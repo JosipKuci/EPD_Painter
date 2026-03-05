@@ -109,7 +109,7 @@ void renderTerminal() {
     epd.setCursor(MARGIN_X, MARGIN_Y + (termRows-1) * LINE_HEIGHT);
     epd.print(termBuffer[(termRows-1)].substring(0,i));
     epd.print("_");
-    epd.paint(1);
+    epd.paint();
   }
 
 }
@@ -121,7 +121,6 @@ void setup() {
     while (1);
   }
   epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
-  epd.clear();
   epd.clear();
 
   termRows = (epd.height() - MARGIN_Y * 2) / LINE_HEIGHT;
