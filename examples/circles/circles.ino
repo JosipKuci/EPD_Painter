@@ -15,12 +15,23 @@ if (!epd.begin()) {
     Serial.println("EPD init failed");
     while (1);
   }
-  epd.clear();
+
+ epd.clear();
+ epd.fillScreen(1);
+
 
 }
 
 void loop() {
-  epd.fillCircle(random(epd.width()), random(epd.height()), random(300), random(4) );
-  epd.paint();
+ for (int y=0; y<500; y+=100){
+  epd.fillRect(0, y, 960, 50, 0);
 
+ }
+ epd.paint();
+ delay(3000);
+  for (int y=0; y<500; y+=100){
+  epd.fillRect(0, y, 960, 50, 1);
+ }
+   epd.paint();
+  delay(3000);
 }
