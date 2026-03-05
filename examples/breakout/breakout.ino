@@ -177,11 +177,6 @@ void setup() {
 void loop() {
   epd.fillScreen(0);
 
-  // Antighosting
-
-  for (int i=0; i<300; i++){
-    epd.getBuffer()[random(192000)]=3;
-  }
 
   for (int i = 0; i < NUM_BALLS; i++) {
     updateBall(balls[i]);
@@ -200,7 +195,9 @@ void loop() {
       if (bricks[r][c].alive) anyAlive = true;
   if (!anyAlive) initBricks();
 
-  epd.paint(1);
+//  long time = esp_timer_get_time();
+  epd.paint();
+//  Serial.println(1000000.0/(esp_timer_get_time()-time));
 
 #ifdef EPD_PAINTER_DEVICE_LILYGO_T5_S3_GPS
   if (digitalRead(0) == 0) {

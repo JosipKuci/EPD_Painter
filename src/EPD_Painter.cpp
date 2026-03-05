@@ -99,7 +99,7 @@ void EPD_Painter::setQuality(Quality quality) {
       _config.latch_delay = 4;
       break;
     case Quality::QUALITY_FAST:
-      _config.latch_delay = 1;
+      _config.latch_delay = 0;
       break;
   }
 }
@@ -441,8 +441,8 @@ void EPD_Painter::clear() {
   PanelPowerGuard guard(*this);
   const int packed_row_bytes = width() / 4;
   
-  uint32_t bitmask[height()];
 
+  memset(bitmask,0xff,height()*4);
   memset(packed_fastbuffer,0x00,packed_row_bytes*height());
 
 
@@ -450,10 +450,8 @@ void EPD_Painter::clear() {
     uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
     uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
 
-    epd_painter_ink_off(fb_row, sb_row, packed_row_bytes, bitmask[row]);
+    bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes, bitmask[row]);
   }
-
-
 
   for (uint8_t pass = 0; pass < PASS_COUNT; pass++) {
     uint8_t lighter_wf[3] = {
@@ -464,24 +462,28 @@ void EPD_Painter::clear() {
 
     for (int row = 0; row < height(); row++) {
       uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
-      epd_painter_convert_packed_fb_to_ink( fb_row , dma_buffer, packed_row_bytes,lighter_wf, 0xff);
+      epd_painter_convert_packed_fb_to_ink( fb_row , dma_buffer, packed_row_bytes,lighter_wf, bitmask[row]);
       sendRow(row == 0);
     }
     delay(_config.latch_delay);
   }
 
-  for (int phase = 0; phase < 2; phase++) {
+  for (int phase = 0; phase < 8; phase++) {
     uint8_t pattern = (phase % 2 == 0) ? 0b01010101 : 0b10101010;
     memset(dma_buffer1, pattern, packed_row_bytes);
     memset(dma_buffer2, pattern, packed_row_bytes);
 
-    for (int passes = 0; passes < 8; passes++) {
+    int totpass[] = {2,2,4,4,6,6,6,6};
+
+    for (int passes = 0; passes < totpass[phase]; passes++) {
       for (int row = 0; row < _config.height; ++row) {
         sendRow(row == 0);
       }
-      delay(_config.latch_delay);
+      delay(6);
     }
   }
+
+  
 
   memset(dma_buffer1, 0x00, packed_row_bytes);
   memset(dma_buffer2, 0x00, packed_row_bytes);
