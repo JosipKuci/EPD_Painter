@@ -1,13 +1,13 @@
-#include "Wire.h"
 #ifndef EPD_Painter_H
 #define EPD_Painter_H
 
 #include <Arduino.h>
-#include <Adafruit_GFX.h>
 #include <esp_private/gdma.h>
 #include <hal/dma_types.h>
+#include "Wire.h"
 
-class EPD_Painter : public GFXcanvas8 {
+
+class EPD_Painter {
 
 public:
 
@@ -53,7 +53,7 @@ struct PowerCtlConfig {
   bool end();
 
   void clear();
-  void paint(int passes=2);
+  void paint(uint8_t* framebuffer);
 
   void setQuality(Quality quality);
 
@@ -72,6 +72,7 @@ private:
   dma_descriptor_t      dma_desc2 = {};
 
   // ---- Buffers ----
+  
   uint8_t* dma_buffer        = nullptr;  // Points at one of the buffers below
   uint8_t* dma_buffer1       = nullptr;  //  Row Double buffer A
   uint8_t* dma_buffer2       = nullptr;  //. Row Double buffer B

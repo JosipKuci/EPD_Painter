@@ -77,15 +77,8 @@ static inline void gpio_clear_fast(uint8_t pin) {
 
 #define PASS_COUNT 7
 
-// =============================================================================
-// Constructor — dimensions come from config defaults until begin() is called.
-// We construct GFXcanvas8 with 0,0 and resize in begin() once we have config.
-// =============================================================================
 
-
-
-EPD_Painter::EPD_Painter(const Config &config)
-  : GFXcanvas8(config.width, config.height, false) {
+EPD_Painter::EPD_Painter(const Config &config) {
   _config = config;
 }
 
@@ -164,8 +157,6 @@ bool EPD_Painter::begin() {
 
   // ---- Allocate GFX canvas buffer now we know dimensions ----
   uint32_t bytes = (uint32_t)_config.width * (uint32_t)_config.height;
-  buffer = (uint8_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM);
-  if (buffer) memset(buffer, 0, bytes);
 
 
   // -- Start I2C if needed.
@@ -287,12 +278,10 @@ bool EPD_Painter::begin() {
     heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
 
   bitmask = static_cast<uint32_t *>(
-    heap_caps_aligned_alloc(4, height()*4, MALLOC_CAP_SPIRAM));
+    heap_caps_aligned_alloc(4, _config.height*4, MALLOC_CAP_SPIRAM));
 
   memset(packed_screenbuffer, 0x00, packed_size);
-  memset(bitmask, 0, height() * sizeof(uint32_t));
-
-  memset(getBuffer(), 0x00, _config.width * _config.height);
+  memset(bitmask, 0, _config.height * sizeof(uint32_t));
 
   // ── If a tps chip is used, initalise PowerCtl Init ──
   if (_config.power.tps_addr != -1) {
@@ -376,14 +365,14 @@ static const uint8_t darker_waveform[][PASS_COUNT] = {
 // =============================================================================
 // paint()
 // =============================================================================
-void EPD_Painter::paint(int passes) {
+void EPD_Painter::paint(uint8_t* framebuffer) {
 
   PanelPowerGuard guard(*this);
-  const int packed_row_bytes = width() / 4;
+  const int packed_row_bytes = _config.width / 4;
 
-  epd_painter_compact_pixels(buffer, packed_fastbuffer, width() * height());
+  epd_painter_compact_pixels(framebuffer, packed_fastbuffer, _config.width * _config.height);
 
-for (int row = 0; row < height(); row++) {
+for (int row = 0; row < _config.height; row++) {
     uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
     uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
     bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes, bitmask[row]);
@@ -410,7 +399,7 @@ for (int row = 0; row < height(); row++) {
       (uint8_t)(darker_waveform[0][pass] * 0x55)
     };
 
-    for (int row = 0; row < height(); row++) {
+    for (int row = 0; row < _config.height; row++) {
       uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
 
      epd_painter_convert_packed_fb_to_ink(
@@ -429,8 +418,8 @@ for (int row = 0; row < height(); row++) {
 
   memset(dma_buffer1, 0x00, packed_row_bytes);
   memset(dma_buffer2, 0x00, packed_row_bytes);
-  for (int row = 0; row < height(); ++row) {
-    sendRow(row == 0, row == height() - 1);
+  for (int row = 0; row < _config.height; ++row) {
+    sendRow(row == 0, row == _config.height - 1);
   }
 }
 
@@ -439,14 +428,14 @@ for (int row = 0; row < height(); row++) {
 // =============================================================================
 void EPD_Painter::clear() {
   PanelPowerGuard guard(*this);
-  const int packed_row_bytes = width() / 4;
+  const int packed_row_bytes = _config.width / 4;
   
 
-  memset(bitmask,0xff,height()*4);
-  memset(packed_fastbuffer,0x00,packed_row_bytes*height());
+  memset(bitmask,0xff,_config.height*4);
+  memset(packed_fastbuffer,0x00,packed_row_bytes*_config.height);
 
 
-  for (int row = 0; row < height(); row++) {
+  for (int row = 0; row < _config.height; row++) {
     uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
     uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
 
@@ -460,7 +449,7 @@ void EPD_Painter::clear() {
       (uint8_t)(lighter_waveform[0][pass] * 0x55)
     };
 
-    for (int row = 0; row < height(); row++) {
+    for (int row = 0; row < _config.height; row++) {
       uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
       epd_painter_convert_packed_fb_to_ink( fb_row , dma_buffer, packed_row_bytes,lighter_wf, bitmask[row]);
       sendRow(row == 0);

@@ -4,10 +4,10 @@
 
 
 #include <Arduino.h>
-#include "EPD_Painter.h"
+#include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_presets.h"
 
-EPD_Painter epd(EPD_PAINTER_PRESET);
+EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
 // Terminal configuration
 #define TERMINAL_FONT_SIZE  5

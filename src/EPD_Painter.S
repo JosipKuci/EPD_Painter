@@ -1,3 +1,4 @@
+#ifdef __ASSEMBLER__
 // =============================================================================
 // EPD Painter Assembly Functions
 // Optimized routines for e-paper display pixel manipulation
@@ -767,3 +768,4 @@ epd_painter_ink:
 
     mov             a2, a11
     retw.n
+#endif

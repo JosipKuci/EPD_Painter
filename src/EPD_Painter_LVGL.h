@@ -1,0 +1,116 @@
+#pragma once
+
+#include <string.h>
+#include <lvgl.h>
+#include <esp_heap_caps.h>
+#include "EPD_Painter.h"
+
+// =============================================================================
+// EPD_PainterLVGL
+//
+// Owns the 8bpp framebuffer, registers it as the LVGL draw buffer, and drives
+// the eInk panel via an EPD_Painter instance.
+//
+// Ownership model:
+//   - This class allocates the framebuffer in begin() (PSRAM, 16-byte aligned)
+//     and frees it in the destructor.
+//   - EPD_Painter is constructed internally and borrows the same pointer via
+//     paint(buffer) — matching the pattern used by EPD_PainterAdafruit.
+//   - LVGL renders directly into the same buffer — no copying on flush.
+//
+// Requires:
+//   - LV_COLOR_DEPTH 8 in lv_conf.h
+//   - LVGL v9
+//
+// Usage:
+//   EPD_Painter::Config config = { ... };
+//   EPD_PainterLVGL lvgl(config);
+//
+//   lv_init();
+//   lv_tick_set_cb(my_tick);
+//   lvgl.begin();
+//
+//   // Create widgets normally, then in loop():
+//   lv_timer_handler();
+// =============================================================================
+class EPD_PainterLVGL {
+public:
+
+    explicit EPD_PainterLVGL(const EPD_Painter::Config &config)
+        : _config(config),
+          _painter(config)
+    {}
+
+    ~EPD_PainterLVGL() {
+        heap_caps_free(_framebuffer);
+        _framebuffer = nullptr;
+    }
+
+    // -------------------------------------------------------------------------
+    // begin() — allocates framebuffer, inits EPD_Painter, registers LVGL display.
+    // Call after lv_init() and lv_tick_set_cb(), before creating any widgets.
+    // -------------------------------------------------------------------------
+    bool begin() {
+        const size_t buf_size = (size_t)_config.width * (size_t)_config.height;
+
+        _framebuffer = static_cast<uint8_t *>(
+            heap_caps_aligned_alloc(16, buf_size, MALLOC_CAP_SPIRAM));
+
+        if (!_framebuffer) return false;
+        memset(_framebuffer, 0x00, buf_size);
+
+        if (!_painter.begin()) return false;
+
+        // Register with LVGL — FULL mode means flush_cb is called once per
+        // frame with the complete buffer, ideal for eInk.
+        _disp = lv_display_create(_config.width, _config.height);
+        lv_display_set_buffers(
+            _disp,
+            _framebuffer,
+            nullptr,
+            (uint32_t)buf_size,
+            LV_DISPLAY_RENDER_MODE_FULL
+        );
+        lv_display_set_flush_cb(_disp, _flush_cb);
+        lv_display_set_user_data(_disp, this);
+
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // end()
+    // -------------------------------------------------------------------------
+    bool end() { return _painter.end(); }
+
+    // -------------------------------------------------------------------------
+    // Quality
+    // -------------------------------------------------------------------------
+    void setQuality(EPD_Painter::Quality q) { _painter.setQuality(q); }
+
+    // -------------------------------------------------------------------------
+    // Config accessor — mirrors EPD_PainterAdafruit
+    // -------------------------------------------------------------------------
+    EPD_Painter::Config getConfig() { return _config; }
+
+    // -------------------------------------------------------------------------
+    // Access to the underlying driver if needed
+    // -------------------------------------------------------------------------
+    EPD_Painter  &driver()  { return _painter; }
+    lv_display_t *display() { return _disp; }
+
+private:
+    EPD_Painter::Config  _config;
+    uint8_t             *_framebuffer = nullptr;    // owned here
+    EPD_Painter          _painter;                  // borrows _framebuffer
+    lv_display_t        *_disp        = nullptr;
+
+    // -------------------------------------------------------------------------
+    // LVGL flush callback — called once per frame in FULL render mode.
+    // px_map is the framebuffer LVGL just finished rendering into.
+    // -------------------------------------------------------------------------
+    static void _flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+        auto *self = static_cast<EPD_PainterLVGL *>(lv_display_get_user_data(disp));
+        self->_painter.paint(px_map);
+        lv_display_flush_ready(disp);
+    }
+};

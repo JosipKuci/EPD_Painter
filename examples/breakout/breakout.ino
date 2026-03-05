@@ -1,16 +1,16 @@
 
 // Pick a board...
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-#define EPD_PAINTER_PRESET_M5PAPER_S3
+#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
+//#define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include <Arduino.h>
-#include "EPD_Painter.h"
+#include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_presets.h"
 
 #define XPOWERS_CHIP_BQ25896
 #include <XPowersLib.h>
 
-EPD_Painter epd(EPD_PAINTER_PRESET);
+EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
 
 // Power off only works with LILYGO T5
@@ -155,7 +155,6 @@ void setup() {
   }
 
   epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
-  epd.clear();
   epd.clear();
 
   const auto& cfg = epd.getConfig();
