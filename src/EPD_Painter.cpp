@@ -1,17 +1,25 @@
 #include <string.h>
-#include "Wire.h"
-#include "esp32-hal.h"
-#include "esp_timer.h"
-#include "Adafruit_GFX.h"
-#include "EPD_Painter.h"
-#include <esp_heap_caps.h>
 #include <cstring>
+#include "build_opt.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "esp_rom_gpio.h"
 #include <driver/periph_ctrl.h>
 #include <esp_private/gdma.h>
 #include <hal/dma_types.h>
 #include <hal/gpio_hal.h>
 #include <soc/lcd_cam_struct.h>
+#include "EPD_Painter.h"
 #include <epd_painter_powerctl.h>
+
+#ifdef ARDUINO
+  #include "Wire.h"
+#else
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/task.h"
+  #include "freertos/semphr.h"
+  #include "driver/i2c_master.h"
+#endif
 
 // LCD_CAM signal indices for the 8 parallel data lines
 static const uint8_t kDataSignals[8] = {
@@ -28,7 +36,6 @@ static const uint8_t kDataSignals[8] = {
 
 
 epd_painter_powerctl *powerctl = nullptr;
-TwoWire *_wire = nullptr;
 
 // Assembly routines — see EPD_Painter.S for full documentation
 extern "C" void epd_painter_compact_pixels(
@@ -93,10 +100,8 @@ void EPD_Painter::setQuality(Quality quality) {
 void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
 
   // Wait for last to complete..
-
-
   while (LCD_CAM.lcd_user.lcd_start) {
-    yield();
+    EPD_YIELD();
   }
 
 
@@ -129,12 +134,12 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
 
   if (lastLine) {
     while (LCD_CAM.lcd_user.lcd_start) {
-      yield();
+      EPD_YIELD();
     }
 
     gpio_clear_fast(_config.pin_ckv);
     gpio_set_fast(_config.pin_le);
-    delayMicroseconds(1);
+    EPD_DELAY_US(1);
     gpio_clear_fast(_config.pin_le);
     gpio_set_fast(_config.pin_ckv);
   }
@@ -145,27 +150,44 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
 // =============================================================================
 bool EPD_Painter::begin() {
 
-  // ---- Allocate GFX canvas buffer now we know dimensions ----
-  uint32_t bytes = (uint32_t)_config.width * (uint32_t)_config.height;
-
-
   // -- Start I2C if needed.
+#ifdef ARDUINO
   if (_config.i2c.scl != -1 && _config.i2c.wire == nullptr) {
-    _wire = new TwoWire(0);
-    _wire->begin(_config.i2c.sda, _config.i2c.scl, _config.i2c.freq);
-    _config.i2c.wire = _wire;
-    delay(50);
+    TwoWire *w = new TwoWire(0);
+    w->begin(_config.i2c.sda, _config.i2c.scl, _config.i2c.freq);
+    _config.i2c.wire = w;
+    EPD_DELAY_MS(50);
   }
+#else
+  if (_config.i2c.scl != -1 && _config.i2c.i2c_bus == nullptr) {
+    i2c_master_bus_config_t i2c_bus_config = {
+      .i2c_port = I2C_NUM_0,
+      .sda_io_num = (gpio_num_t)_config.i2c.sda,
+      .scl_io_num = (gpio_num_t)_config.i2c.scl,
+      .clk_source = I2C_CLK_SRC_DEFAULT,
+      .glitch_ignore_cnt = 7,
+      .flags = { .enable_internal_pullup = true },
+    };
+    i2c_master_bus_handle_t bus;
+    esp_err_t err = i2c_new_master_bus(&i2c_bus_config, &bus);
+    if (err != ESP_OK) {
+      printf("EPD_Painter: I2C bus init failed (%d)\n", err);
+      return false;
+    }
+    _config.i2c.i2c_bus = bus;
+    EPD_DELAY_MS(50);
+  }
+#endif
 
 
   // ---- Configure EPD control pins ----
-  pinMode(_config.pin_pwr, OUTPUT);
-  pinMode(_config.pin_spv, OUTPUT);
-  pinMode(_config.pin_ckv, OUTPUT);
-  pinMode(_config.pin_sph, OUTPUT);
-  pinMode(_config.pin_oe, OUTPUT);
-  pinMode(_config.pin_le, OUTPUT);
-  pinMode(_config.pin_cl, OUTPUT);
+  EPD_PIN_OUTPUT(_config.pin_pwr);
+  EPD_PIN_OUTPUT(_config.pin_spv);
+  EPD_PIN_OUTPUT(_config.pin_ckv);
+  EPD_PIN_OUTPUT(_config.pin_sph);
+  EPD_PIN_OUTPUT(_config.pin_oe);
+  EPD_PIN_OUTPUT(_config.pin_le);
+  EPD_PIN_OUTPUT(_config.pin_cl);
 
 
   packed_row_bytes = _config.width / 4;
@@ -174,7 +196,7 @@ bool EPD_Painter::begin() {
   periph_module_enable(PERIPH_LCD_CAM_MODULE);
   periph_module_reset(PERIPH_LCD_CAM_MODULE);
   LCD_CAM.lcd_user.lcd_reset = 1;
-  esp_rom_delay_us(100);
+  EPD_DELAY_US(100);
 
   // ---- Configure LCD_CAM pixel clock ----
   LCD_CAM.lcd_clock.clk_en = 1;
@@ -270,20 +292,15 @@ bool EPD_Painter::begin() {
   bitmask = static_cast<uint32_t *>(
     heap_caps_aligned_alloc(4, _config.height * 4, MALLOC_CAP_SPIRAM));
 
-  //memset(packed_screenbuffer, 0x00, packed_size);
-  //memset(bitmask, 0, _config.height * sizeof(uint32_t));
-
-  // ── If a tps chip is used, initalise PowerCtl Init ──
+  // ── If a TPS chip is present, initialise the power controller ──
   if (_config.power.tps_addr != -1) {
-    Serial.println("\n── PowerCtl Init ──");
+    printf("\n── PowerCtl Init ──\n");
     powerctl = new epd_painter_powerctl();
     if (!powerctl->begin(_config)) {
-      Serial.println("FATAL: powerctl init failed!");
-      while (1) delay(1000);
+      printf("FATAL: powerctl init failed!\n");
+      while (1) EPD_DELAY_MS(1000);
     }
   }
-
-
 
   if (!(dma_buffer && packed_fastbuffer && packed_screenbuffer)) return false;
 
@@ -327,22 +344,21 @@ bool EPD_Painter::end() {
 // Power control
 // =============================================================================
 void EPD_Painter::powerOn() {
-  digitalWrite(_config.pin_spv, LOW);
-  digitalWrite(_config.pin_sph, LOW);
+  EPD_PIN_LOW(_config.pin_spv);
+  EPD_PIN_LOW(_config.pin_sph);
 
   if (powerctl) {
     powerctl->powerOn();
   } else {
-    digitalWrite(_config.pin_oe, HIGH);
-    delayMicroseconds(100);
-    digitalWrite(_config.pin_pwr, HIGH);
-    delayMicroseconds(100);
+    EPD_PIN_HIGH(_config.pin_oe);
+    EPD_DELAY_US(100);
+    EPD_PIN_HIGH(_config.pin_pwr);
+    EPD_DELAY_US(100);
   }
-
 
   gpio_clear_fast(_config.pin_spv);
   gpio_clear_fast(_config.pin_ckv);
-  delayMicroseconds(1);
+  EPD_DELAY_US(1);
 
   gpio_set_fast(_config.pin_ckv);
   gpio_set_fast(_config.pin_spv);
@@ -352,10 +368,10 @@ void EPD_Painter::powerOff() {
   if (powerctl) {
     powerctl->powerOff();
   } else {
-    digitalWrite(_config.pin_oe, LOW);
-    delayMicroseconds(100);
-    digitalWrite(_config.pin_pwr, LOW);
-    delayMicroseconds(100);
+    EPD_PIN_LOW(_config.pin_oe);
+    EPD_DELAY_US(100);
+    EPD_PIN_LOW(_config.pin_pwr);
+    EPD_DELAY_US(100);
   }
 }
 
@@ -391,9 +407,6 @@ static uint8_t hq_darker_waveform[][13] = {
 
 // =============================================================================
 // paint()
-// Called from the LVGL task (core 1). Blocks until any previous paint task
-// has finished, runs compact_pixels on this core, then hands off to the
-// dedicated paint task on core 0.
 // =============================================================================
 void EPD_Painter::paint(uint8_t *framebuffer) {
   xSemaphoreTake(_paint_done_sem, portMAX_DELAY);
@@ -403,7 +416,6 @@ void EPD_Painter::paint(uint8_t *framebuffer) {
 
 // =============================================================================
 // _paint_task_entry() / _paint_task_body()
-// Runs on core 0. Waits for paint() to signal, then drives the EPD waveform.
 // =============================================================================
 void EPD_Painter::_paint_task_entry(void *arg) {
   static_cast<EPD_Painter *>(arg)->_paint_task_body();
@@ -455,9 +467,9 @@ void EPD_Painter::_paint_task_body() {
       }
 
       if (_config.quality == Quality::QUALITY_FAST) {
-        delay(1);
+        EPD_DELAY_MS(1);
       } else {
-        delay(4);
+        EPD_DELAY_MS(4);
       }
     }
 
@@ -513,9 +525,9 @@ void EPD_Painter::clear() {
     }
 
     if (_config.quality == Quality::QUALITY_FAST) {
-      delay(1);
+      EPD_DELAY_MS(1);
     } else {
-      delay(4);
+      EPD_DELAY_MS(4);
     }
   }
 
@@ -530,10 +542,9 @@ void EPD_Painter::clear() {
       for (int row = 0; row < _config.height; ++row) {
         sendRow(row == 0);
       }
-      delay(6);
+      EPD_DELAY_MS(6);
     }
   }
-
 
   memset(dma_buffer1, 0x00, packed_row_bytes);
   memset(dma_buffer2, 0x00, packed_row_bytes);

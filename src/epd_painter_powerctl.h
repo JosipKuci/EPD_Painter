@@ -1,30 +1,31 @@
 #pragma once
 
-#include <Wire.h>
+#include "build_opt.h"
 #include <EPD_Painter.h>
 
 class epd_painter_powerctl {
 public:
-  // Constructor
   epd_painter_powerctl();
 
-  // Init only the I2C side and expander direction cache
   bool begin(EPD_Painter::Config config);
 
-  // Main power sequencing
   bool powerOn();
   void powerOff();
 
-  // Diagnostics
   bool isPwrGood();
   uint8_t readTpsPg();
   uint8_t readPcaPort(uint8_t port);
 
-  // Optional direct helpers if you want them elsewhere
   void setVcomMv(int vcom_mv);
 
 private:
   EPD_Painter::Config config;
+
+#ifndef ARDUINO
+  // ESP-IDF: per-device handles created from the bus in begin()
+  i2c_master_dev_handle_t _pca_dev = nullptr;
+  i2c_master_dev_handle_t _tps_dev = nullptr;
+#endif
 
   // ---- PCA9535 cached state ----
   uint8_t _pca_out[2];
@@ -38,6 +39,10 @@ private:
   static constexpr uint8_t PIN_WAKEUP  = 13;  // port1 bit5
   static constexpr uint8_t PIN_PWRGOOD = 14;  // port1 bit6 input
   static constexpr uint8_t PIN_INT     = 15;  // port1 bit7 input
+
+  // ---- PCA pin direction constants (I2C expander, not real GPIO) ----
+  static constexpr uint8_t PCA_OUTPUT = 0;
+  static constexpr uint8_t PCA_INPUT  = 1;
 
   // ---- TPS65185 registers ----
   static constexpr uint8_t TPS_ENABLE = 0x01;

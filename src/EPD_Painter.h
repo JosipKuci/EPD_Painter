@@ -1,9 +1,20 @@
 #ifndef EPD_Painter_H
 #define EPD_Painter_H
 
+// FreeRTOS headers — available in both Arduino-ESP32 and pure ESP-IDF
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
 #include <esp_private/gdma.h>
 #include <hal/dma_types.h>
-#include "Wire.h"
+
+// I2C — TwoWire for Arduino, ESP-IDF master API otherwise
+#ifdef ARDUINO
+  #include <Wire.h>
+#else
+  #include "driver/i2c_master.h"
+#endif
 
 
 class EPD_Painter {
@@ -11,7 +22,11 @@ class EPD_Painter {
 public:
 
 struct I2CBusConfig {
+#ifdef ARDUINO
     TwoWire* wire = nullptr;
+#else
+    i2c_master_bus_handle_t i2c_bus = nullptr;
+#endif
     int sda = -1;
     int scl = -1;
     uint32_t freq = 100000;
@@ -67,7 +82,7 @@ private:
   dma_descriptor_t      dma_desc2 = {};
 
   // ---- Buffers ----
-  
+
   uint8_t* dma_buffer        = nullptr;  // Points at one of the buffers below
   uint8_t* dma_buffer1       = nullptr;  //  Row Double buffer A
   uint8_t* dma_buffer2       = nullptr;  //. Row Double buffer B
@@ -77,7 +92,7 @@ private:
   uint32_t* bitmask = nullptr;
 
 
-  
+
 
   int packed_row_bytes = 0;
   bool interlace_period = false;
@@ -110,10 +125,10 @@ private:
   private:
     EPD_Painter& disp;
 
-    static inline TaskHandle_t     task      = nullptr;
-    static inline EPD_Painter*     owner     = nullptr;
+    static inline TaskHandle_t      task      = nullptr;
+    static inline EPD_Painter*      owner     = nullptr;
     static inline SemaphoreHandle_t power_mtx = nullptr;
-    static inline uint8_t          state     = 0;
+    static inline uint8_t           state     = 0;
 
     static void initOnce(EPD_Painter& d) {
       struct Init {
