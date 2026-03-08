@@ -80,7 +80,7 @@ public:
     // -------------------------------------------------------------------------
     void setQuality(EPD_Painter::Quality q) { _painter.setQuality(q); }
     
-    EPD_Painter::Config getConfig(){return _config;}
+    EPD_Painter::Config getConfig(){ return _painter.getConfig(); }
     
 
     // -------------------------------------------------------------------------

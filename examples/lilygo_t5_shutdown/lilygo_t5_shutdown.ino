@@ -17,30 +17,32 @@
 
 #define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
 
-#include "EPD_Painter.h"
+#include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_presets.h"
 
 #define XPOWERS_CHIP_BQ25896
 #include <XPowersLib.h>
 
 
-EPD_Painter epd(EPD_PAINTER_PRESET);
+EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 XPowersPPM PPM;
 
 
 void setup() {
+  Serial.begin(115200);
+  delay(1000);
 
 epd.begin();
 
 const auto& cfg = epd.getConfig();
 
+Serial.println(cfg.i2c.wire==nullptr);
+
 // This config can be found in EPD_Painter_presets
 bool result = PPM.init(*cfg.i2c.wire, cfg.i2c.sda, cfg.i2c.scl, BQ25896_SLAVE_ADDRESS);
  if (!result) {
-   while (1) {
      Serial.println("PPM is not online...");
-     delay(1000);
-   }
+    while(true);
  }
 
   pinMode(0, INPUT);
@@ -58,15 +60,20 @@ bool result = PPM.init(*cfg.i2c.wire, cfg.i2c.sda, cfg.i2c.scl, BQ25896_SLAVE_AD
 }
 
 void loop() {
+
  if (digitalRead(0) == 0) {
-   
    epd.fillScreen(0);
-   epd.setCursor(1, 1);
-   epd.print("Turning off in 3 seconds..");
+   epd.setCursor(2, 2);
+   epd.print("Disconnecting battery in 3 seconds....");
    epd.paint();
+   epd.paint();
+
    delay(3000);
    epd.clear();
    PPM.shutdown();
+
+   Serial.println("Battery now disconnected. If you're seeing this, its because its connected to USB.");
+
  }
 
 }
