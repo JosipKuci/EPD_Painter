@@ -1,3 +1,7 @@
+// Breakout Demo — autonomous multi-ball brick basher, no paddle required.
+// Balls bounce forever; bricks reset when all cleared.
+// Power off via Boot button (battery only — does not work when plugged in via USB).
+
 
 // Pick a board...
 #define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
@@ -14,7 +18,7 @@ EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
 
 // Power off only works with LILYGO T5
-#ifdef EPD_PAINTER_DEVICE_LILYGO_T5_S3_GPS
+#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
 XPowersPPM PPM;
 #endif
 
@@ -157,9 +161,16 @@ void setup() {
   epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
   epd.clear();
 
+  epd.fillScreen(3);
+  epd.paint();
+  epd.paint();
+  epd.fillScreen(0);
+  epd.paint();
+  
+
   const auto& cfg = epd.getConfig();
 
-#ifdef EPD_PAINTER_DEVICE_LILYGO_T5_S3_GPS
+#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
  bool result = PPM.init(*cfg.i2c.wire, cfg.i2c.sda, cfg.i2c.scl, BQ25896_SLAVE_ADDRESS);
  if (!result) {
    while (1) {
@@ -170,10 +181,14 @@ void setup() {
  #endif
 
   pinMode(0, INPUT);
+
+  epd.setTextSize(3);
   initGame();
 }
 
 void loop() {
+
+
   epd.fillScreen(0);
 
 
@@ -195,12 +210,18 @@ void loop() {
   if (!anyAlive) initBricks();
 
 //  long time = esp_timer_get_time();
-  epd.paint();
-//  Serial.println(1000000.0/(esp_timer_get_time()-time));
+ // long time = esp_timer_get_time();
 
-#ifdef EPD_PAINTER_DEVICE_LILYGO_T5_S3_GPS
+
+  epd.setCursor(30,500);
+  epd.print("Turn off by pressing Boot button.");
+
+  epd.paint();
+// Serial.println(1000000.0/(esp_timer_get_time()-time));
+
+#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
   if (digitalRead(0) == 0) {
-   epd.clear();
+   Serial.println("shutdown");
    epd.clear();
    PPM.shutdown();
  }
