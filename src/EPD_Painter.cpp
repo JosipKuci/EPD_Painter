@@ -319,7 +319,7 @@ bool EPD_Painter::begin() {
   xSemaphoreGive(_paint_start_sem);  // available immediately so first paint() doesn't block
 
   xTaskCreatePinnedToCore(
-    _paint_task_entry, "epd_paint", 4096, this, 10, &_paint_task_h, 0);
+    _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
 
   return true;
 }
@@ -529,7 +529,26 @@ void EPD_Painter::clear() {
   PanelPowerGuard guard(*this);
   const int packed_row_bytes = _config.width / 4;
 
-  memset(packed_fastbuffer, 0x00, packed_row_bytes * _config.height);
+  // for(;;){
+  //   xSemaphoreTake(_paint_start_sem, portMAX_DELAY);
+  // //  memset(packed_paintbuffer, 0x00, packed_row_bytes * _config.height);
+
+  //   if (paintStage==2){
+  //     xSemaphoreGive(_paint_start_sem);
+  //     vTaskDelay(1);
+  //     continue;
+  //   }
+
+  //   paintStage=2;
+  //   xSemaphoreGive(_paint_start_sem);
+  //   break;
+  // }
+
+  // // Wait till it hits the screen.
+  // while (paintStage!=0){
+  //   EPD_DELAY_MS(1);
+  // }
+
 
   const uint8_t *lt_wf;
   int wf_len;
@@ -542,32 +561,9 @@ void EPD_Painter::clear() {
     wf_len = 7;
   }
 
-  for (int row = 0; row < _config.height; row++) {
-    uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
-    uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
-    bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes, bitmask[row]);
-  }
 
-  for (uint8_t pass = 0; pass < wf_len; pass++) {
-    uint8_t lighter_wf[3] = {
-      (uint8_t)(lt_wf[2 * wf_len + pass] * 0x55),
-      (uint8_t)(lt_wf[1 * wf_len + pass] * 0x55),
-      (uint8_t)(lt_wf[0 * wf_len + pass] * 0x55)
-    };
 
-    for (int row = 0; row < _config.height; row++) {
-      uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
-      epd_painter_convert_packed_fb_to_ink(fb_row, dma_buffer, packed_row_bytes, lighter_wf, bitmask[row]);
-      sendRow(row == 0);
-    }
-
-    if (_config.quality == Quality::QUALITY_FAST) {
-      EPD_DELAY_MS(1);
-    } else {
-      EPD_DELAY_MS(4);
-    }
-  }
-
+  // Send clear
   for (int phase = 0; phase < 4; phase++) {
     uint8_t pattern = (phase % 2 == 0) ? 0b01010101 : 0b10101010;
     memset(dma_buffer1, pattern, packed_row_bytes);
@@ -579,13 +575,17 @@ void EPD_Painter::clear() {
       for (int row = 0; row < _config.height; ++row) {
         sendRow(row == 0);
       }
-      EPD_DELAY_MS(6);
+      EPD_DELAY_MS(15);
     }
   }
 
+
+  // Send neutral..
   memset(dma_buffer1, 0x00, packed_row_bytes);
   memset(dma_buffer2, 0x00, packed_row_bytes);
   for (int row = 0; row < _config.height; ++row) {
     sendRow(row == 0, row == _config.height - 1);
   }
+
+
 }
