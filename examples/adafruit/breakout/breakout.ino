@@ -158,11 +158,10 @@ void setup() {
     while (1);
   }
 
-  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+  epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
   epd.clear();
 
   epd.fillScreen(3);
-  epd.paint();
   epd.paint();
   epd.fillScreen(0);
   epd.paint();
@@ -188,6 +187,7 @@ void setup() {
 
 void loop() {
 
+  long time = esp_timer_get_time();
 
   epd.fillScreen(0);
 
@@ -217,7 +217,7 @@ void loop() {
   epd.print("Turn off by pressing Boot button.");
 
   epd.paint();
-// Serial.println(1000000.0/(esp_timer_get_time()-time));
+ Serial.println(1000000.0/(esp_timer_get_time()-time));
 
 #ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
   if (digitalRead(0) == 0) {

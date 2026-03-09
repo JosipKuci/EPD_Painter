@@ -1,3 +1,4 @@
+#include "esp32-hal.h"
 #include <string.h>
 #include <cstring>
 #include "build_opt.h"
@@ -104,21 +105,10 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
     EPD_YIELD();
   }
 
-
   if (firstLine) {
     // Reset to top of page
     gpio_clear_fast(_config.pin_spv);
     gpio_clear_fast(_config.pin_ckv);
-    gdma_reset(dma_chan);  // Use the DMA reset time, as a delay for the pins.
-    gpio_set_fast(_config.pin_ckv);
-    gpio_set_fast(_config.pin_spv);
-  } else {
-    gpio_clear_fast(_config.pin_ckv);
-    gpio_set_fast(_config.pin_le);
-    gdma_reset(dma_chan);
-    gpio_clear_fast(_config.pin_le);
-    gpio_set_fast(_config.pin_ckv);
-  }
 
   if (dma_buffer == dma_buffer1) {
     gdma_start(dma_chan, (intptr_t)&dma_desc1);
@@ -127,6 +117,25 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
     gdma_start(dma_chan, (intptr_t)&dma_desc2);
     dma_buffer = dma_buffer1;
   }
+  
+    gpio_set_fast(_config.pin_ckv);
+    gpio_set_fast(_config.pin_spv);
+  } else {
+    gpio_clear_fast(_config.pin_ckv);
+    gpio_set_fast(_config.pin_le);
+
+  if (dma_buffer == dma_buffer1) {
+    gdma_start(dma_chan, (intptr_t)&dma_desc1);
+    dma_buffer = dma_buffer2;
+  } else {
+    gdma_start(dma_chan, (intptr_t)&dma_desc2);
+    dma_buffer = dma_buffer1;
+  }
+    gpio_clear_fast(_config.pin_le);
+    gpio_set_fast(_config.pin_ckv);
+  }
+
+
 
 
 
@@ -452,15 +461,14 @@ void EPD_Painter::_paint_task_body() {
       xSemaphoreGive(_paint_start_sem);
     }
 
-    printf("outputting /n");
-
   
     PanelPowerGuard guard(*this);
 
     for (int row = 0; row < _config.height; row++) {
       uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
       uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
-      bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes, 0xffffffff);
+      bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes,
+                                     (row & 1) ? 0x00000000 : 0xffffffff);
     }
 
     const uint8_t *lt_wf;
