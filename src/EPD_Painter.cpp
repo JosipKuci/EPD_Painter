@@ -288,6 +288,8 @@ bool EPD_Painter::begin() {
 
   packed_screenbuffer = static_cast<uint8_t *>(
     heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
+  packed_paintbuffer = static_cast<uint8_t *>(
+    heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
 
   bitmask = static_cast<uint32_t *>(
     heap_caps_aligned_alloc(4, _config.height * 4, MALLOC_CAP_SPIRAM));
@@ -305,8 +307,7 @@ bool EPD_Painter::begin() {
   if (!(dma_buffer && packed_fastbuffer && packed_screenbuffer)) return false;
 
   _paint_start_sem = xSemaphoreCreateBinary();
-  _paint_done_sem = xSemaphoreCreateBinary();
-  xSemaphoreGive(_paint_done_sem);  // available immediately so first paint() doesn't block
+  xSemaphoreGive(_paint_start_sem);  // available immediately so first paint() doesn't block
 
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 4096, this, 10, &_paint_task_h, 0);
@@ -325,10 +326,6 @@ bool EPD_Painter::end() {
   if (_paint_start_sem) {
     vSemaphoreDelete(_paint_start_sem);
     _paint_start_sem = nullptr;
-  }
-  if (_paint_done_sem) {
-    vSemaphoreDelete(_paint_done_sem);
-    _paint_done_sem = nullptr;
   }
 
   if (dma_chan) {
@@ -409,9 +406,30 @@ static uint8_t hq_darker_waveform[][13] = {
 // paint()
 // =============================================================================
 void EPD_Painter::paint(uint8_t *framebuffer) {
-  xSemaphoreTake(_paint_done_sem, portMAX_DELAY);
-  epd_painter_compact_pixels(framebuffer, packed_fastbuffer, _config.width * _config.height);
-  xSemaphoreGive(_paint_start_sem);
+  
+  for(;;){
+    xSemaphoreTake(_paint_start_sem, portMAX_DELAY);
+    if (paintStage==2){
+      xSemaphoreGive(_paint_start_sem);
+      vTaskDelay(1);
+      continue;
+    }
+
+    epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    paintStage=2;
+    xSemaphoreGive(_paint_start_sem);
+    break;
+  }
+}
+
+// =============================================================================
+// paintLater
+// =============================================================================
+void EPD_Painter::paintLater(uint8_t *framebuffer) {
+    xSemaphoreTake(_paint_start_sem, portMAX_DELAY); 
+    epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    paintStage=2;
+    xSemaphoreGive(_paint_start_sem); 
 }
 
 // =============================================================================
@@ -424,7 +442,19 @@ void EPD_Painter::_paint_task_entry(void *arg) {
 void EPD_Painter::_paint_task_body() {
   for (;;) {
     xSemaphoreTake(_paint_start_sem, portMAX_DELAY);
+    if (paintStage==0){
+      xSemaphoreGive(_paint_start_sem);
+      vTaskDelay(1);
+      continue;
+    }  else {
+      memcpy(packed_fastbuffer, packed_paintbuffer, packed_row_bytes*_config.height);
+      paintStage-=1;
+      xSemaphoreGive(_paint_start_sem);
+    }
 
+    printf("outputting /n");
+
+  
     PanelPowerGuard guard(*this);
 
     for (int row = 0; row < _config.height; row++) {
@@ -481,7 +511,6 @@ void EPD_Painter::_paint_task_body() {
 
     interlace_period = !interlace_period;
 
-    xSemaphoreGive(_paint_done_sem);
   }
 }
 

@@ -67,6 +67,8 @@ struct PowerCtlConfig {
 
   void clear();
   void paint(uint8_t* framebuffer);
+  void paintLater(uint8_t* framebuffer);
+
 
   void setQuality(Quality quality);
 
@@ -89,12 +91,12 @@ private:
 
   uint8_t* packed_fastbuffer  = nullptr;  // 2bpp current frame  (internal RAM)
   uint8_t* packed_screenbuffer = nullptr; // 2bpp previous frame (PSRAM)
+  uint8_t* packed_paintbuffer = nullptr; // 2bpp previous frame (PSRAM)
+
   uint32_t* bitmask = nullptr;
 
-
-
-
   int packed_row_bytes = 0;
+  int paintStage = 0;
   bool interlace_period = false;
   bool shouldSkipRow = false;
 

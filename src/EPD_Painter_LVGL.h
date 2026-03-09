@@ -52,10 +52,6 @@ public:
     {}
 
     ~EPD_PainterLVGL() {
-        if (_paint_timer) {
-            lv_timer_delete(_paint_timer);
-            _paint_timer = nullptr;
-        }
         heap_caps_free(_framebuffer);
         _framebuffer = nullptr;
     }
@@ -88,8 +84,6 @@ public:
         lv_display_set_flush_cb(_disp, _flush_cb);
         lv_display_set_user_data(_disp, this);
 
-        // Task runs every lv_timer_handler() call; does the actual EPD paint.
-        _paint_timer = lv_timer_create(_paint_task_cb, 0, this);
 
         return true;
     }
@@ -142,28 +136,9 @@ private:
     // -------------------------------------------------------------------------
     static void _flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
         auto *self = static_cast<EPD_PainterLVGL *>(lv_display_get_user_data(disp));
-        self->_pending_px_map = px_map;
-        self->_paint_pass     = 0;
-        self->_flush_pending  = true;
+        self->_painter.paintLater(px_map);
         lv_display_flush_ready(disp);
     }
 
-    // -------------------------------------------------------------------------
-    // LVGL task callback — runs every lv_timer_handler() iteration.
-    // Calls paint() once per invocation until _paint_passes have been done.
-    // -------------------------------------------------------------------------
-    static void _paint_task_cb(lv_timer_t *timer) {
-        auto *self = static_cast<EPD_PainterLVGL *>(lv_timer_get_user_data(timer));
-        if (!self->_flush_pending) return;
-
-        self->_painter.paint(self->_pending_px_map);
-
-        self->_paint_pass++;
-
-        if (self->_paint_pass >= self->_paint_passes) {
-            self->_flush_pending  = false;
-            self->_pending_px_map = nullptr;
-            self->_paint_pass     = 0;
-        }
-    }
+  
 };
