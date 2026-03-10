@@ -136,9 +136,6 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
   }
 
 
-
-
-
   LCD_CAM.lcd_user.lcd_start = 1;
 
   if (lastLine) {
@@ -526,7 +523,7 @@ void EPD_Painter::_paint_task_body() {
 // clear()
 // =============================================================================
 void EPD_Painter::clear() {
-  PanelPowerGuard guard(*this);
+
   const int packed_row_bytes = _config.width / 4;
 
   // for(;;){
@@ -549,7 +546,14 @@ void EPD_Painter::clear() {
   //   EPD_DELAY_MS(1);
   // }
 
+  xSemaphoreTake(_paint_start_sem, portMAX_DELAY); 
+  memset(packed_paintbuffer, 0x00, packed_row_bytes * _config.height);
+  paintStage=2;
+  xSemaphoreGive(_paint_start_sem); 
 
+  delay(400);
+
+  PanelPowerGuard guard(*this);
   const uint8_t *lt_wf;
   int wf_len;
 
@@ -578,7 +582,6 @@ void EPD_Painter::clear() {
       EPD_DELAY_MS(15);
     }
   }
-
 
   // Send neutral..
   memset(dma_buffer1, 0x00, packed_row_bytes);
