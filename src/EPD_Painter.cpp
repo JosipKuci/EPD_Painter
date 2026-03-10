@@ -397,13 +397,13 @@ static uint8_t darker_waveform[][7] = {
 // Higer quality waveforms
 static uint8_t hq_lighter_waveform[][13] = {
   { 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3 },
-  { 1, 1, 1, 2, 3, 2, 2, 2, 3, 3, 2, 2, 2 },
+  { 1, 1, 2, 2, 3, 2, 2, 2, 3, 3, 2, 2, 2 },
   { 2, 2, 2, 2, 2, 3, 2, 2, 2, 2, 2, 3, 2 }
 };
 
 static uint8_t hq_darker_waveform[][13] = {
   { 1, 1, 3, 3, 1, 3, 3, 3, 1, 3, 1, 2, 2 },
-  { 3, 3, 3, 3, 1, 3, 3, 1, 1, 3, 1, 3, 3 },
+  { 3, 3, 3, 1, 1, 3, 3, 1, 1, 3, 1, 3, 3 },
   { 1, 1, 1, 1, 1, 3, 1, 1, 1, 1, 1, 3, 1 }
 };
 
@@ -464,8 +464,7 @@ void EPD_Painter::_paint_task_body() {
     for (int row = 0; row < _config.height; row++) {
       uint8_t *fb_row = packed_fastbuffer + row * packed_row_bytes;
       uint8_t *sb_row = packed_screenbuffer + row * packed_row_bytes;
-      bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes,
-                                     (row & 1) ? 0x00000000 : 0xffffffff);
+      bitmask[row] = epd_painter_ink(fb_row, sb_row, packed_row_bytes,  0xffffffff);
     }
 
     const uint8_t *lt_wf;
@@ -506,7 +505,7 @@ void EPD_Painter::_paint_task_body() {
       } else if (_config.quality == Quality::QUALITY_NORMAL) {
         EPD_DELAY_MS(4);
       } else {
-        EPD_DELAY_MS(7);
+        EPD_DELAY_MS(6);
       }
     }
 
