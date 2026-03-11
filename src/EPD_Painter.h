@@ -49,6 +49,7 @@ struct PowerCtlConfig {
       uint16_t width;
       uint16_t height;
       int8_t pin_pwr;
+      int8_t pin_syspwr = -1;
       int8_t pin_sph;
       int8_t pin_oe;
       int8_t pin_cl;
@@ -70,6 +71,8 @@ struct PowerCtlConfig {
 
   void clear();
   void paint(uint8_t* framebuffer);
+  void paintPacked(const uint8_t* packed);
+  void unpaintPacked(const uint8_t* packed);
   void paintLater(uint8_t* framebuffer);
   void setInterlaceMode(bool mode){
     interlace_mode = mode;

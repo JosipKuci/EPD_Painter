@@ -7,7 +7,8 @@
     static EPD_Painter::Config EPD_PAINTER_PRESET = {
         .width    = 960,
         .height   = 540,
-        .pin_pwr  = 46,
+        .pin_pwr    = 46,
+        .pin_syspwr = 44,
         .pin_sph  = 13,
         .pin_oe   = 45,
         .pin_cl   = 16,
@@ -27,6 +28,7 @@
     static EPD_Painter::Config EPD_PAINTER_PRESET = {
         .width    = 960,
         .height   = 540,
+        .pin_pwr  = -1,
         .pin_sph  = 41,
         .pin_cl   = 4,
         .pin_spv  = 45,

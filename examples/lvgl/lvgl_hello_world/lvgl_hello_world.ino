@@ -15,7 +15,6 @@ static uint32_t my_tick_cb() {
     return millis();
 }
 
-
 static lv_obj_t *slider1_label;
 static lv_obj_t *slider2_label;
 
@@ -80,12 +79,11 @@ void setup() {
    } else {
         Serial.println("wire is not null");
     }  
-    Serial.println("got there");
 
     tc.setRotation(ROTATION_RIGHT);
     tc.begin(display.getConfig().i2c.wire);
-    Serial.println("got here");
 
+    display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
     display.clear();
 
     lv_obj_set_style_bg_color(lv_screen_active(), EPD_PainterLVGL::WHITE, 0);

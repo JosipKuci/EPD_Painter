@@ -12,6 +12,7 @@
 #include <soc/lcd_cam_struct.h>
 #include "EPD_Painter.h"
 #include <epd_painter_powerctl.h>
+#include "epd_painter_shutdown.h"
 
 #ifdef ARDUINO
   #include "Wire.h"
@@ -316,6 +317,8 @@ bool EPD_Painter::begin() {
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
 
+  new EPD_PainterShutdown(this);
+
   return true;
 }
 
@@ -421,6 +424,37 @@ void EPD_Painter::paint(uint8_t *framebuffer) {
 }
 
 // =============================================================================
+// paintPacked() — like paint() but skips compaction; buffer is already 2bpp
+// =============================================================================
+void EPD_Painter::paintPacked(const uint8_t* packed) {
+  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  memcpy(packed_paintbuffer, packed, (_config.width * _config.height) / 4);
+  paintStage = (interlace_mode ? 3 : 2);
+  xSemaphoreGive(_paint_buffer_sem);
+
+  while (paintStage == (interlace_mode ? 3 : 2)) {
+    vTaskDelay(1);
+  }
+}
+
+// =============================================================================
+// unpaintPacked() — DC-balance pass: tells the driver the screen currently
+// shows 'packed', then drives a blank (all-zero) frame so every pixel that
+// was darkened gets a matching lightening pulse.
+// =============================================================================
+void EPD_Painter::unpaintPacked(const uint8_t* packed) {
+  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  memcpy(packed_screenbuffer, packed, packed_row_bytes * _config.height);
+  memset(packed_paintbuffer,  0x00,  packed_row_bytes * _config.height);
+  paintStage = (interlace_mode ? 3 : 2);
+  xSemaphoreGive(_paint_buffer_sem);
+
+  while (paintStage == (interlace_mode ? 3 : 2)) {
+    vTaskDelay(1);
+  }
+}
+
+// =============================================================================
 // paintLater
 // =============================================================================
 void EPD_Painter::paintLater(uint8_t *framebuffer) {
@@ -452,7 +486,7 @@ void EPD_Painter::_paint_task_body() {
     xSemaphoreGive(_paint_buffer_sem);
 
     paintStage-=1;
-  
+
     PanelPowerGuard guard(*this);
 
     for (int row = 0; row < _config.height; row++) {
@@ -541,14 +575,6 @@ void EPD_Painter::clear() {
   PanelPowerGuard guard(*this);
   const uint8_t *lt_wf;
   int wf_len;
-
-  if (_config.quality == Quality::QUALITY_HIGH) {
-    lt_wf = &hq_lighter_waveform[0][0];
-    wf_len = 13;
-  } else {
-    lt_wf = &lighter_waveform[0][0];
-    wf_len = 7;
-  }
 
   // Send clear
   for (int phase = 0; phase < 4; phase++) {
