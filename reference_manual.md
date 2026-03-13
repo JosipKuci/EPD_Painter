@@ -116,11 +116,71 @@ display.paint();  // high quality render
 
 ---
 
+## Colour Depth — Why Only Four Shades?
+
+EPD_Painter deliberately limits the display to four shades of grey (2 bits per pixel). This is a performance decision, not a hardware limitation.
+
+E-paper panels are driven by multi-step waveforms — each shade transition requires a sequence of voltage pulses applied over several passes. Supporting more grey levels (e.g. 16 or 32) means running proportionally more waveform passes per frame, which multiplies refresh time. At four shades the driver can complete a full-screen delta update at ~70fps equivalent, with the second pass running in the background.
+
+The 2bpp pixel format also has a direct impact on memory bandwidth and the efficiency of the ESP32-S3 SIMD assembly that packs pixels: 64 pixels fit in a single 128-bit vector operation, keeping the pipeline fast enough to sustain real-time updates.
+
+In short: four shades gives you a display that feels responsive and interactive. More shades would mean slower, flashier refreshes more typical of traditional e-paper use.
+
+---
+
+## Shutdown Image
+
+When the board powers off, EPD_Painter displays a static image from LittleFS:
+
+```
+/.epd_painter_shutdown.img
+```
+
+If this file is not present, a Mandelbrot fractal is generated and shown as a fallback.
+
+### File format
+
+The file is raw 2bpp packed pixel data — the same format used internally by the driver. Each byte holds **4 pixels**, packed from MSB to LSB:
+
+```
+Bits 7-6 → pixel 0
+Bits 5-4 → pixel 1
+Bits 3-2 → pixel 2
+Bits 1-0 → pixel 3
+```
+
+Pixel values:
+
+| Bits | Shade |
+|---|---|
+| `00` | White |
+| `01` | Light grey |
+| `10` | Dark grey |
+| `11` | Black |
+
+File size for a 960×540 display: `960 × 540 / 4 = 129,600 bytes`.
+
+Pixels are stored row by row, left to right, top to bottom.
+
+### Generating a shutdown image
+
+Convert any image to the correct format with ImageMagick — quantise to 4 grey levels and pack to 2bpp:
+
+```bash
+convert input.png -resize 960x540! -colorspace Gray \
+  -posterize 4 -depth 2 -type Grayscale \
+  gray:shutdown.img
+```
+
+Then upload `shutdown.img` to LittleFS at the path `/.epd_painter_shutdown.img` using the Arduino LittleFS upload tool or your preferred method.
+
+---
+
 ## Adafruit GFX Binding
 
 Wraps `EPD_PainterAdafruit`, which extends `GFXcanvas8`. All standard Adafruit GFX drawing functions are available — `print()`, `drawLine()`, `drawBitmap()`, `fillRect()`, `setFont()`, etc.
 
-Pixel values are 8bpp greyscale. The driver uses the two most significant bits, giving four shades:
+Pixel values are 8bpp greyscale. The driver reads the two most significant bits, giving four shades:
 
 | Value | Shade |
 |---|---|
@@ -290,15 +350,6 @@ void loop() {
     lv_timer_handler();  // LVGL drives paint() internally via flush callback
     delay(5);
 }
-```
-
-### Adjusting paint passes (LVGL)
-
-By default the LVGL binding runs 2 paint passes per flush. You can change this:
-
-```cpp
-display.setPaintPasses(1);  // faster, may leave lighter pixels incomplete
-display.setPaintPasses(2);  // default — full coverage
 ```
 
 ---

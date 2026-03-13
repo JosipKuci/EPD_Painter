@@ -115,22 +115,12 @@ public:
     EPD_Painter  &driver()  { return _painter; }
     lv_display_t *display() { return _disp; }
 
-    // -------------------------------------------------------------------------
-    // setPaintPasses() — how many times paint() is called per flush.
-    // 1 = single pass (default); 2 = two sequential paint passes per frame.
-    // -------------------------------------------------------------------------
-    void setPaintPasses(uint8_t n) { _paint_passes = (n > 0) ? n : 1; }
 
 private:
     uint8_t             *_framebuffer    = nullptr;   // owned here
     EPD_Painter          _painter;                    // borrows _framebuffer
-    lv_display_t        *_disp           = nullptr;
-    lv_timer_t          *_paint_timer    = nullptr;
+    lv_display_t        *_disp;
 
-    uint8_t             *_pending_px_map = nullptr;   // set by flush_cb
-    bool                 _flush_pending  = false;     // task consumes this
-    uint8_t              _paint_pass     = 0;         // passes completed
-    uint8_t              _paint_passes   = 2;         // passes required
 
     // -------------------------------------------------------------------------
     // LVGL flush callback — stores the buffer pointer and returns immediately.
