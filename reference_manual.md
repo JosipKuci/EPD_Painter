@@ -168,7 +168,7 @@ Convert any image to the correct format with ImageMagick — quantise to 4 grey 
 
 ```bash
 convert input.png -resize 960x540! -colorspace Gray \
-  -posterize 4 -depth 2 -type Grayscale \
+  -posterize 4 -negate -depth 2 -type Grayscale \
   gray:shutdown.img
 ```
 

@@ -1,26 +1,176 @@
-![epd painter logo](img/epdpainter_logo.png "")
-
+![EPD Painter logo](img/epdpainter_logo.png)
 
 # EPD_Painter
-Fast m5paperS3 epaper driver
 
-Currently just a Proof of concept Arduino project.
+A high-performance e-paper display driver for ESP32-S3, targeting the **M5Stack M5PaperS3** and **LilyGo T5 S3 GPS**. Achieves ~70fps equivalent update rates through a combination of ESP32-S3 vector (SIMD) assembly, a custom LCD_CAM DMA pipeline, and a delta-update pixel system.
 
-Download, open in arduino IDE.
+---
 
-You need to add the Adafruit GFX Library, to get things going.  It might not be the fastest out there, but its rock solid.
+## What makes this different
 
-This should work straight away on an M5PaperS3,  for other epaper devices that use an ESP32-S3, update the pins in EPD_Painter.h
+Most ESP32-S3 e-paper drivers use the standard `esp_lcd_panel_io_i80` interface for pushing pixels. That interface has significant overhead and is the main bottleneck for high-speed EPD updates. EPD_Painter bypasses it entirely and drives the LCD_CAM peripheral directly — an approach inspired by [this Adafruit blog post](https://blog.adafruit.com/2022/06/21/esp32uesday-more-s3-lcd-peripheral-hacking-with-code/).
 
-The main differences between this and, I think, all other ESP32-S3 epaper drivers:
-* Uses ESP32-S3 Vector code to calculate 64 pixels at a time.
-* Uses a different way of using DMA.  The standard ESP32-S3 I80 drivers (using esp_lcd_panel_io_i80_config_t and esp_lcd_panel_io_tx_color), are terrible, and the biggest bottleneck for high performance.  After battling hard trying to get it to perform, I found this adafruit blog.  https://blog.adafruit.com/2022/06/21/esp32uesday-more-s3-lcd-peripheral-hacking-with-code/  -  I ripped it out, and used the LCD_CAM driver instead.  Far far faster.
-* Just 4 colours (2 bit).  I don't see this changing soon, due to the way the vector code shift bits...   epaper receives commands in 2 bits per pixel,  and 4 colours are 2 bits per pixel... to convert between requires a few boolean operations...and incredibly quick.  There maybe ways though ....maybe do multiple passes with different waveform arrays? but, this is far future.
+On top of that:
 
-# todo
-* Make this a propper library
-* Currently requires 2 paints to paint every line complete.  Add an interlace mode, which if turned off, will automatically do 2 paints 
-* Screen is balanced when in use, but when turned off, the memory clears and when turned on, it doesn't know what pixels were dark/white in order to dc balance.  What would be perfect is a 'turn off' method that will clear the screen, and then turn off the M5PaperS3.... Or, even better, display an off image, before turning off. which is used to DC balance when turned back on.
-* Add a quality setting, that adjusts the delay when each line is latched. It appears that a longer delay = darker image, at a cost of slower update.
-* Add some instructions!!.... But, its very easy - Use the same way as AdafruitGFX.  But, when you're ready to paint to the screen,  call paint();
-  
+- **ESP32-S3 vector (SIMD) assembly** — pixel packing, waveform conversion, and delta detection are done 64 pixels at a time using 128-bit vector registers
+- **Delta updates** — only pixels that have changed since the last frame are driven, keeping refresh times short even for large screens
+- **Dual-core pipeline** — the second waveform pass runs on the background core while your code continues on the main core
+- **4-shade greyscale** (white, light grey, dark grey, black) — the 2bpp pixel format maps directly onto the EPD waveform encoding with minimal conversion, keeping the pipeline fast
+
+---
+
+## Supported boards
+
+| Board | Resolution | Preset |
+|---|---|---|
+| M5Stack M5PaperS3 | 960×540 | `EPD_PAINTER_PRESET_M5PAPER_S3` |
+| LilyGo T5 S3 GPS | 960×540 | `EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS` |
+
+---
+
+## Installation
+
+1. Download or clone this repository
+2. Open `src/src.ino` in Arduino IDE
+3. Install the **Adafruit GFX Library** (required)
+4. Install **LVGL v9** (optional — needed for LVGL examples)
+5. Select your board: M5Stack M5PaperS3 or LilyGo T5 S3 GPS (ESP32-S3 with PSRAM)
+6. Add one `#define` before your includes to select your board preset (see below)
+
+---
+
+## Quick start
+
+```cpp
+#define EPD_PAINTER_PRESET_M5PAPER_S3
+#include "EPD_Painter_presets.h"
+#include "EPD_Painter_Adafruit.h"
+
+EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
+
+void setup() {
+    display.begin();
+
+    display.fillScreen(0x00);       // white background
+    display.setTextColor(0xFF);     // black text
+    display.setTextSize(3);
+    display.setCursor(40, 40);
+    display.print("Hello, EPD!");
+
+    display.paint();
+}
+
+void loop() {}
+```
+
+---
+
+## Bindings
+
+| Binding | Header | Description |
+|---|---|---|
+| Adafruit GFX | `EPD_Painter_Adafruit.h` | Full Adafruit GFX API — `print()`, `drawBitmap()`, shapes, custom fonts |
+| LVGL v9 | `EPD_Painter_LVGL.h` | Complete LVGL widget library; flush callback wired automatically |
+| Raw driver | `EPD_Painter.h` | Bring your own 8bpp framebuffer |
+
+---
+
+## Core API
+
+| Function | Description |
+|---|---|
+| `begin()` | Allocate buffers, init hardware and I2C |
+| `paint()` | Delta-update the panel; first pass blocks, second pass runs in background |
+| `paintLater()` | Fully non-blocking paint — hands off to background task immediately |
+| `clear()` | Drive the **physical panel** to full white; removes ghosting |
+| `setQuality(q)` | `QUALITY_HIGH` / `QUALITY_NORMAL` / `QUALITY_FAST` — trades refresh speed for black depth |
+
+**Ghosting removal:**
+```cpp
+display.clear();   // blank the physical panel
+display.paint();   // repaint current framebuffer onto the clean panel
+```
+
+See [reference_manual.md](reference_manual.md) for full documentation with copy-paste examples.
+
+---
+
+## Colour depth
+
+EPD_Painter uses 4 shades of grey (2 bits per pixel). This is a deliberate performance choice — more grey levels require proportionally more waveform passes per frame, multiplying refresh time. At 4 shades the driver keeps updates fast enough to feel interactive.
+
+| Adafruit GFX value | Shade |
+|---|---|
+| `0x00` | White |
+| `0x55` | Light grey |
+| `0xAA` | Dark grey |
+| `0xFF` | Black |
+
+For the LVGL binding, use the provided colour constants (`EPD_PainterLVGL::WHITE`, `::LT_GREY`, `::DK_GREY`, `::BLACK`) rather than standard LVGL colour functions.
+
+---
+
+## Shutdown image
+
+When the device powers off, EPD_Painter displays a static image stored in LittleFS at:
+
+```
+/.epd_painter_shutdown.img
+```
+
+If the file is not present, a Mandelbrot fractal is generated as a fallback. The file format is raw 2bpp packed pixels — 4 pixels per byte, `00`=white through `11`=black — matching the driver's internal format.
+
+Convert a PNG with ImageMagick:
+```bash
+convert input.png -resize 960x540! -colorspace Gray \
+  -posterize 4 -negate -depth 2 -type Grayscale \
+  gray:shutdown.img
+```
+
+---
+
+## Examples
+
+| Example | Binding | Description |
+|---|---|---|
+| `adafruit/bounce` | Adafruit GFX | Bouncing ball animation |
+| `adafruit/breakout` | Adafruit GFX | Playable Breakout game |
+| `adafruit/circles` | Adafruit GFX | Animated circles |
+| `adafruit/page_text` | Adafruit GFX | Text rendering |
+| `lvgl/lvgl_hello_world` | LVGL | Minimal LVGL setup |
+| `lvgl/lvgl_gps_clock` | LVGL | GPS-synced clock (LilyGo) |
+| `lvgl/lvgl_gps_receiver` | LVGL | Live GPS data display (LilyGo) |
+| `lvgl/lvgl_lighting_control` | LVGL | UI control panel demo |
+| `lvgl/pixel_post_controller` | LVGL | Pixel art post controller |
+| `other/elevated` | Raw | ESP32 port of the Elevated 4K intro |
+| `other/drift` | Raw | Julia set morphing animation |
+| `other/gps_raw_serial` | Raw | Raw NMEA output from u-blox GPS (LilyGo) |
+| `other/lilygo_t5_shutdown` | Raw | Graceful shutdown with LittleFS image |
+| `map_viewer` | Raw | Live OpenStreetMap tile viewer via GPS |
+
+---
+
+## Architecture overview
+
+```
+ ┌─────────────────────────┐
+ │  8bpp GFX canvas (PSRAM)│  ← Adafruit GFX / LVGL draws here
+ └────────────┬────────────┘
+              │ SIMD pixel packing (assembly)
+ ┌────────────▼────────────┐
+ │ 2bpp fastbuffer (IRAM)  │  ← 64-pixel chunks, bitmask delta detection
+ └────────────┬────────────┘
+              │ waveform lookup + DMA
+ ┌────────────▼────────────┐
+ │   LCD_CAM DMA → panel   │  ← row-by-row, SPV/CKV/LE timing signals
+ └─────────────────────────┘
+```
+
+Memory usage on a 960×540 display:
+
+| Buffer | Location | Size |
+|---|---|---|
+| 8bpp GFX canvas | PSRAM | ~518 KB |
+| 2bpp fastbuffer | Internal RAM | ~130 KB |
+| 2bpp screenbuffer | PSRAM | ~130 KB |
+| DMA row buffers | Internal RAM | 480 B (double-buffered) |
