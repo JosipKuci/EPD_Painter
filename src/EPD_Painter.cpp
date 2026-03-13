@@ -598,13 +598,13 @@ void EPD_Painter::clear() {
     memset(dma_buffer1, pattern, packed_row_bytes);
     memset(dma_buffer2, pattern, packed_row_bytes);
 
-    int totpass[] = { 6, 2, 4, 8, 6, 6, 6, 6 };
+    int totpass[] = { 6, 2, 4, 8}; //6 blacks, 2 whites, 4 blacks 8 whites.
 
     for (int passes = 0; passes < totpass[phase]; passes++) {
       for (int row = 0; row < _config.height; ++row) {
         sendRow(row == 0);
       }
-      EPD_DELAY_MS(15);
+      EPD_DELAY_MS(5);
     }
   }
 
