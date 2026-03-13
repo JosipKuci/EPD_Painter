@@ -14,7 +14,7 @@ On top of that:
 
 - **ESP32-S3 vector (SIMD) assembly** — pixel packing, waveform conversion, and delta detection are done 64 pixels at a time using 128-bit vector registers
 - **Delta updates** — only pixels that have changed since the last frame are driven.
-- **Dual-core pipeline** — the second waveform pass runs on the background core while your code continues on the main core
+- **Dual-core pipeline** — the waveform rendering runs in the background core while your code continues on the main core.
 - **4-shade greyscale** (white, light grey, dark grey, black) — the 2bpp pixel format maps directly onto the EPD waveform encoding with minimal conversion, keeping the pipeline fast
 
 ---
