@@ -30,7 +30,7 @@ Add one of these `#define`s before your includes:
 
 ### `begin()`
 
-Allocates buffers, initialises the LCD_CAM DMA hardware, and powers on the PMIC. Call once in `setup()`, after `Wire.begin()` if using I2C power control.
+Allocates buffers, initialises the LCD_CAM DMA hardware, and powers on the PMIC. I2C is initialised internally — you do not need to call `Wire.begin()`.
 
 Returns `true` on success.
 
@@ -41,20 +41,25 @@ if (!display.begin()) {
 }
 ```
 
+If you need access to the I2C bus (e.g. to talk to other devices on the same bus), retrieve the `Wire` instance via `getConfig()`:
+
+```cpp
+TwoWire* wire = display.getConfig().i2c.wire;
+wire->beginTransmission(0x51);  // talk to another device on the bus
+// ...
+```
+
 ---
 
 ### `paint()`
 
-Pushes the current framebuffer to the physical display. Uses **delta update** — only pixels that changed since the last `paint()` are driven. Two sequential `paint()` calls cover all cases (lighter pixels deferred to the second pass).
+Pushes the current framebuffer to the physical display. Uses **delta update** — only pixels that changed since the last `paint()` are driven.
 
-**Blocking** — returns after the panel refresh completes.
+`paint()` runs the first pass and returns. A second pass then runs automatically in the background to handle the case where a previously lightened pixel needs to be darkened — full coverage is achieved without blocking your code.
 
 ```cpp
-display.paint();          // first pass
-display.paint();          // second pass catches deferred lighter pixels
+display.paint();   // runs first pass, returns; second pass runs in background
 ```
-
-> **Tip:** For static content that rarely changes, a single `paint()` call is usually sufficient and faster.
 
 ---
 
@@ -135,7 +140,6 @@ EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
 
 void setup() {
     Serial.begin(115200);
-    Wire.begin(41, 42);  // SDA, SCL for M5PaperS3
 
     if (!display.begin()) {
         Serial.println("Display init failed");
@@ -151,9 +155,8 @@ void setup() {
 
     display.drawRect(20, 20, 400, 80, 0xFF);
 
-    // Push to panel
+    // Push to panel — second pass runs automatically in background
     display.paint();
-    display.paint();  // second pass for full coverage
 }
 
 void loop() {}
@@ -170,7 +173,6 @@ EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
 
 void setup() {
     Serial.begin(115200);
-    Wire.begin(39, 40);  // SDA, SCL for LilyGo T5 S3
 
     if (!display.begin()) {
         Serial.println("Display init failed");
@@ -185,7 +187,6 @@ void setup() {
     display.setCursor(10, 10);
     display.print("LilyGo T5 S3 GPS");
 
-    display.paint();
     display.paint();
 }
 
@@ -227,7 +228,6 @@ void loop() {
     display.print(refreshCount);
 
     display.paint();
-    display.paint();
 }
 ```
 
@@ -267,7 +267,6 @@ static uint32_t my_tick_cb(void) {
 
 void setup() {
     Serial.begin(115200);
-    Wire.begin(41, 42);
 
     lv_init();
     lv_tick_set_cb(my_tick_cb);
@@ -322,7 +321,6 @@ display.fillScreen(0x00);
 display.setCursor(40, 200);
 display.print("Done.");
 display.paint();
-display.paint();
 ```
 
 ---
@@ -332,7 +330,7 @@ display.paint();
 | Function | Blocks? | What it does |
 |---|---|---|
 | `begin()` | yes | Allocate buffers, init hardware |
-| `paint()` | yes | Delta-update the panel from the current framebuffer |
+| `paint()` | first pass | Delta-update; first pass blocks, second pass runs in background |
 | `paintLater()` | no | Trigger a background delta-update; returns immediately |
 | `clear()` | yes | Drive the **physical panel** to full white, remove ghosting |
 | `setQuality(q)` | — | Set waveform timing for next paint |
