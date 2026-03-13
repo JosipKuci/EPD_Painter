@@ -120,11 +120,11 @@ display.paint();  // high quality render
 
 EPD_Painter deliberately limits the display to four shades of grey (2 bits per pixel). This is a performance decision, not a hardware limitation.
 
-E-paper panels are driven by multi-step waveforms — each shade transition requires a sequence of voltage pulses applied over several passes. Supporting more grey levels (e.g. 16 or 32) means running proportionally more waveform passes per frame, which multiplies refresh time. At four shades the driver can complete a full-screen delta update at ~70fps equivalent, with the second pass running in the background.
+E-paper panels are driven by waveforms where each period is encoded as 2 bits. Four shades maps directly onto this — one 2bpp pixel value equals one 2-bit waveform period. The conversion is a handful of boolean operations, and the ESP32-S3 SIMD assembly handles 64 pixels at a time in a single 128-bit vector operation.
 
-The 2bpp pixel format also has a direct impact on memory bandwidth and the efficiency of the ESP32-S3 SIMD assembly that packs pixels: 64 pixels fit in a single 128-bit vector operation, keeping the pipeline fast enough to sustain real-time updates.
+More grey levels would break this clean 1:1 mapping. Converting, say, 4bpp or 8bpp pixel values into 2-bit waveform periods requires significantly more memory manipulation per pixel, which would make the pipeline too slow for real-time updates.
 
-In short: four shades gives you a display that feels responsive and interactive. More shades would mean slower, flashier refreshes more typical of traditional e-paper use.
+In short: four shades is the sweet spot where the pixel format and the waveform encoding are the same thing — and that is what makes the ~70fps equivalent update rate possible.
 
 ---
 
