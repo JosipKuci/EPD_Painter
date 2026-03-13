@@ -30,12 +30,14 @@ On top of that:
 
 ## Installation
 
-1. Download or clone this repository
-2. Open `src/src.ino` in Arduino IDE
-3. Install the **Adafruit GFX Library** (required)
-4. Install **LVGL v9** (optional — needed for LVGL examples)
-5. Select your board: M5Stack M5PaperS3 or LilyGo T5 S3 GPS (ESP32-S3 with PSRAM)
-6. Add one `#define` before your includes to select your board preset (see below)
+1. Clone this repository into your Arduino `libraries` folder:
+   ```
+   git clone https://github.com/your-repo/EPD_Painter ~/Arduino/libraries/EPD_Painter
+   ```
+2. Install the **Adafruit GFX Library** (required) via Arduino Library Manager
+3. Install **LVGL v9** (optional — needed for LVGL examples) via Arduino Library Manager
+4. Select your board in Arduino IDE: M5Stack M5PaperS3 or LilyGo T5 S3 GPS (ESP32-S3 with PSRAM)
+5. Add one `#define` before your includes to select your board preset (see Quick Start below)
 
 ---
 
@@ -51,8 +53,8 @@ EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
 void setup() {
     display.begin();
 
-    display.fillScreen(0x00);       // white background
-    display.setTextColor(0xFF);     // black text
+    display.fillScreen(0);      // white background
+    display.setTextColor(3);    // black text
     display.setTextSize(3);
     display.setCursor(40, 40);
     display.print("Hello, EPD!");
@@ -99,12 +101,12 @@ See [reference_manual.md](reference_manual.md) for full documentation with copy-
 
 EPD_Painter uses 4 shades of grey (2 bits per pixel). This is a deliberate performance choice — more grey levels require proportionally more waveform passes per frame, multiplying refresh time. At 4 shades the driver keeps updates fast enough to feel interactive.
 
-| Adafruit GFX value | Shade |
+| Value | Shade |
 |---|---|
-| `0x00` | White |
-| `0x55` | Light grey |
-| `0xAA` | Dark grey |
-| `0xFF` | Black |
+| `0` | White |
+| `1` | Light grey |
+| `2` | Dark grey |
+| `3` | Black |
 
 For the LVGL binding, use the provided colour constants (`EPD_PainterLVGL::WHITE`, `::LT_GREY`, `::DK_GREY`, `::BLACK`) rather than standard LVGL colour functions.
 
