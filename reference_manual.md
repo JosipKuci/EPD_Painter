@@ -523,8 +523,16 @@ is now armed — pressing reset will trigger shutdown.
 ### Intercepting shutdown — showing a confirmation screen
 
 Set `setAutoShutdown(false)` before `begin()` so that `proceed()` is not called
-automatically. Then check `isPending()` in your loop and show your own UI
-before deciding whether to proceed or cancel.
+automatically. Then check `isPending()` in `setup()` or `loop()` and show your
+own UI before deciding whether to proceed or cancel.
+
+A complete working example is provided at
+`examples/adafruit/shutdown_confirmation/`. It shows a 5-second countdown on
+the EPD with a prompt to press the BOOT button (GPIO 0) to cancel. If the
+countdown expires the device shuts down; if the button is pressed, shutdown is
+cancelled and the main screen is restored.
+
+The key structure:
 
 ```cpp
 EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
