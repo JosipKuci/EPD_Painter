@@ -33,11 +33,18 @@ public:
     // -------------------------------------------------------------------------
     // Constructor — allocates the framebuffer and wires everything together.
     // -------------------------------------------------------------------------
-    explicit EPD_PainterAdafruit(const EPD_Painter::Config &config)
-        : GFXcanvas8(config.width, config.height, false),
+    explicit EPD_PainterAdafruit(const EPD_Painter::Config &config, bool portrait = false)
+        : GFXcanvas8(
+              // Swap canvas dimensions for portrait (CW rotation) so the GFX
+              // drawing space matches the logical orientation.
+              (config.rotation == EPD_Painter::Rotation::ROTATION_CW || portrait) ? config.height : config.width,
+              (config.rotation == EPD_Painter::Rotation::ROTATION_CW || portrait) ? config.width  : config.height,
+              false),
           _config(config),
-          _painter(config)   
-    {}
+          _painter(config, portrait)
+    {
+        if (portrait) _config.rotation = EPD_Painter::Rotation::ROTATION_CW;
+    }
 
     // -------------------------------------------------------------------------
     // Destructor — frees the framebuffer.

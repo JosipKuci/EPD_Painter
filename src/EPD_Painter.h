@@ -48,6 +48,11 @@ struct PowerCtlConfig {
     QUALITY_FAST
   };
 
+  enum class Rotation {
+    ROTATION_0,   // landscape — normal orientation
+    ROTATION_CW   // 90° clockwise — portrait drawing canvas (width↔height swapped)
+  };
+
   struct Config {
       uint16_t width;
       uint16_t height;
@@ -59,16 +64,21 @@ struct PowerCtlConfig {
       int8_t pin_spv;
       int8_t pin_ckv;
       int8_t pin_le;
-      Quality quality;
+      Quality  quality;
+      Rotation rotation = Rotation::ROTATION_0;
       int8_t data_pins[8];
       I2CBusConfig i2c{};
       PowerCtlConfig power{};
+
+      // Returns a copy of this config with rotation set — lets you write:
+      //   EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_CW));
+      Config withRotation(Rotation r) const { Config c = *this; c.rotation = r; return c; }
   };
 
 
   Config _config;
 
-  EPD_Painter(const Config &config);
+  EPD_Painter(const Config &config, bool portrait = false);
   bool begin();
   bool end();
 

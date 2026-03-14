@@ -47,8 +47,8 @@ public:
     inline static const lv_color_t DK_GREY = lv_color_make(0, 0, 170);   // blue>>6 = 2
     inline static const lv_color_t BLACK   = lv_color_make(0, 0, 255);   // blue>>6 = 3
 
-    explicit EPD_PainterLVGL(const EPD_Painter::Config &config)
-        : _painter(config)
+    explicit EPD_PainterLVGL(const EPD_Painter::Config &config, bool portrait = false)
+        : _painter(config, portrait)
     {}
 
     ~EPD_PainterLVGL() {
@@ -75,7 +75,11 @@ public:
 
         // Register with LVGL — FULL mode means flush_cb is called once per
         // frame with the complete buffer, ideal for eInk.
-        _disp = lv_display_create(_painter.getConfig().width, _painter.getConfig().height);
+        // Use logical (canvas) dimensions: swapped for portrait rotation.
+        const auto &cfg = _painter.getConfig();
+        const uint16_t lv_w = (cfg.rotation == EPD_Painter::Rotation::ROTATION_CW) ? cfg.height : cfg.width;
+        const uint16_t lv_h = (cfg.rotation == EPD_Painter::Rotation::ROTATION_CW) ? cfg.width  : cfg.height;
+        _disp = lv_display_create(lv_w, lv_h);
         lv_display_set_buffers(
             _disp,
             _framebuffer,

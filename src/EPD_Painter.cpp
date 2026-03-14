@@ -45,6 +45,51 @@ epd_painter_powerctl *powerctl = nullptr;
 extern "C" void epd_painter_compact_pixels(
   const uint8_t *input, uint8_t *output, uint32_t size);
 
+// =============================================================================
+// compact_pixels_rotated_cw
+//
+// Combines 90° clockwise rotation and 8bpp→2bpp compaction in one pass.
+//
+// The portrait canvas is src_w wide × src_h tall (e.g. 540×960).
+// The physical panel is src_h wide × src_w tall (e.g. 960×540).
+//
+// Rotation mapping (clockwise):
+//   canvas pixel (col=x, row=y)  →  panel pixel (col=y, row=src_w-1-x)
+//
+// Processed in blocks of 16 portrait rows so the working set (16 × src_w bytes)
+// stays warm in cache across all src_w column iterations within each block,
+// avoiding repeated PSRAM fetches for the strided column access pattern.
+//
+// src_h must be a multiple of 16. src_w must be a multiple of 4.
+// =============================================================================
+static IRAM_ATTR void compact_pixels_rotated_cw(
+    const uint8_t* src, uint8_t* dst, int src_w, int src_h)
+{
+
+    const int out_stride = src_h / 4;   // packed bytes per output row (e.g. 240)
+
+    for (int rb = 0; rb < src_h; rb += 16) {
+        for (int cx = 0; cx < src_w; cx++) {
+            // CW: canvas column cx → output row (src_w - 1 - cx)
+            uint8_t* out       = dst + (src_w - 1 - cx) * out_stride + rb / 4;
+            const uint8_t* col = src + rb * src_w + cx;
+
+            // 16 portrait rows → 4 packed output bytes, 4 pixels per byte.
+            // Fully unrolled; all 16 loads are to addresses within the current
+            // 16-row block (rb * src_w .. (rb+15) * src_w), which is warm in cache.
+            out[0] = ((col[ 0        ] & 3) << 6) | ((col[  src_w] & 3) << 4)
+                   | ((col[ 2*src_w  ] & 3) << 2) |  (col[ 3*src_w] & 3);
+            out[1] = ((col[ 4*src_w  ] & 3) << 6) | ((col[ 5*src_w] & 3) << 4)
+                   | ((col[ 6*src_w  ] & 3) << 2) |  (col[ 7*src_w] & 3);
+            out[2] = ((col[ 8*src_w  ] & 3) << 6) | ((col[ 9*src_w] & 3) << 4)
+                   | ((col[10*src_w  ] & 3) << 2) |  (col[11*src_w] & 3);
+            out[3] = ((col[12*src_w  ] & 3) << 6) | ((col[13*src_w] & 3) << 4)
+                   | ((col[14*src_w  ] & 3) << 2) |  (col[15*src_w] & 3);
+        }
+    }
+
+}
+
 extern "C" void epd_painter_convert_packed_fb_to_ink(
   const uint8_t *packed_fb, uint8_t *output, uint32_t length,
   const uint8_t *waveform, uint32_t chunk_flags);
@@ -89,8 +134,9 @@ static inline void gpio_clear_fast(uint8_t pin) {
 #define PASS_COUNT 13
 
 
-EPD_Painter::EPD_Painter(const Config &config) {
+EPD_Painter::EPD_Painter(const Config &config, bool portrait) {
   _config = config;
+  if (portrait) _config.rotation = Rotation::ROTATION_CW;
 }
 
 
@@ -432,8 +478,14 @@ static uint8_t hq_darker_waveform[][13] = {
 // paint()
 // =============================================================================
 void EPD_Painter::paint(uint8_t *framebuffer) {
-  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY); 
-  epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+
+  if (_config.rotation == Rotation::ROTATION_CW)
+    compact_pixels_rotated_cw(framebuffer, packed_paintbuffer, _config.height, _config.width);
+  else
+    epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+
+
   paintStage=(interlace_mode?3:2);
   xSemaphoreGive(_paint_buffer_sem); 
 
@@ -478,8 +530,17 @@ void EPD_Painter::unpaintPacked(const uint8_t* packed) {
 // paintLater
 // =============================================================================
 void EPD_Painter::paintLater(uint8_t *framebuffer) {
-    xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY); 
-    epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+    //const int64_t t0 = esp_timer_get_time();
+
+    if (_config.rotation == Rotation::ROTATION_CW)
+      compact_pixels_rotated_cw(framebuffer, packed_paintbuffer, _config.height, _config.width);
+    else
+      epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    
+   // printf("[rotate] compact_pixels_rotated_cw: %lld us\n", esp_timer_get_time() - t0);
+
+    
     paintStage=interlace_mode?3:2;
     xSemaphoreGive(_paint_buffer_sem); 
 }
@@ -555,7 +616,7 @@ void EPD_Painter::_paint_task_body() {
       }
 
      if (_config.quality == Quality::QUALITY_HIGH) {
-        EPD_DELAY_MS(5);
+        EPD_DELAY_MS(3);
 
       }
     }
