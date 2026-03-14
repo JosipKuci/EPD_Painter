@@ -1,6 +1,9 @@
 #ifndef EPD_Painter_H
 #define EPD_Painter_H
 
+// Forward declaration — avoids circular include with epd_painter_shutdown.h
+class EPD_PainterShutdown;
+
 // FreeRTOS headers — available in both Arduino-ESP32 and pure ESP-IDF
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -78,12 +81,19 @@ struct PowerCtlConfig {
     interlace_mode = mode;
   }
 
-
   void setQuality(Quality quality);
 
   Config getConfig(){
     return _config;
   }
+
+  // Shutdown handler — created automatically by begin().
+  // By default, if a shutdown was requested on the previous reset, begin()
+  // calls proceed() immediately (no prompt). To intercept it yourself,
+  // call setAutoShutdown(false) BEFORE begin(), then check
+  // shutdown()->isPending() in your loop().
+  void setAutoShutdown(bool v) { _autoShutdown = v; }
+  EPD_PainterShutdown* shutdown() { return _shutdown; }
 
 
 private:
@@ -114,6 +124,8 @@ private:
   std::atomic<int> paintStage{0};
   bool interlace_mode = false;
   bool shouldSkipRow = false;
+  bool _autoShutdown = true;
+  EPD_PainterShutdown* _shutdown = nullptr;
 
 
   // ---- Internal helpers ----

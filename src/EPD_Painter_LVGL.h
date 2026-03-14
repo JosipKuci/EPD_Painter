@@ -112,8 +112,13 @@ public:
     // -------------------------------------------------------------------------
     // Access to the underlying driver if needed
     // -------------------------------------------------------------------------
-    EPD_Painter  &driver()  { return _painter; }
-    lv_display_t *display() { return _disp; }
+    EPD_Painter      &driver()   { return _painter; }
+    lv_display_t     *display()  { return _disp; }
+
+    // Shutdown — call setAutoShutdown(false) BEFORE begin() to intercept
+    // the shutdown yourself. Then check shutdown()->isPending() in loop().
+    void              setAutoShutdown(bool v) { _painter.setAutoShutdown(v); }
+    EPD_PainterShutdown *shutdown()           { return _painter.shutdown(); }
 
 
 private:

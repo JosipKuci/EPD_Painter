@@ -181,63 +181,38 @@ void EPD_PainterShutdown::powerOff() {
 EPD_PainterShutdown::EPD_PainterShutdown(EPD_Painter* p_epd) {
   _epd = p_epd;
 
-  // --- Check shutdown flag BEFORE doing anything else ---
+  // Shutdown state is stored as a uint8_t:
+  //   0 = normal startup
+  //   1 = shutdown requested (popup shown if autoShutdown=false, else auto-proceed)
+  //   2 = force shutdown (always auto-proceed, no popup)
   Preferences prefs;
   prefs.begin("power", false);
-  bool shutdownFlag = prefs.getBool("shutdown", false);
+  uint8_t flag = prefs.getUChar("shutdown", 0);
 
-  if (shutdownFlag) {
-    Serial.println("Shutdown flag detected. Powering off...");
-    prefs.putBool("shutdown", false);
+  if (flag == 2) {
+    // Force shutdown — clear flag and proceed immediately, no popup.
+    prefs.putUChar("shutdown", 0);
     prefs.end();
-
-    const auto cfg = _epd->getConfig();
-    const size_t packed_size = (size_t)cfg.width * cfg.height / 4;
-    bool fsOk = LittleFS.begin(false) || LittleFS.begin(true);
-
-    if (!fsOk) {
-      // No LittleFS partition — generate and paint directly from PSRAM
-      Serial.println("LittleFS unavailable — painting Mandelbrot directly");
-      showMandAndPaint();
-    } else {
-      if (!LittleFS.exists(IMG_PATH)) {
-        Serial.println("No shutdown image found — generating...");
-        showMand();
-      }
-
-      uint8_t* packed = (uint8_t*)heap_caps_malloc(packed_size, MALLOC_CAP_SPIRAM);
-      if (packed) {
-        File f = LittleFS.open(IMG_PATH, FILE_READ);
-        if (f) {
-          size_t file_size = f.size();
-          size_t bytes_read = f.read(packed, packed_size);
-          f.close();
-          Serial.printf("paintPacked: file=%u expected=%u read=%u\n", file_size, packed_size, bytes_read);
-          _epd->setQuality(EPD_Painter::Quality::QUALITY_HIGH);
-          _epd->clear();
-          _epd->paintPacked(packed);
-        } else {
-          Serial.println("Failed to open shutdown image");
-        }
-        heap_caps_free(packed);
-      }
-      LittleFS.end();
-    }
-
-    delay(500);
-    powerOff();
-
-    // If still alive (USB connected), restart back into normal operation
-    ESP.restart();
+    Serial.println("Force shutdown.");
+    _pending = true;
+    proceed();
     return;
   }
 
-  // --- Flag was false: normal startup, arm flag for next reset ---
-  prefs.putBool("shutdown", true);
+  if (flag == 1) {
+    // Normal shutdown request — defer to proceed()/cancel().
+    prefs.putUChar("shutdown", 0);
+    prefs.end();
+    _pending = true;
+    Serial.println("Shutdown pending. Call proceed() or cancel().");
+    return;
+  }
+
+  // Normal startup: arm flag for next reset, then DC-balance the screen.
+  prefs.putUChar("shutdown", 1);
   prefs.end();
   Serial.println("Running. Reset again to shut down.");
 
-  // DC-balance pass: erase the shutdown image if it exists
   const auto cfg = _epd->getConfig();
   const size_t packed_size = (size_t)cfg.width * cfg.height / 4;
   if (LittleFS.begin(false) && LittleFS.exists(IMG_PATH)) {
@@ -255,4 +230,110 @@ EPD_PainterShutdown::EPD_PainterShutdown(EPD_Painter* p_epd) {
     }
     LittleFS.end();
   }
+}
+
+// ---------------------------------------------------------------------------
+void EPD_PainterShutdown::proceed() {
+  if (!_pending) return;
+  _pending = false;
+
+  if (_pre_shutdown_cb) {
+    Serial.println("Shutdown: running pre-shutdown callback...");
+    _pre_shutdown_cb();
+  }
+
+  Serial.println("Shutdown: proceeding...");
+
+  const auto cfg = _epd->getConfig();
+  const size_t packed_size = (size_t)cfg.width * cfg.height / 4;
+  bool fsOk = LittleFS.begin(false) || LittleFS.begin(true);
+
+  if (!fsOk) {
+    Serial.println("LittleFS unavailable — painting Mandelbrot directly");
+    showMandAndPaint();
+  } else {
+    if (!LittleFS.exists(IMG_PATH)) {
+      Serial.println("No shutdown image found — generating...");
+      showMand();
+    }
+
+    uint8_t* packed = (uint8_t*)heap_caps_malloc(packed_size, MALLOC_CAP_SPIRAM);
+    if (packed) {
+      File f = LittleFS.open(IMG_PATH, FILE_READ);
+      if (f) {
+        size_t bytes_read = f.read(packed, packed_size);
+        f.close();
+        Serial.printf("Shutdown: read %u bytes\n", bytes_read);
+        _epd->setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+        _epd->clear();
+        _epd->paintPacked(packed);
+      } else {
+        Serial.println("Failed to open shutdown image");
+      }
+      heap_caps_free(packed);
+    }
+    LittleFS.end();
+  }
+
+  delay(500);
+  powerOff();
+
+  // If still alive (USB connected), restart into normal operation.
+  ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
+void EPD_PainterShutdown::startIdleTimer(uint32_t seconds) {
+  cancelIdleTimer();
+  _idle_timer = xTimerCreate(
+      "epd_idle",
+      pdMS_TO_TICKS(seconds * 1000),
+      pdFALSE,           // one-shot
+      this,              // timer ID = this pointer
+      _idle_timer_cb);
+  xTimerStart(_idle_timer, 0);
+  Serial.printf("Idle timer started: %u seconds\n", seconds);
+}
+
+void EPD_PainterShutdown::resetIdleTimer() {
+  if (_idle_timer)
+    xTimerReset(_idle_timer, 0);
+}
+
+void EPD_PainterShutdown::cancelIdleTimer() {
+  if (_idle_timer) {
+    xTimerStop(_idle_timer, 0);
+    xTimerDelete(_idle_timer, 0);
+    _idle_timer = nullptr;
+  }
+}
+
+void EPD_PainterShutdown::_idle_timer_cb(TimerHandle_t h) {
+  EPD_PainterShutdown* self = static_cast<EPD_PainterShutdown*>(pvTimerGetTimerID(h));
+  Serial.println("Idle timer expired. Shutting down.");
+  self->shutdown(true);
+}
+
+// ---------------------------------------------------------------------------
+void EPD_PainterShutdown::shutdown(bool force) {
+  Preferences prefs;
+  prefs.begin("power", false);
+  prefs.putUChar("shutdown", force ? 2 : 1);
+  prefs.end();
+  Serial.printf("Shutdown requested (force=%d). Restarting...\n", force);
+  delay(100);
+  ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
+void EPD_PainterShutdown::cancel() {
+  if (!_pending) return;
+  _pending = false;
+
+  // Re-arm the flag so the next reset triggers shutdown again.
+  Preferences prefs;
+  prefs.begin("power", false);
+  prefs.putUChar("shutdown", 1);
+  prefs.end();
+  Serial.println("Shutdown cancelled. Re-armed for next reset.");
 }

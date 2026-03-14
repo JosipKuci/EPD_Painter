@@ -88,7 +88,12 @@ public:
     // -------------------------------------------------------------------------
     // Access to the underlying driver if needed
     // -------------------------------------------------------------------------
-    EPD_Painter &driver() { return _painter; }
+    EPD_Painter      &driver()   { return _painter; }
+
+    // Shutdown — call setAutoShutdown(false) BEFORE begin() to intercept
+    // the shutdown yourself. Then check shutdown()->isPending() in loop().
+    void              setAutoShutdown(bool v) { _painter.setAutoShutdown(v); }
+    EPD_PainterShutdown *shutdown()           { return _painter.shutdown(); }
 
 private:
     EPD_Painter::Config  _config;

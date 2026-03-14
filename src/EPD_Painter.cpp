@@ -1,4 +1,5 @@
 #include "esp32-hal.h"
+#include "epd_painter_shutdown.h"
 #include <string.h>
 #include <cstring>
 #include "build_opt.h"
@@ -14,7 +15,6 @@
 #include <soc/gdma_struct.h>
 #include "EPD_Painter.h"
 #include <epd_painter_powerctl.h>
-#include "epd_painter_shutdown.h"
 
 #ifdef ARDUINO
   #include "Wire.h"
@@ -334,7 +334,9 @@ bool EPD_Painter::begin() {
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
 
-  new EPD_PainterShutdown(this);
+  _shutdown = new EPD_PainterShutdown(this);
+  if (_autoShutdown && _shutdown->isPending())
+    _shutdown->proceed();
 
   return true;
 }
@@ -420,7 +422,7 @@ static uint8_t hq_lighter_waveform[][13] = {
 
 static uint8_t hq_darker_waveform[][13] = {
   { 1, 3, 2, 2, 1, 2, 1, 1, 2, 1, 1, 1, 3 },
-  { 3, 3, 1, 1, 1, 3, 3, 1, 1, 3, 1, 3, 3 },
+  { 2, 1, 1, 1, 1, 2, 1, 1, 1, 3, 1, 2, 1 },
   { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
 };
 
@@ -552,7 +554,7 @@ void EPD_Painter::_paint_task_body() {
       }
 
      if (_config.quality == Quality::QUALITY_HIGH) {
-        EPD_DELAY_MS(2);
+        EPD_DELAY_MS(5);
 
       }
     }
