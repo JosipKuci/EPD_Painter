@@ -43,6 +43,11 @@ public:
     // Call once in setup() after Serial is ready.
     bool begin();
 
+    // Re-initialise ESP-NOW and restore the saved channel after a WiFi
+    // stop/start cycle (e.g. waking from light sleep).  Call after
+    // esp_wifi_start() returns.
+    bool reinit();
+
     // Supply the current Unix epoch (seconds) so every packet carries a fresh
     // timestamp.  Call after reading the RTC at boot.
     void setEpoch(uint32_t epoch);

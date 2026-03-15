@@ -105,8 +105,6 @@ bool epd_painter_powerctl::powerOn() {
   tpsRead(TPS_VCOM2, val);
   printf("[PWRCTL] Reading TPS VCOM2... %d \n", val);
 
-
-
   printf("[PWRCTL] Waiting for TPS PG...");
   timeout = 0;
   uint8_t pg = 0;

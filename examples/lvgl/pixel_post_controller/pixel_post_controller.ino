@@ -12,6 +12,7 @@
 #include <TAMC_GT911.h>
 #include <I2C_BM8563.h>
 #include "PixelPostNetwork.h"
+#include "battery.h"
 
 // HMAC key – must match the key on all pixel post receivers.
 static const uint8_t HMAC_KEY[32] = {
@@ -33,14 +34,22 @@ static uint32_t my_tick_cb() {
 
 // ── Backlight (LilyGo only) ───────────────────────────────────────────────────
 #ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-#define BACKLIGHT_PIN 11
-#define BACKLIGHT_TIMEOUT_MS 10000
+#define BACKLIGHT_PIN       11
+#define BACKLIGHT_LEDC_FREQ 5000
+#define BACKLIGHT_LEDC_BITS 8
+static uint8_t     backlight_brightness = 200;  // 0-255, loaded from prefs
+static Preferences bl_prefs;
+#endif
+
+#define BACKLIGHT_TIMEOUT_MS 5000
 static uint32_t backlight_last_touch_ms = 0;
 static bool backlight_on = false;
 
 static void backlight_on_touch() {
   if (!backlight_on) {
-    digitalWrite(BACKLIGHT_PIN, HIGH);
+    #ifdef BACKLIGHT_PIN
+    ledcWrite(BACKLIGHT_PIN, backlight_brightness);
+    #endif
     backlight_on = true;
   }
   backlight_last_touch_ms = millis();
@@ -48,11 +57,20 @@ static void backlight_on_touch() {
 
 static void backlight_tick() {
   if (backlight_on && (millis() - backlight_last_touch_ms >= BACKLIGHT_TIMEOUT_MS)) {
-    digitalWrite(BACKLIGHT_PIN, LOW);
+    #ifdef BACKLIGHT_PIN
+    ledcWrite(BACKLIGHT_PIN, 0);
+    #endif
     backlight_on = false;
+    esp_wifi_stop();
+    Serial.println("sleeping");
+    Serial.end();
+    esp_light_sleep_start();
+    Serial.begin(115200);
+    Serial.println("woke up");
+    esp_wifi_start();
+    net.reinit();
   }
 }
-#endif
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
@@ -126,6 +144,7 @@ static lv_obj_t *effect_btns[6];
 static lv_obj_t *effect_lbls[6];
 static lv_obj_t *menu_btns[MENU_COUNT];
 static lv_obj_t *header_time_lbl = nullptr;
+static lv_obj_t *bat_lbl         = nullptr;
 static lv_obj_t *chan_btns[3] = { nullptr, nullptr, nullptr };
 static lv_obj_t *popup = nullptr;
 
@@ -284,6 +303,16 @@ static void wifi_chan_cb(lv_event_t *e) {
   }
 }
 
+#ifdef BACKLIGHT_PIN
+static void backlight_brightness_cb(lv_event_t *e) {
+  int val = (int)lv_slider_get_value(lv_event_get_target_obj(e));
+  backlight_brightness = (uint8_t)(val * 255 / 100);
+  if (backlight_on) ledcWrite(BACKLIGHT_PIN, backlight_brightness);
+  if (lv_event_get_code(e) == LV_EVENT_RELEASED)
+    bl_prefs.putUInt("brightness", backlight_brightness);
+}
+#endif
+
 static void settings_btn_cb(lv_event_t *) {
   if (popup) return;
 
@@ -302,7 +331,11 @@ static void settings_btn_cb(lv_event_t *) {
 
   // Card
   lv_obj_t *card = lv_obj_create(popup);
+#ifdef BACKLIGHT_PIN
+  lv_obj_set_size(card, 500, 400);
+#else
   lv_obj_set_size(card, 500, 280);
+#endif
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_bg_color(card, EPD_PainterLVGL::WHITE, 0);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
@@ -349,6 +382,30 @@ static void settings_btn_cb(lv_event_t *) {
     lv_obj_set_style_text_color(lbl, EPD_PainterLVGL::BLACK, 0);
     lv_obj_center(lbl);
   }
+
+#ifdef BACKLIGHT_PIN
+  lv_obj_t *bl_lbl = lv_label_create(card);
+  lv_label_set_text(bl_lbl, "Backlight");
+  lv_obj_set_style_text_font(bl_lbl, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(bl_lbl, EPD_PainterLVGL::DK_GREY, 0);
+  lv_obj_align(bl_lbl, LV_ALIGN_TOP_LEFT, 0, 182);
+
+  lv_obj_t *bl_sldr = lv_slider_create(card);
+  lv_obj_set_size(bl_sldr, 452, 52);
+  lv_obj_align(bl_sldr, LV_ALIGN_TOP_LEFT, 0, 220);
+  lv_slider_set_range(bl_sldr, 5, 100);
+  lv_slider_set_value(bl_sldr, (int)(backlight_brightness * 100 / 255), LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(bl_sldr, EPD_PainterLVGL::LT_GREY, LV_PART_MAIN);
+  lv_obj_set_style_border_color(bl_sldr, EPD_PainterLVGL::DK_GREY, LV_PART_MAIN);
+  lv_obj_set_style_border_width(bl_sldr, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(bl_sldr, 6, LV_PART_MAIN);
+  lv_obj_set_style_bg_color(bl_sldr, EPD_PainterLVGL::DK_GREY, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(bl_sldr, 6, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_color(bl_sldr, EPD_PainterLVGL::WHITE, LV_PART_KNOB);
+  lv_obj_set_style_radius(bl_sldr, 4, LV_PART_KNOB);
+  lv_obj_add_event_cb(bl_sldr, backlight_brightness_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_add_event_cb(bl_sldr, backlight_brightness_cb, LV_EVENT_RELEASED, NULL);
+#endif
 
   lv_obj_t *close_btn = lv_button_create(card);
   lv_obj_set_size(close_btn, 130, 50);
@@ -483,19 +540,12 @@ static void build_ui() {
   lv_obj_set_style_text_color(header_time_lbl, EPD_PainterLVGL::BLACK, 0);
   lv_obj_align(header_time_lbl, LV_ALIGN_LEFT_MID, 0, 0);
 
-  // Battery % + icon (right) – TODO: read from BQ27220 PMU at 0x55
-  static const int BAT_PCT = 87;
-  lv_obj_t *bat_lbl = lv_label_create(hdr);
-  char bat_str[24];
-  const char *bat_sym = BAT_PCT > 75 ? LV_SYMBOL_BATTERY_FULL : BAT_PCT > 50 ? LV_SYMBOL_BATTERY_3
-                                                              : BAT_PCT > 25 ? LV_SYMBOL_BATTERY_2
-                                                              : BAT_PCT > 5  ? LV_SYMBOL_BATTERY_1
-                                                                             : LV_SYMBOL_BATTERY_EMPTY;
-  lv_snprintf(bat_str, sizeof(bat_str), "%d%%  %s", BAT_PCT, bat_sym);
-  lv_label_set_text(bat_lbl, bat_str);
+  // Battery % + icon (right) – populated by battery_update() / battery_timer_cb()
+  bat_lbl = lv_label_create(hdr);
+  lv_label_set_text(bat_lbl, "--%  " LV_SYMBOL_BATTERY_FULL);
   lv_obj_set_style_text_font(bat_lbl, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(bat_lbl, EPD_PainterLVGL::BLACK, 0);
-  lv_obj_align(bat_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
+  lv_obj_align(bat_lbl, LV_ALIGN_RIGHT_MID, -20, 0);
 
   // ── Effect buttons (2×3 grid) ─────────────────────────────────────────────
   for (int i = 0; i < 6; i++) {
@@ -596,10 +646,8 @@ static void build_ui() {
 static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
   tc.read();
   if (tc.down) {
-    if (psd) psd->resetIdleTimer();
-#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-    backlight_on_touch();
-#endif
+  if (psd) psd->resetIdleTimer();
+  backlight_on_touch();
   }
   data->point.x = tc.x;
   data->point.y = tc.y;
@@ -615,9 +663,20 @@ void setup() {
   lv_tick_set_cb(my_tick_cb);
 
 #ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-  pinMode(BACKLIGHT_PIN, OUTPUT);
-  backlight_on_touch();
+  bl_prefs.begin("backlight", false);
+  backlight_brightness = (uint8_t)bl_prefs.getUInt("brightness", 200);
+  ledcAttach(BACKLIGHT_PIN, BACKLIGHT_LEDC_FREQ, BACKLIGHT_LEDC_BITS);
+  gpio_wakeup_enable((gpio_num_t) 3, GPIO_INTR_LOW_LEVEL);  // touch interrupt wakes device
 #endif
+
+#ifdef EPD_PAINTER_PRESET_M5PAPER_S3
+    gpio_wakeup_enable((gpio_num_t) 48, GPIO_INTR_LOW_LEVEL); // pin 48 = touch interupt. Wakes the device up if touched.
+#endif
+
+
+
+
+  backlight_on_touch();
 
   display.setAutoShutdown(false);  // handle shutdown ourselves with a popup
   if (!display.begin()) {
@@ -632,6 +691,10 @@ void setup() {
     rtc = &rtc_obj;
     rtc->begin();
   }
+
+  esp_sleep_enable_gpio_wakeup();
+
+
 
   psd = display.shutdown();  // use the instance created by begin()
   psd->setPreShutdownCallback([]() {
@@ -651,6 +714,16 @@ void setup() {
   update_header_time();                           // show correct time immediately
   lv_timer_create(time_timer_cb, 1000, nullptr);  // refresh every second
 
+#ifdef EPD_PAINTER_PRESET_M5PAPER_S3
+  battery_begin_adc(4, 2.0f);  // GPIO 4, 100k/100k voltage divider
+#elif defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS)
+  if (display.getConfig().i2c.wire)
+    battery_begin_bq25896(display.getConfig().i2c.wire);
+#endif
+  battery_set_label(bat_lbl);
+  battery_update();                                // show real value immediately
+  lv_timer_create(battery_timer_cb, 60000, nullptr);  // refresh every 60 s
+
   lv_indev_t *touch = lv_indev_create();
   lv_indev_set_type(touch, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(touch, touch_read_cb);
@@ -661,8 +734,7 @@ void loop() {
     show_shutdown_popup();
 
   lv_timer_handler();
-#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
   backlight_tick();
-#endif
+
   delay(5);
 }

@@ -44,6 +44,32 @@ bool PixelPostNetwork::begin() {
     return true;
 }
 
+// ── reinit ────────────────────────────────────────────────────────────────────
+
+bool PixelPostNetwork::reinit() {
+    esp_now_deinit();  // harmless if already down
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("PixelPostNetwork: esp_now_init failed (reinit)");
+        return false;
+    }
+
+    esp_now_peer_info_t peer = {};
+    memset(peer.peer_addr, 0xFF, 6);
+    peer.channel = 0;
+    peer.ifidx   = WIFI_IF_STA;
+    peer.encrypt = false;
+
+    if (esp_now_add_peer(&peer) != ESP_OK) {
+        Serial.println("PixelPostNetwork: esp_now_add_peer failed (reinit)");
+        return false;
+    }
+
+    esp_wifi_set_channel(WIFI_CHANNELS[_channel_idx], WIFI_SECOND_CHAN_NONE);
+    Serial.printf("PixelPostNetwork: reinit  channel=%d\n", WIFI_CHANNELS[_channel_idx]);
+    return true;
+}
+
 // ── setEpoch ──────────────────────────────────────────────────────────────────
 
 void PixelPostNetwork::setEpoch(uint32_t epoch) {
