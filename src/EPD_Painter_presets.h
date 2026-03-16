@@ -45,7 +45,6 @@
         .power = {
             .pca_addr = 0x20,
             .tps_addr = 0x68,
-            .vcom_mv = -1000
         }
     };
 

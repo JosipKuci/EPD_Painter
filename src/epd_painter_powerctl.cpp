@@ -98,12 +98,11 @@ bool epd_painter_powerctl::powerOn() {
   // Dont set vcomm... this chip should already konow it. 
   //setVcomMv(config.power.vcom_mv);
 
-  uint8_t val = 0;
-  tpsRead(TPS_VCOM1, val);
-  
-  printf("[PWRCTL] Reading TPS VCOM1... %d \n", val);
-  tpsRead(TPS_VCOM2, val);
-  printf("[PWRCTL] Reading TPS VCOM2... %d \n", val);
+  uint8_t v1 = 0, v2 = 0;
+  tpsRead(TPS_VCOM1, v1);
+  tpsRead(TPS_VCOM2, v2);
+  int vcom_mv = -(((int)(v2 & 0x01) << 8 | v1) * 10);
+  printf("[PWRCTL] TPS VCOM = %d mV (VCOM1=0x%02X VCOM2=0x%02X)\n", vcom_mv, v1, v2);
 
   printf("[PWRCTL] Waiting for TPS PG...");
   timeout = 0;

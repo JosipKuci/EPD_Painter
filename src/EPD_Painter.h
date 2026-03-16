@@ -40,7 +40,6 @@ struct I2CBusConfig {
 struct PowerCtlConfig {
     int pca_addr=-1;
     int tps_addr=-1;
-    int vcom_mv=-1;
 };
   enum class Quality {
     QUALITY_HIGH,
