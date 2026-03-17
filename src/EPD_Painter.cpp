@@ -459,6 +459,19 @@ static uint8_t darker_waveform[][7] = {
   { 1, 1, 1, 1, 1, 1, 1 }
 };
 
+// Normal quality waveforms
+static uint8_t nm_lighter_waveform[][13] = {
+  { 1, 3, 1, 1, 2, 2, 1, 2, 2, 2, 2, 2, 2 },
+  { 1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 3, 3 },
+  { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 }
+};
+
+static uint8_t nm_darker_waveform[][13] = {
+  { 2, 3, 1, 1, 1, 2, 2, 1, 2, 1, 1, 1, 1 },
+  { 3, 1, 1, 2, 1, 1, 1, 1, 1, 3, 3, 1, 1 },
+  { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }
+};
+
 
 // Higer quality waveforms
 static uint8_t hq_lighter_waveform[][13] = {
@@ -590,6 +603,10 @@ void EPD_Painter::_paint_task_body() {
       lt_wf = &lighter_waveform[0][0];
       dk_wf = &darker_waveform[0][0];
       wf_len = 7;
+    } else if(_config.quality == Quality::QUALITY_NORMAL) {
+      lt_wf = &nm_lighter_waveform[0][0];
+      dk_wf = &nm_darker_waveform[0][0];
+      wf_len = 13;
     } else {
       lt_wf = &hq_lighter_waveform[0][0];
       dk_wf = &hq_darker_waveform[0][0];
