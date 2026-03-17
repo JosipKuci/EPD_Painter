@@ -462,7 +462,7 @@ static uint8_t darker_waveform[][7] = {
 // Normal quality waveforms
 static uint8_t nm_lighter_waveform[][13] = {
   { 1, 3, 1, 1, 2, 2, 1, 2, 2, 2, 2, 2, 2 },
-  { 1, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 3, 3 },
+  { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3 },
   { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 }
 };
 
