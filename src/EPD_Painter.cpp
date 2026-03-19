@@ -1,4 +1,6 @@
+#ifdef ARDUINO
 #include "esp32-hal.h"
+#endif
 #include "epd_painter_shutdown.h"
 #include <string.h>
 #include <cstring>
@@ -22,7 +24,6 @@
   #include "freertos/FreeRTOS.h"
   #include "freertos/task.h"
   #include "freertos/semphr.h"
-  #include "driver/i2c_master.h"
 #endif
 
 // LCD_CAM signal indices for the 8 parallel data lines
@@ -222,24 +223,7 @@ bool EPD_Painter::begin() {
     EPD_DELAY_MS(50);
   }
 #else
-  if (_config.i2c.scl != -1 && _config.i2c.i2c_bus == nullptr) {
-    i2c_master_bus_config_t i2c_bus_config = {
-      .i2c_port = I2C_NUM_0,
-      .sda_io_num = (gpio_num_t)_config.i2c.sda,
-      .scl_io_num = (gpio_num_t)_config.i2c.scl,
-      .clk_source = I2C_CLK_SRC_DEFAULT,
-      .glitch_ignore_cnt = 7,
-      .flags = { .enable_internal_pullup = true },
-    };
-    i2c_master_bus_handle_t bus;
-    esp_err_t err = i2c_new_master_bus(&i2c_bus_config, &bus);
-    if (err != ESP_OK) {
-      printf("EPD_Painter: I2C bus init failed (%d)\n", err);
-      return false;
-    }
-    _config.i2c.i2c_bus = bus;
-    EPD_DELAY_MS(50);
-  }
+  // I2C not used in ESP-IDF builds
 #endif
 
 
@@ -351,7 +335,7 @@ bool EPD_Painter::begin() {
   const size_t packed_size = (_config.width * _config.height) / 4;
 
   packed_fastbuffer = static_cast<uint8_t *>(
-    heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_INTERNAL));
+    heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
 
   packed_screenbuffer = static_cast<uint8_t *>(
     heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));

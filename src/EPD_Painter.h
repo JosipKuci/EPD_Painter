@@ -15,11 +15,9 @@ class EPD_PainterShutdown;
 #include <hal/dma_types.h>
 #include <esp_intr_alloc.h>
 
-// I2C — TwoWire for Arduino, ESP-IDF master API otherwise
+// I2C — TwoWire for Arduino only; ESP-IDF builds don't use I2C
 #ifdef ARDUINO
   #include <Wire.h>
-#else
-  #include "driver/i2c_master.h"
 #endif
 
 
@@ -31,7 +29,7 @@ struct I2CBusConfig {
 #ifdef ARDUINO
     TwoWire* wire = nullptr;
 #else
-    i2c_master_bus_handle_t i2c_bus = nullptr;
+    void* i2c_bus = nullptr;  // unused in ESP-IDF builds
 #endif
     int sda = -1;
     int scl = -1;

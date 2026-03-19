@@ -1,9 +1,9 @@
 #include <cstring>
-#include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter.h"
 #include "epd_painter_shutdown.h"
 
 #ifdef ARDUINO
+#include "EPD_Painter_Adafruit.h"
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <esp_heap_caps.h>
@@ -11,6 +11,8 @@
 #endif
 
 extern "C" void epd_painter_compact_pixels(const uint8_t* input, uint8_t* output, uint32_t size);
+
+#ifdef ARDUINO
 
 static const char* IMG_PATH = "/.epd_painter_shutdown.img";
 
@@ -362,3 +364,22 @@ void EPD_PainterShutdown::cancel() {
   prefs.end();
   Serial.println("Shutdown cancelled. Re-armed for next reset.");
 }
+
+#else  // !ARDUINO — ESP-IDF stubs (shutdown feature not used in ESP-IDF builds)
+
+extern "C" void epd_painter_compact_pixels(const uint8_t*, uint8_t*, uint32_t);
+
+EPD_PainterShutdown::EPD_PainterShutdown(EPD_Painter* p_epd) : _epd(p_epd) {}
+void EPD_PainterShutdown::showMand() {}
+void EPD_PainterShutdown::showMandAndPaint() {}
+bool EPD_PainterShutdown::isUsbConnected() { return false; }
+void EPD_PainterShutdown::powerOff() {}
+void EPD_PainterShutdown::proceed() {}
+void EPD_PainterShutdown::cancel() {}
+void EPD_PainterShutdown::shutdown(bool) {}
+void EPD_PainterShutdown::startIdleTimer(uint32_t) {}
+void EPD_PainterShutdown::resetIdleTimer() {}
+void EPD_PainterShutdown::cancelIdleTimer() {}
+void EPD_PainterShutdown::_idle_timer_cb(TimerHandle_t) {}
+
+#endif // ARDUINO

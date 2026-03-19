@@ -4,7 +4,6 @@
 #ifndef ARDUINO
   #include "freertos/FreeRTOS.h"
   #include "freertos/task.h"
-  #include "driver/i2c_master.h"
 #endif
 
 epd_painter_powerctl::epd_painter_powerctl() {
@@ -18,28 +17,7 @@ bool epd_painter_powerctl::begin(EPD_Painter::Config cfg) {
 
   config = cfg;
 
-#ifndef ARDUINO
-  // ---- Create per-device I2C handles from the shared bus ----
-  i2c_device_config_t pca_dev_cfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address  = (uint16_t)config.power.pca_addr,
-    .scl_speed_hz    = config.i2c.freq,
-  };
-  if (i2c_master_bus_add_device(config.i2c.i2c_bus, &pca_dev_cfg, &_pca_dev) != ESP_OK) {
-    printf("[PWRCTL] Failed to add PCA I2C device\n");
-    return false;
-  }
-
-  i2c_device_config_t tps_dev_cfg = {
-    .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-    .device_address  = (uint16_t)config.power.tps_addr,
-    .scl_speed_hz    = config.i2c.freq,
-  };
-  if (i2c_master_bus_add_device(config.i2c.i2c_bus, &tps_dev_cfg, &_tps_dev) != ESP_OK) {
-    printf("[PWRCTL] Failed to add TPS I2C device\n");
-    return false;
-  }
-#endif
+  // I2C not used in ESP-IDF builds
 
   // ---- Configure PCA9535: pins 8-13 outputs, 14-15 inputs ----
   for (int pin = 8; pin <= 13; ++pin) {
@@ -174,8 +152,7 @@ bool epd_painter_powerctl::pcaWriteReg(uint8_t reg, uint8_t val) {
   config.i2c.wire->write(val);
   return (config.i2c.wire->endTransmission() == 0);
 #else
-  uint8_t buf[2] = { reg, val };
-  return i2c_master_transmit(_pca_dev, buf, 2, pdMS_TO_TICKS(100)) == ESP_OK;
+  return false;  // I2C not used in ESP-IDF builds
 #endif
 }
 
@@ -189,7 +166,7 @@ bool epd_painter_powerctl::pcaReadReg(uint8_t reg, uint8_t& val) {
   val = config.i2c.wire->read();
   return true;
 #else
-  return i2c_master_transmit_receive(_pca_dev, &reg, 1, &val, 1, pdMS_TO_TICKS(100)) == ESP_OK;
+  return false;  // I2C not used in ESP-IDF builds
 #endif
 }
 
@@ -238,8 +215,7 @@ bool epd_painter_powerctl::tpsWrite(uint8_t reg, uint8_t val) {
   config.i2c.wire->write(val);
   return (config.i2c.wire->endTransmission() == 0);
 #else
-  uint8_t buf[2] = { reg, val };
-  return i2c_master_transmit(_tps_dev, buf, 2, pdMS_TO_TICKS(100)) == ESP_OK;
+  return false;  // I2C not used in ESP-IDF builds
 #endif
 }
 
@@ -251,8 +227,7 @@ bool epd_painter_powerctl::tpsWrite16(uint8_t reg, uint8_t lo, uint8_t hi) {
   config.i2c.wire->write(hi);
   return (config.i2c.wire->endTransmission() == 0);
 #else
-  uint8_t buf[3] = { reg, lo, hi };
-  return i2c_master_transmit(_tps_dev, buf, 3, pdMS_TO_TICKS(100)) == ESP_OK;
+  return false;  // I2C not used in ESP-IDF builds
 #endif
 }
 
@@ -266,6 +241,6 @@ bool epd_painter_powerctl::tpsRead(uint8_t reg, uint8_t& val) {
   val = config.i2c.wire->read();
   return true;
 #else
-  return i2c_master_transmit_receive(_tps_dev, &reg, 1, &val, 1, pdMS_TO_TICKS(100)) == ESP_OK;
+  return false;  // I2C not used in ESP-IDF builds
 #endif
 }

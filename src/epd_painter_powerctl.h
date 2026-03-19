@@ -21,12 +21,6 @@ public:
 private:
   EPD_Painter::Config config;
 
-#ifndef ARDUINO
-  // ESP-IDF: per-device handles created from the bus in begin()
-  i2c_master_dev_handle_t _pca_dev = nullptr;
-  i2c_master_dev_handle_t _tps_dev = nullptr;
-#endif
-
   // ---- PCA9535 cached state ----
   uint8_t _pca_out[2];
   uint8_t _pca_cfg[2];

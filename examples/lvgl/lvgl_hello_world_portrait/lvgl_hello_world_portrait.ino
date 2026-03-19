@@ -380,7 +380,7 @@ void setup() {
         tc.begin(display.getConfig().i2c.wire);
     }
 
-    display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+    //display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
     display.clear();
 
     lv_obj_t *scr = lv_screen_active();
