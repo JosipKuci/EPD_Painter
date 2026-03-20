@@ -1,6 +1,6 @@
 // Choose your board.
-#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
+//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
+#define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include <Arduino.h>
 #include "EPD_Painter_Adafruit.h"
@@ -274,7 +274,7 @@ void setup() {
         Serial.println("EPD init failed");
         while (1);
     }
-    epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+    //epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
     //epd.clear();
     //epd.clear();
     //epd.clear();
