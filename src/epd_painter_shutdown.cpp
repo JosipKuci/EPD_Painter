@@ -3,9 +3,7 @@
 #include "epd_painter_shutdown.h"
 
 #ifdef ARDUINO
-#include "EPD_Painter_Adafruit.h"
 #include <Preferences.h>
-#include <Adafruit_GFX.h>
 #include <esp_heap_caps.h>
 #include <LittleFS.h>
 #endif
