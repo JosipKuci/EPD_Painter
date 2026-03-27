@@ -1,7 +1,6 @@
 #ifdef ARDUINO
 #include "esp32-hal.h"
 #endif
-#include "epd_painter_shutdown.h"
 #include <string.h>
 #include <cstring>
 #include "build_opt.h"
@@ -181,13 +180,9 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
 
     gpio_set_fast(_config.pin_le);
     gpio_clear_fast(_config.pin_le);
-
-
     gpio_clear_fast(_config.pin_ckv);
     EPD_DELAY_US(1);
     gpio_set_fast(_config.pin_ckv);
-
-
   }
 
   // Reset ownership, flush AFIFO, and restart GDMA from the correct descriptor.
@@ -365,9 +360,9 @@ bool EPD_Painter::begin() {
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
 
-  _shutdown = new EPD_PainterShutdown(this);
-  if (_autoShutdown && _shutdown->isPending())
-    _shutdown->proceed();
+
+  // Clear previous screen, to keep DC balance.
+  clear();
 
   return true;
 }
@@ -601,6 +596,9 @@ void EPD_Painter::_paint_task_body() {
 // =============================================================================
 void EPD_Painter::clear() {
 
+
+  PanelPowerGuard guard(*this);
+
   const int packed_row_bytes = _config.width / 4;
 
   // First paint it white.
@@ -612,11 +610,9 @@ void EPD_Painter::clear() {
   while (paintStage==1){
     vTaskDelay(1);  // Wait until paintloop starts up again
   }
-
-  // Wait until paintloop is idle.. By taking it, prevents paint loop from starting again.
+  
   xSemaphoreTake(_paint_active_sem, portMAX_DELAY);
 
-  PanelPowerGuard guard(*this);
   const uint8_t *lt_wf;
   int wf_len;
 
