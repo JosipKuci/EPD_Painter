@@ -1,6 +1,6 @@
 // Choose your board.
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-#define EPD_PAINTER_PRESET_M5PAPER_S3
+#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
+//#define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include <Arduino.h>
 #include <lvgl.h>
@@ -73,6 +73,8 @@ void setup() {
         Serial.println("Display init failed!");
         while (1) delay(1000);
     }
+
+
 
    if (display.getConfig().i2c.wire == nullptr) {                                                                                                  
         Serial.println("GT911_Lite: Wire is null, aborting begin()");                                                         

@@ -16,6 +16,7 @@
 #include <soc/gdma_struct.h>
 #include "EPD_Painter.h"
 #include <epd_painter_powerctl.h>
+#include "epd_painter_bootctl.h"
 
 #ifdef ARDUINO
   #include "Wire.h"
@@ -37,9 +38,8 @@ static const uint8_t kDataSignals[8] = {
   LCD_DATA_OUT7_IDX,
 };
 
-
-
 epd_painter_powerctl *powerctl = nullptr;
+uint8_t shiftReg = 0;
 
 // Assembly routines — see EPD_Painter.S for full documentation
 extern "C" void epd_painter_compact_pixels(
@@ -364,6 +364,10 @@ bool EPD_Painter::begin() {
   // Clear previous screen, to keep DC balance.
   clear();
 
+  if (_autoShutdown) {
+    EPD_BootCtl boot(*this);  // never returns on shutdown path
+  }
+
   return true;
 }
 
@@ -589,6 +593,63 @@ void EPD_Painter::_paint_task_body() {
     }
 
   }
+}
+
+// GPIO set/clear via direct register write — pins always <32
+#define GPIO_SET(mask) (GPIO.out_w1ts = (mask))
+#define GPIO_CLR(mask) (GPIO.out_w1tc = (mask))
+
+// Clock one bit: set/clear data, then pulse clk
+#define SHIFT_BIT(data_set, data_clr, clk_mask) \
+  data_set; clk_mask; clk_mask
+
+static void IRAM_ATTR shift_send(uint8_t reg,
+                                  uint32_t data_mask,
+                                  uint32_t clk_set,
+                                  uint32_t clk_clr,
+                                  uint32_t strobe_mask) {
+  #define SEND_BIT(n) \
+    if ((reg) & (1U << (n))) { GPIO_SET(data_mask); } else { GPIO_CLR(data_mask); } \
+    GPIO_SET(clk_set); GPIO_CLR(clk_clr);
+
+  SEND_BIT(7) SEND_BIT(6) SEND_BIT(5) SEND_BIT(4)
+  SEND_BIT(3) SEND_BIT(2) SEND_BIT(1) SEND_BIT(0)
+  #undef SEND_BIT
+
+  GPIO_SET(strobe_mask);
+  GPIO_CLR(strobe_mask);
+}
+
+void EPD_Painter::shiftOn(int bits) {
+  shiftReg |= (uint8_t)bits;
+  shift_send(shiftReg,
+    1U << _config.shift.data,
+    1U << _config.shift.clk,
+    1U << _config.shift.clk,
+    1U << _config.shift.strobe);
+}
+
+void EPD_Painter::shiftOff(int bits) {
+  shiftReg &= ~(uint8_t)bits;
+  shift_send(shiftReg,
+    1U << _config.shift.data,
+    1U << _config.shift.clk,
+    1U << _config.shift.clk,
+    1U << _config.shift.strobe);
+}
+
+// =============================================================================
+// clearBuffers()
+// Zero all packed pixel buffers so the DC-balance baseline is reset.
+// Call this after painting a shutdown image and before cutting power, so that
+// on the next boot unpaintPacked() works from a clean white baseline rather
+// than the painted state that was left in PSRAM.
+// =============================================================================
+void EPD_Painter::clearBuffers() {
+  const size_t packed_bytes = (size_t)_config.width * _config.height / 4;
+  if (packed_fastbuffer)   memset(packed_fastbuffer,   0, packed_bytes);
+  if (packed_screenbuffer) memset(packed_screenbuffer, 0, packed_bytes);
+  if (packed_paintbuffer)  memset(packed_paintbuffer,  0, packed_bytes);
 }
 
 // =============================================================================

@@ -59,23 +59,31 @@ struct PowerCtlConfig {
       uint8_t high_darker[3][13];
   };
 
+  struct Shift {
+    int8_t data;
+    int8_t clk; 
+    int8_t strobe;
+  };
+
+
   struct Config {
       uint16_t width;
       uint16_t height;
-      int8_t pin_pwr;
-      int8_t pin_syspwr = -1;
-      int8_t pin_sph;
-      int8_t pin_oe;
-      int8_t pin_cl;
-      int8_t pin_spv;
-      int8_t pin_ckv;
-      int8_t pin_le;
+      int16_t pin_pwr;
+      int16_t pin_syspwr = -1;
+      int16_t pin_sph;
+      int16_t pin_oe;
+      int16_t pin_cl;
+      int16_t pin_spv;
+      int16_t pin_ckv;
+      int16_t pin_le;
       Quality  quality;
       Rotation rotation = Rotation::ROTATION_0;
       int8_t data_pins[8];
       I2CBusConfig i2c{};
       PowerCtlConfig power{};
       Waveforms waveforms;
+      Shift shift;
 
       // Returns a copy of this config with rotation set — lets you write:
       //   EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_CW));
@@ -91,6 +99,7 @@ struct PowerCtlConfig {
 
   void clear();
   void fxClear();
+  void clearBuffers();  // zero all packed buffers (call before power-off to reset DC-balance baseline)
   void paint(uint8_t* framebuffer);
   void paintPacked(const uint8_t* packed);
   void unpaintPacked(const uint8_t* packed);
@@ -156,6 +165,9 @@ private:
   void powerOn();
   void powerOff();
   void sendRow(bool firstLine, bool lastLine=false, bool skipRow=false);
+
+  void shiftOn(int bitmask);
+  void shiftOff(int bitmask);
 
   // ---- Dual-core paint task ----
   SemaphoreHandle_t _paint_active_sem = nullptr;  // signals task to start
