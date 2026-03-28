@@ -159,7 +159,7 @@ void setup() {
     while (1);
   }
 
-  epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
   epd.clear();
 
   epd.fillScreen(3);

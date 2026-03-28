@@ -120,11 +120,6 @@ struct PowerCtlConfig {
     return _config;
   }
 
-  // Shutdown handler — created automatically by begin().
-  // By default, if a shutdown was requested on the previous reset, begin()
-  // calls proceed() immediately (no prompt). To intercept it yourself,
-  // call setAutoShutdown(false) BEFORE begin(), then check
-  // shutdown()->isPending() in your loop().
   void setAutoShutdown(bool v) { _autoShutdown = v; }
   EPD_PainterShutdown* shutdown() { return _shutdown; }
 

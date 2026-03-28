@@ -365,7 +365,8 @@ bool EPD_Painter::begin() {
   clear();
 
   if (_autoShutdown) {
-    EPD_BootCtl boot(*this);  // never returns on shutdown path
+    EPD_BootCtl boot(*this);
+    if (boot.shutdownPending()) boot.shutdown();  // [[noreturn]] on shutdown path
   }
 
   return true;
