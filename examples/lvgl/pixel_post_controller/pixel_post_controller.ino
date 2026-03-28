@@ -9,7 +9,7 @@
 #include <lvgl.h>
 #include "EPD_Painter_presets.h"
 #include "EPD_Painter_LVGL.h"
-#include "epd_painter_shutdown.h"  // needed for EPD_PainterShutdown* type
+#include "epd_painter_bootctl.h"
 #include <gt911_lite.h>
 #include <I2C_BM8563.h>
 #include "PixelPostNetwork.h"
@@ -27,7 +27,7 @@ static PixelPostNetwork net(HMAC_KEY);
 EPD_PainterLVGL display(EPD_PAINTER_PRESET);
 GT911_Lite tc;
 static I2C_BM8563 *rtc = nullptr;
-static EPD_PainterShutdown *psd = nullptr;
+static EPD_BootCtl* g_boot = nullptr;
 
 static uint32_t my_tick_cb() {
   return millis();
@@ -426,12 +426,18 @@ static void settings_btn_cb(lv_event_t *) {
 
 // ── Shutdown popup ────────────────────────────────────────────────────────────
 
+static void do_shutdown() {
+  net.sendTurnOff();
+  delay(200);  // allow ESP-NOW broadcast to go out before power-off
+  if (g_boot) g_boot->shutdown();  // [[noreturn]]
+}
+
 static void shutdown_confirm_cb(lv_event_t *) {
   if (popup) {
     lv_obj_del(popup);
     popup = nullptr;
   }
-  psd->proceed();  // show shutdown image and power off
+  do_shutdown();
 }
 
 static void shutdown_cancel_cb(lv_event_t *) {
@@ -439,7 +445,7 @@ static void shutdown_cancel_cb(lv_event_t *) {
     lv_obj_del(popup);
     popup = nullptr;
   }
-  psd->cancel();  // re-arm for next reset, continue running
+  if (g_boot) g_boot->cancelShutdown();
   display.clear();
 }
 
@@ -646,19 +652,18 @@ static void build_ui() {
 
 // ── Touch ─────────────────────────────────────────────────────────────────────
 
+static uint32_t g_last_activity_ms = 0;
+
 static void touch_read_cb(lv_indev_t *, lv_indev_data_t *data) {
   tc.read();
   if (tc.down) {
-  if (psd) psd->resetIdleTimer();
-  backlight_on_touch();
+    g_last_activity_ms = millis();
+    backlight_on_touch();
   }
- 
-  data->point.x =  tc.y;
-  data->point.y =  display.getConfig().height-tc.x;
 
-
+  data->point.x = tc.y;
+  data->point.y = display.getConfig().height - tc.x;
   data->state = tc.down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-
 }
 
 // ── Setup / loop ──────────────────────────────────────────────────────────────
@@ -680,16 +685,18 @@ void setup() {
     gpio_wakeup_enable((gpio_num_t) 48, GPIO_INTR_LOW_LEVEL); // pin 48 = touch interupt. Wakes the device up if touched.
 #endif
 
-
-
-
   backlight_on_touch();
 
-  display.setAutoShutdown(false);  // handle shutdown ourselves with a popup
+  display.setAutoShutdown(false);  // handle shutdown ourselves with a confirmation popup
+
   if (!display.begin()) {
     Serial.println("Display init failed!");
     while (1) delay(1000);
   }
+
+  static EPD_BootCtl boot_ctl(display.driver());
+  g_boot = &boot_ctl;
+  g_last_activity_ms = millis();
 
   if (display.getConfig().i2c.wire != nullptr) {
     tc.begin(display.getConfig().i2c.wire);
@@ -700,18 +707,9 @@ void setup() {
 
   esp_sleep_enable_gpio_wakeup();
 
-
-
-  psd = display.shutdown();  // use the instance created by begin()
-  psd->setPreShutdownCallback([]() {
-    net.sendTurnOff();
-    delay(200);  // allow the ESP-NOW broadcast to go out before power-off
-  });
-  psd->startIdleTimer(3600);  // auto power-off after 1 hour idle
-
   //display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
 
-  if (!(psd->isPending())) display.clear();
+  if (!g_boot->shutdownPending()) display.clear();
 
   net.begin();
   sync_epoch_from_rtc();
@@ -736,8 +734,12 @@ void setup() {
 }
 
 void loop() {
-  if (psd && psd->isPending() && !popup)
+  if (g_boot->shutdownPending() && !popup)
     show_shutdown_popup();
+
+  // Auto power-off after 1 hour of inactivity
+  if (!g_boot->shutdownPending() && millis() - g_last_activity_ms > 3600000UL)
+    do_shutdown();
 
   lv_timer_handler();
   backlight_tick();

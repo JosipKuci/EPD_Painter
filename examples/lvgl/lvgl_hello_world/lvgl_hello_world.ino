@@ -75,6 +75,8 @@ void setup() {
         while (1) delay(1000);
     }
 
+
+
    if (display.getConfig().i2c.wire == nullptr) {                                                                                                  
         Serial.println("GT911_Lite: Wire is null, aborting begin()");                                                         
         return;
