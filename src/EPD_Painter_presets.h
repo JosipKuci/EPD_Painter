@@ -44,51 +44,6 @@
         },
     };
 
-#elif defined(EPD_PAINTER_PRESET_LILYGO_T5_S3)
-    static EPD_Painter::Config EPD_PAINTER_PRESET = {
-        .width    = 960,
-        .height   = 540,
-        .pin_pwr  = 0x106,  // _MODE shift reg 6 
-        .pin_sph  = 41,
-        .pin_oe   = 0x107,  // Shift reg 1
-        .pin_cl   = 4,
-        .pin_spv  = 0x104,  // Shuft reg 4
-        .pin_ckv  = 48,
-        .pin_le   = 0x100,  // Shift reg 0
-        .quality  = EPD_Painter::Quality::QUALITY_NORMAL,
-        .data_pins = { 11, 12, 13, 14, 21, 47, 45, 38 },
-        .shift = { .data = 2, .clk = 42, .str = 1 },
-        .i2c = {
-            .sda = 6,
-            .scl = 5,
-            .freq = 100000
-        },
-        .power = {
-            .pca_addr = -1,
-            .tps_addr = -1,
-        },
-        .waveforms = {
-            .fast_lighter   = { { 1, 2, 2, 2, 2, 2, 3 },
-                                { 3, 2, 2, 2, 2, 2, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2 } },
-            .fast_darker    = { { 1, 1, 3, 3, 1, 3, 1 },
-                                { 1, 3, 1, 1, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1 } },
-            .normal_lighter = { { 1, 1, 1, 1, 2, 2, 3, 2, 2, 2, 2, 2, 2 },
-                                { 1, 2, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .normal_darker  = { { 1, 2, 1, 1, 1, 3, 1, 2, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 2, 2, 3, 1, 1, 3, 1, 3, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-            .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
-                                { 1, 1, 3, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .high_darker    = { { 1, 3, 1, 1, 1, 2, 2, 2, 1, 2, 2, 1, 1 },
-                                { 1, 1, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-        },
-    };
-
 #elif defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS)
     static EPD_Painter::Config EPD_PAINTER_PRESET = {
         .width    = 960,

@@ -260,12 +260,12 @@ bool epd_painter_powerctl_74HCT4094D::begin(EPD_Painter::Config cfg) {
   gpio_reset_pin((gpio_num_t)config.shift.clk);
   EPD_PIN_OUTPUT(config.shift.data);
   EPD_PIN_OUTPUT(config.shift.clk);
-  EPD_PIN_OUTPUT(config.shift.str);
-  EPD_PIN_LOW(config.shift.str);
+  EPD_PIN_OUTPUT(config.shift.strobe);
+  EPD_PIN_LOW(config.shift.strobe);
   _sr = ShiftState{};
   sr_push_bits();
   EPD_DEBUG_PRINT("[PWRCTL] Shift-reg init OK (DATA=%d CLK=%d STR=%d)\n",
-                  config.shift.data, config.shift.clk, config.shift.str);
+                  config.shift.data, config.shift.clk, config.shift.strobe);
   return true;
 }
 
@@ -295,7 +295,7 @@ void epd_painter_powerctl_74HCT4094D::sr_push_bits() {
 
   const int data = config.shift.data;
   const int clk  = config.shift.clk;
-  const int str  = config.shift.str;
+  const int str  = config.shift.strobe;
 
   uint8_t byte =
     (_sr.ep_output_enable  ? 0x80 : 0) |
