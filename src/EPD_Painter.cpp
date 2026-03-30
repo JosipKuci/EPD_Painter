@@ -414,9 +414,12 @@ bool EPD_Painter::end() {
 // Power control
 // =============================================================================
 void EPD_Painter::powerOn() {
-  if (!shiftctl) {
+  if (shiftctl) {
+    shiftctl->sr_set_le(false);
+    shiftctl->sr_set_stv(false);
+  } else {
     EPD_PIN_LOW(_config.pin_spv);
-  }
+  } 
   EPD_PIN_LOW(_config.pin_sph);
 
   if (shiftctl) {
@@ -437,7 +440,9 @@ void EPD_Painter::powerOn() {
   EPD_DELAY_US(1);
 
   gpio_set_fast(_config.pin_ckv);
-  if (!shiftctl) {
+  if (shiftctl) {
+    shiftctl->sr_set_stv(true);
+  } else {
     gpio_set_fast(_config.pin_spv);
   }
 }

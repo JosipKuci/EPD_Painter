@@ -8,10 +8,173 @@
 #include "EPD_Painter_presets.h"
 
 #define BOOT_BTN 0   // GPIO 0 — BOOT button, active LOW
+#define NUM_PAGES 3
 
 EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
 static int currentPage = 1;
+static String serialBuffer = "";
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+struct Page2Layout;
+static void showPage(int page);
+
+// ---------------------------------------------------------------------------
+// Serial command protocol for waveform calibration tool
+// ---------------------------------------------------------------------------
+static void parseWaveformRow(const char* data, uint8_t* dest, int len) {
+    int idx = 0;
+    const char* p = data;
+    while (*p && idx < len) {
+        while (*p == ' ') p++;
+        if (*p >= '0' && *p <= '3') {
+            dest[idx++] = *p - '0';
+        }
+        p++;
+    }
+}
+
+static void parseWaveformCommand(String& cmd) {
+    // Format: WF:FAST_LIGHTER:v,v,v,...|v,v,v,...|v,v,v,...
+    int firstColon = cmd.indexOf(':', 3);
+    if (firstColon < 0) { Serial.println("ERR:BAD_FORMAT"); return; }
+
+    String name = cmd.substring(3, firstColon);
+    String data = cmd.substring(firstColon + 1);
+
+    // Split rows by '|'
+    int pipe1 = data.indexOf('|');
+    int pipe2 = data.indexOf('|', pipe1 + 1);
+    if (pipe1 < 0 || pipe2 < 0) { Serial.println("ERR:BAD_ROWS"); return; }
+
+    String row0 = data.substring(0, pipe1);
+    String row1 = data.substring(pipe1 + 1, pipe2);
+    String row2 = data.substring(pipe2 + 1);
+
+    EPD_Painter::Waveforms& wf = epd.driver()._config.waveforms;
+
+    if (name == "FAST_LIGHTER") {
+        parseWaveformRow(row0.c_str(), wf.fast_lighter[0], 7);
+        parseWaveformRow(row1.c_str(), wf.fast_lighter[1], 7);
+        parseWaveformRow(row2.c_str(), wf.fast_lighter[2], 7);
+    } else if (name == "FAST_DARKER") {
+        parseWaveformRow(row0.c_str(), wf.fast_darker[0], 7);
+        parseWaveformRow(row1.c_str(), wf.fast_darker[1], 7);
+        parseWaveformRow(row2.c_str(), wf.fast_darker[2], 7);
+    } else if (name == "NORMAL_LIGHTER") {
+        parseWaveformRow(row0.c_str(), wf.normal_lighter[0], 13);
+        parseWaveformRow(row1.c_str(), wf.normal_lighter[1], 13);
+        parseWaveformRow(row2.c_str(), wf.normal_lighter[2], 13);
+    } else if (name == "NORMAL_DARKER") {
+        parseWaveformRow(row0.c_str(), wf.normal_darker[0], 13);
+        parseWaveformRow(row1.c_str(), wf.normal_darker[1], 13);
+        parseWaveformRow(row2.c_str(), wf.normal_darker[2], 13);
+    } else if (name == "HIGH_LIGHTER") {
+        parseWaveformRow(row0.c_str(), wf.high_lighter[0], 13);
+        parseWaveformRow(row1.c_str(), wf.high_lighter[1], 13);
+        parseWaveformRow(row2.c_str(), wf.high_lighter[2], 13);
+    } else if (name == "HIGH_DARKER") {
+        parseWaveformRow(row0.c_str(), wf.high_darker[0], 13);
+        parseWaveformRow(row1.c_str(), wf.high_darker[1], 13);
+        parseWaveformRow(row2.c_str(), wf.high_darker[2], 13);
+    } else {
+        Serial.println("ERR:UNKNOWN_WF");
+        return;
+    }
+    Serial.println("OK");
+}
+
+static void sendWaveformRow(const uint8_t* row, int len) {
+    for (int i = 0; i < len; i++) {
+        if (i > 0) Serial.print(',');
+        Serial.print(row[i]);
+    }
+}
+
+static void sendWaveformTable(const char* name, const uint8_t row0[], const uint8_t row1[], const uint8_t row2[], int len) {
+    Serial.print(name);
+    Serial.print(':');
+    sendWaveformRow(row0, len);
+    Serial.print('|');
+    sendWaveformRow(row1, len);
+    Serial.print('|');
+    sendWaveformRow(row2, len);
+    Serial.println();
+}
+
+static void sendAllWaveforms() {
+    EPD_Painter::Waveforms& wf = epd.driver()._config.waveforms;
+    Serial.println("WF_START");
+    sendWaveformTable("FAST_LIGHTER",   wf.fast_lighter[0],   wf.fast_lighter[1],   wf.fast_lighter[2],   7);
+    sendWaveformTable("FAST_DARKER",    wf.fast_darker[0],    wf.fast_darker[1],    wf.fast_darker[2],    7);
+    sendWaveformTable("NORMAL_LIGHTER", wf.normal_lighter[0], wf.normal_lighter[1], wf.normal_lighter[2], 13);
+    sendWaveformTable("NORMAL_DARKER",  wf.normal_darker[0],  wf.normal_darker[1],  wf.normal_darker[2],  13);
+    sendWaveformTable("HIGH_LIGHTER",   wf.high_lighter[0],   wf.high_lighter[1],   wf.high_lighter[2],   13);
+    sendWaveformTable("HIGH_DARKER",    wf.high_darker[0],    wf.high_darker[1],    wf.high_darker[2],    13);
+    Serial.println("WF_END");
+}
+
+static void processSerialCommand(String& cmd) {
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    if (cmd.startsWith("WF:")) {
+        parseWaveformCommand(cmd);
+    } else if (cmd == "GET_WF") {
+        sendAllWaveforms();
+    } else if (cmd.startsWith("PAGE:")) {
+        int page = cmd.substring(5).toInt();
+        if (page >= 1 && page <= NUM_PAGES) {
+            currentPage = page;
+            showPage(currentPage);
+        } else {
+            Serial.println("ERR:BAD_PAGE");
+        }
+    } else if (cmd == "CLEAR") {
+        epd.clear();
+        epd.clear();
+        epd.clear();
+        Serial.println("OK");
+    } else if (cmd == "UPDATE") {
+        showPage(currentPage);
+    } else if (cmd.startsWith("QUALITY:")) {
+        String q = cmd.substring(8);
+        q.trim();
+        if (q == "FAST") {
+            epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+            Serial.println("OK");
+        } else if (q == "NORMAL") {
+            epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+            Serial.println("OK");
+        } else if (q == "HIGH") {
+            epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+            Serial.println("OK");
+        } else {
+            Serial.println("ERR:BAD_QUALITY");
+        }
+    } else {
+        Serial.print("ERR:UNKNOWN_CMD:");
+        Serial.println(cmd);
+    }
+}
+
+static void handleSerial() {
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (serialBuffer.length() > 0) {
+                processSerialCommand(serialBuffer);
+                serialBuffer = "";
+            }
+        } else {
+            if (serialBuffer.length() < 512) {
+                serialBuffer += c;
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // drawRadialGradient()
@@ -127,23 +290,81 @@ static void drawPage1(EPD_PainterAdafruit& epd) {
 }
 
 // ---------------------------------------------------------------------------
-// drawPage2() — waveform grey calibration
-//
-// Two large squares, each split horizontally:
-//   Square 1 (lt-grey 0x01)
-//     Top    : solid fill 8bpp=170  (exact quantisation level, zero dither error)
-//     Bottom : 1-in-3 diagonal pixel pattern  → 33.3 % black, 66.7 % white
-//
-//   Square 2 (dk-grey 0x02)
-//     Top    : solid fill 8bpp=85   (exact quantisation level, zero dither error)
-//     Bottom : 2-in-3 diagonal pixel pattern  → 66.7 % black, 33.3 % white
-//
-// If the waveform for a grey level is correctly tuned the two halves of each
-// square will appear perceptually identical.
-//
-// Pattern: black when  (x + y*2) % 3 == 0
-//   Gives exactly 1/3 black density; the y*2 offset shifts each row by 1 so
-//   adjacent rows are not aligned (avoids visible vertical striping).
+// Page 2 layout constants (shared by drawPage2 and drawPage3)
+// ---------------------------------------------------------------------------
+struct Page2Layout {
+    int W, H;
+    int labelColW, sqY, footerH, sqH, halfH, gap, sqW;
+    int s1x, s2x, midY;
+
+    Page2Layout(int w, int h) : W(w), H(h) {
+        labelColW = 68;
+        sqY       = 50;
+        footerH   = 30;
+        sqH       = H - sqY - footerH;
+        halfH     = sqH / 2;
+        gap       = 30;
+        sqW       = (W - labelColW - gap) / 2;
+        s1x       = labelColW;
+        s2x       = labelColW + sqW + gap;
+        midY      = sqY + halfH;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// drawPage2Dithered() — draw the dithered halves and borders (shared)
+// ---------------------------------------------------------------------------
+static void drawPage2Dithered(EPD_PainterAdafruit& epd, const Page2Layout& L) {
+    // Left bracket annotations
+    epd.setTextSize(1);
+    epd.setTextColor(0);
+
+    epd.drawFastVLine(L.labelColW - 4, L.sqY,   L.halfH, 0);
+    epd.drawFastHLine(L.labelColW - 8, L.sqY,   4, 0);
+    epd.drawFastHLine(L.labelColW - 8, L.midY - 1, 4, 0);
+
+    epd.drawFastVLine(L.labelColW - 4, L.midY,  L.halfH, 0);
+    epd.drawFastHLine(L.labelColW - 8, L.midY,  4, 0);
+    epd.drawFastHLine(L.labelColW - 8, L.sqY + L.sqH - 1, 4, 0);
+
+    epd.setCursor(2, L.sqY + L.halfH / 2 - 12);
+    epd.print("Solid");
+    epd.setCursor(2, L.sqY + L.halfH / 2 - 4);
+    epd.print("grey");
+
+    epd.setCursor(2, L.midY + L.halfH / 2 - 12);
+    epd.print("Dithrd");
+    epd.setCursor(2, L.midY + L.halfH / 2 - 4);
+    epd.print("B+W");
+
+    // --- Dithered halves ---
+    // Square 1: 1-in-3 pattern (33% black)
+    for (int y = L.midY; y < L.sqY + L.sqH; y++)
+        for (int x = L.s1x; x < L.s1x + L.sqW; x++)
+            epd.drawPixel(x, y, ((x + y * 2) % 3 == 0) ? 0 : 255);
+
+    // Square 2: 2-in-3 pattern (67% black)
+    for (int y = L.midY; y < L.sqY + L.sqH; y++)
+        for (int x = L.s2x; x < L.s2x + L.sqW; x++)
+            epd.drawPixel(x, y, ((x + y * 2) % 3 != 0) ? 0 : 255);
+
+    // --- Borders ---
+    epd.drawRect(L.s1x, L.sqY, L.sqW, L.sqH, 0);
+    epd.drawFastHLine(L.s1x, L.midY, L.sqW, 0);
+    epd.drawRect(L.s2x, L.sqY, L.sqW, L.sqH, 0);
+    epd.drawFastHLine(L.s2x, L.midY, L.sqW, 0);
+
+    // --- Dithered half labels ---
+    epd.setTextSize(1);
+    epd.setTextColor(0);
+    epd.setCursor(L.s1x + 4, L.midY + 4);
+    epd.print("33.3% black + 66.7% white pixels");
+    epd.setCursor(L.s2x + 4, L.midY + 4);
+    epd.print("66.7% black + 33.3% white pixels");
+}
+
+// ---------------------------------------------------------------------------
+// drawPage2() — darker waveform grey calibration
 // ---------------------------------------------------------------------------
 static void drawPage2(EPD_PainterAdafruit& epd) {
     const int W = epd.width();
@@ -155,95 +376,73 @@ static void drawPage2(EPD_PainterAdafruit& epd) {
     epd.setTextColor(0);
     epd.setTextSize(2);
     epd.setCursor(10, 8);
-    epd.print("Grey Waveform Calibration");
+    epd.print("Darker Waveform Calibration");
     epd.setTextSize(1);
     epd.setCursor(10, 32);
-    epd.print("Top half = solid waveform grey.  Bottom half = dithered B+W at matching density.  Match = correct waveform.   [BOOT = prev page]");
+    epd.print("Top half = solid waveform grey.  Bottom half = dithered B+W at matching density.  Match = correct waveform.   [BOOT = next]");
 
-    // Layout
-    const int labelColW = 68;
-    const int sqY       = 50;
-    const int footerH   = 30;
-    const int sqH       = H - sqY - footerH;
-    const int halfH     = sqH / 2;
-    const int gap       = 30;
-    const int sqW       = (W - labelColW - gap) / 2;
-    const int s1x       = labelColW;
-    const int s2x       = labelColW + sqW + gap;
-    const int midY      = sqY + halfH;
+    Page2Layout L(W, H);
+    drawPage2Dithered(epd, L);
 
-    // Left bracket annotations
-    epd.setTextSize(1);
-    epd.setTextColor(0);
-
-    epd.drawFastVLine(labelColW - 4, sqY,   halfH, 0);
-    epd.drawFastHLine(labelColW - 8, sqY,   4, 0);
-    epd.drawFastHLine(labelColW - 8, midY - 1, 4, 0);
-
-    epd.drawFastVLine(labelColW - 4, midY,  halfH, 0);
-    epd.drawFastHLine(labelColW - 8, midY,  4, 0);
-    epd.drawFastHLine(labelColW - 8, sqY + sqH - 1, 4, 0);
-
-    epd.setCursor(2, sqY + halfH / 2 - 12);
-    epd.print("Solid");
-    epd.setCursor(2, sqY + halfH / 2 - 4);
-    epd.print("grey");
-
-    epd.setCursor(2, midY + halfH / 2 - 12);
-    epd.print("Dithrd");
-    epd.setCursor(2, midY + halfH / 2 - 4);
-    epd.print("B+W");
-
-    // --- Square 1: lt-grey ---
+    // --- Solid fills (grey) ---
     epd.setTextSize(2);
     epd.setTextColor(0);
-    epd.setCursor(s1x + sqW / 2 - 60, sqY - 18);
+    epd.setCursor(L.s1x + L.sqW / 2 - 60, L.sqY - 18);
     epd.print("lt-grey 0x01");
+    epd.fillRect(L.s1x + 1, L.sqY + 1, L.sqW - 2, L.halfH - 1, 170);
 
-    epd.fillRect(s1x, sqY, sqW, halfH, 170);
-
-    for (int y = midY; y < sqY + sqH; y++)
-        for (int x = s1x; x < s1x + sqW; x++)
-            epd.drawPixel(x, y, ((x + y * 2) % 3 == 0) ? 0 : 255);
-
-    epd.drawRect(s1x, sqY, sqW, sqH, 0);
-    epd.drawFastHLine(s1x, midY, sqW, 0);
-
-    epd.setTextSize(1);
-    epd.setTextColor(0);
-    epd.setCursor(s1x + 4, sqY + 4);
-    epd.print("8bpp = 170  (solid waveform grey)");
-    epd.setCursor(s1x + 4, midY + 4);
-    epd.print("33.3% black + 66.7% white pixels");
-
-    // --- Square 2: dk-grey ---
     epd.setTextSize(2);
     epd.setTextColor(0);
-    epd.setCursor(s2x + sqW / 2 - 60, sqY - 18);
+    epd.setCursor(L.s2x + L.sqW / 2 - 60, L.sqY - 18);
     epd.print("dk-grey 0x02");
+    epd.fillRect(L.s2x + 1, L.sqY + 1, L.sqW - 2, L.halfH - 1, 85);
 
-    epd.fillRect(s2x, sqY, sqW, halfH, 85);
-
-    for (int y = midY; y < sqY + sqH; y++)
-        for (int x = s2x; x < s2x + sqW; x++)
-            epd.drawPixel(x, y, ((x + y * 2) % 3 != 0) ? 0 : 255);
-
-    epd.drawRect(s2x, sqY, sqW, sqH, 0);
-    epd.drawFastHLine(s2x, midY, sqW, 0);
-
+    // Solid half labels
     epd.setTextSize(1);
-    epd.setTextColor(255);
-    epd.setCursor(s2x + 4, sqY + 4);
-    epd.print("8bpp = 85   (solid waveform grey)");
     epd.setTextColor(0);
-    epd.setCursor(s2x + 4, midY + 4);
-    epd.print("66.7% black + 33.3% white pixels");
+    epd.setCursor(L.s1x + 4, L.sqY + 4);
+    epd.print("8bpp = 170  (solid waveform grey)");
+    epd.setTextColor(255);
+    epd.setCursor(L.s2x + 4, L.sqY + 4);
+    epd.print("8bpp = 85   (solid waveform grey)");
 
     // Footer
     epd.setTextSize(1);
     epd.setTextColor(0);
     epd.setCursor(10, H - 18);
     epd.print("0=white  1=lt-grey(8bpp=170)  2=dk-grey(8bpp=85)  3=black(0)   |   pattern: (x + y*2) % 3 == 0  -> 1/3 black, diagonal offset");
+}
+
+// ---------------------------------------------------------------------------
+// drawPage3() — lighter waveform calibration
+//
+// Same layout as Page 2, but the solid grey halves are WHITE.
+// Show Page 2 first (greys on screen), then Page 3: the grey→white
+// transition exercises the lighter waveform.  If calibrated correctly,
+// no ghosting will remain in the solid areas.
+// ---------------------------------------------------------------------------
+static void drawPage3(EPD_PainterAdafruit& epd) {
+
+    int trd = epd.height() / 3;
+    int H = epd.height();
+    int W = epd.width();
+    epd.fillRect(0, 0, W, H, 1);
+    epd.paint();
+    epd.clear();
+
+    delay(500);
+    epd.fillRect(0, 0, W-200, trd, 1);
+    epd.fillRect(0, trd, W-200, trd, 2);
+    epd.fillRect(0, 2*trd, W-200, trd, 3);
+    epd.paint();
+
+    delay(500);
+    epd.fillRect(W-400, 0, 400, epd.height(), 0);
+
+    epd.setTextSize(3);
+    epd.setCursor(10, 8);
+    epd.print("Lighter Waveform Calibration");
+    epd.paint();
 }
 
 // ---------------------------------------------------------------------------
@@ -254,12 +453,27 @@ static void showPage(int page) {
     epd.clear();
     epd.clear();
 
-    if (page == 1) {
-        Serial.println("Drawing page 1...");
-        drawPage1(epd);
-    } else {
-        Serial.println("Drawing page 2...");
-        drawPage2(epd);
+    switch (page) {
+        case 1:
+            Serial.println("Drawing page 1...");
+            drawPage1(epd);
+            break;
+        case 2:
+            Serial.println("Drawing page 2...");
+            drawPage2(epd);
+            break;
+        case 3:
+            Serial.println("Drawing page 3...");
+            drawPage3(epd);
+            return; // dither and paint are handled inside drawPage3() 
+                    // to ensure the timing is correct for the lighter 
+                    // waveform test — we don't want the white rectangles 
+                    // to be composited into the framebuffer before paint() 
+                    // reads it, or it would defeat the purpose of the test.
+            break;
+        default:
+            Serial.println("ERR:BAD_PAGE");
+            return;
     }
     Serial.println("Dithering...");
     epd.dither();
@@ -276,30 +490,49 @@ void setup() {
         Serial.println("EPD init failed");
         while (1);
     }
-    //epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
-    epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+
+#if defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_H752)
+    #define BACKLIGHT_PIN 40
+#elif defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS)
+    #define BACKLIGHT_PIN 11
+#endif
+    #define TFT_BRIGHT_Bits 8
+    #define TFT_BRIGHT_FREQ 5000
+
+#if defined(BACKLIGHT_PIN)
+    pinMode(BACKLIGHT_PIN, OUTPUT);
+    //digitalWrite(BACKLIGHT_PIN, HIGH);
+    ledcAttach(BACKLIGHT_PIN, TFT_BRIGHT_FREQ, TFT_BRIGHT_Bits);
+    ledcWrite(BACKLIGHT_PIN, 0);
+#endif
+
+    Serial.println("EPD_Painter Dither Demo + Waveform Calibration");
+    Serial.println("Serial commands: PAGE:n  CLEAR  UPDATE  QUALITY:x  WF:name:data  GET_WF");
 
     showPage(currentPage);
 }
 
 void loop() {
+    // Handle serial commands from calibration tool
+    handleSerial();
+
 #ifdef EPD_PAINTER_PRESET_M5PAPER_S3
     // M5PaperS3 has no user-accessible BOOT button — advance automatically
     delay(4000);
-    currentPage = (currentPage == 1) ? 2 : 1;
+    currentPage = (currentPage % NUM_PAGES) + 1;
     showPage(currentPage);
 #else
     // Wait for BOOT button press (active LOW), with debounce
     if (digitalRead(BOOT_BTN) == LOW) {
         delay(50);
         if (digitalRead(BOOT_BTN) == LOW) {
-            currentPage = (currentPage == 1) ? 2 : 1;
+            currentPage = (currentPage % NUM_PAGES) + 1;
             showPage(currentPage);
             while (digitalRead(BOOT_BTN) == LOW)
                 delay(10);
             delay(50);
         }
     }
-    delay(100); // avoid watchdog trigger
+    delay(10); // avoid watchdog trigger
 #endif
 }
