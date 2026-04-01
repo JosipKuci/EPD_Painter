@@ -63,6 +63,7 @@ struct PowerCtlConfig {
     int8_t data   = -1;
     int8_t clk    = -1; 
     int8_t strobe = -1;
+    int8_t le_time = 6;
   };
 
 

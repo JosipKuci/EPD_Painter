@@ -255,17 +255,17 @@ bool epd_painter_powerctl::tpsRead(uint8_t reg, uint8_t& val) {
 
 epd_painter_powerctl_74HCT4094D::epd_painter_powerctl_74HCT4094D() {}
 
-bool epd_painter_powerctl_74HCT4094D::begin(EPD_Painter::Config cfg) {
-  config = cfg;
-  gpio_reset_pin((gpio_num_t)config.shift.clk);
-  EPD_PIN_OUTPUT(config.shift.data);
-  EPD_PIN_OUTPUT(config.shift.clk);
-  EPD_PIN_OUTPUT(config.shift.strobe);
-  EPD_PIN_LOW(config.shift.strobe);
+bool epd_painter_powerctl_74HCT4094D::begin(EPD_Painter::Config& cfg) {
+  config = &cfg;
+  gpio_reset_pin((gpio_num_t)config->shift.clk);
+  EPD_PIN_OUTPUT(config->shift.data);
+  EPD_PIN_OUTPUT(config->shift.clk);
+  EPD_PIN_OUTPUT(config->shift.strobe);
+  EPD_PIN_LOW(config->shift.strobe);
   _sr = ShiftState{};
   sr_push_bits();
   EPD_DEBUG_PRINT("[PWRCTL] Shift-reg init OK (DATA=%d CLK=%d STR=%d)\n",
-                  config.shift.data, config.shift.clk, config.shift.strobe);
+                  config->shift.data, config->shift.clk, config->shift.strobe);
   return true;
 }
 
@@ -293,19 +293,19 @@ void epd_painter_powerctl_74HCT4094D::sr_push_bits() {
 #define SR_NOP6  __asm volatile("nop;nop;nop;nop;nop;nop;" ::: "memory")
 #define SR_NOP2  __asm volatile("nop;nop;" ::: "memory")
 
-  const int data = config.shift.data;
-  const int clk  = config.shift.clk;
-  const int str  = config.shift.strobe;
+  const int data = config->shift.data;
+  const int clk  = config->shift.clk;
+  const int str  = config->shift.strobe;
 
   uint8_t byte =
-    (_sr.ep_output_enable  ? 0x80 : 0) |
-    (_sr.ep_mode           ? 0x40 : 0) |
-    (_sr.ep_scan_direction ? 0x20 : 0) |
-    (_sr.ep_stv            ? 0x10 : 0) |
-    (_sr.neg_power_enable  ? 0x08 : 0) |
-    (_sr.pos_power_enable  ? 0x04 : 0) |
-    (_sr.power_disable     ? 0x02 : 0) |
-    (_sr.ep_latch_enable   ? 0x01 : 0);
+    (_sr.ep_output_enable  ? 0x80 : 0) | // QP7 -> EP_OE
+    (_sr.ep_mode           ? 0x40 : 0) | // QP6 -> EP_MODE
+    (_sr.power_enable      ? 0x20 : 0) | // QP5 -> PWR_EN
+    (_sr.ep_stv            ? 0x10 : 0) | // QP4 -> EP_STV
+    (_sr.q3_unused         ? 0x08 : 0) | // QP3
+    (_sr.q2_unused         ? 0x04 : 0) | // QP2
+    (_sr.q1_unused         ? 0x02 : 0) | // QP1
+    (_sr.ep_latch_enable   ? 0x01 : 0);  // QP0 -> EP_LE
 
   iram_pin_clr(str);
   for (int i = 7; i >= 0; i--) {
@@ -325,6 +325,7 @@ void epd_painter_powerctl_74HCT4094D::sr_push_bits() {
 void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_le(bool val) {
   _sr.ep_latch_enable = val;
   sr_push_bits();
+  if(val) EPD_DELAY_US(config->shift.le_time);
 }
 
 void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_stv(bool val) {
@@ -334,31 +335,35 @@ void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_stv(bool val) {
 
 bool epd_painter_powerctl_74HCT4094D::powerOn() {
   EPD_DEBUG_PRINT("[PWRCTL] Shift-reg power-on...\n");
-  _sr.ep_scan_direction = true;
-  _sr.power_disable = false;
+  _sr.ep_latch_enable = false;
+  _sr.ep_stv = false;
+  _sr.ep_output_enable = false;
+  _sr.ep_mode = false;
   sr_push_bits();
 
-  _sr.neg_power_enable = true;
-  _sr.pos_power_enable = true;
+  // H752 schematic:
+  //   QP0=EP_LE, QP4=EP_STV, QP5=PWR_EN, QP6=EP_MODE, QP7=EP_OE.
+  // Bring panel rails up first, then enable the driver outputs.
+  _sr.power_enable = true;
   sr_push_bits();
+  EPD_DELAY_US(200);
 
-  _sr.ep_stv = true;
-  _sr.ep_output_enable = true;
   _sr.ep_mode = true;
+  _sr.ep_output_enable = true;
   sr_push_bits();
   return true;
 }
 
 void epd_painter_powerctl_74HCT4094D::powerOff() {
   EPD_DEBUG_PRINT("[PWRCTL] Shift-reg power-off...\n");
-  _sr.pos_power_enable = false;
-  _sr.neg_power_enable = false;
-  sr_push_bits();
-
-  _sr.ep_stv = false;
-  _sr.ep_output_enable = false;
-  _sr.ep_mode = false;
+  // Disable panel drive before removing power.
   _sr.ep_latch_enable = false;
-  _sr.power_disable = true;
+  _sr.ep_stv = false;
+  _sr.ep_mode = false;
+  _sr.ep_output_enable = false;
+  sr_push_bits();
+  EPD_DELAY_US(100);
+
+  _sr.power_enable = false;
   sr_push_bits();
 }

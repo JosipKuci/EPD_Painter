@@ -63,7 +63,7 @@ class epd_painter_powerctl_74HCT4094D {
 public:
   epd_painter_powerctl_74HCT4094D();
 
-  bool begin(EPD_Painter::Config config);
+  bool begin(EPD_Painter::Config& config);
 
   bool powerOn();
   void powerOff();
@@ -72,17 +72,17 @@ public:
   void IRAM_ATTR sr_set_stv(bool val);
 
 private:
-  EPD_Painter::Config config;
+  EPD_Painter::Config* config;
 
   struct ShiftState {
-    bool power_disable     = true;
-    bool pos_power_enable  = false;
-    bool neg_power_enable  = false;
-    bool ep_scan_direction = true;
-    bool ep_output_enable  = false;
-    bool ep_mode           = false;
-    bool ep_stv            = false;
-    bool ep_latch_enable   = false;
+    bool ep_latch_enable   = false; // QP0 -> EP_LE
+    bool q1_unused         = false; // QP1 -> not used by the driver
+    bool q2_unused         = false; // QP2 -> not used by the driver
+    bool q3_unused         = false; // QP3 -> not used by the driver
+    bool ep_stv            = false; // QP4 -> EP_STV / SPV
+    bool power_enable      = false; // QP5 -> PWR_EN
+    bool ep_mode           = false; // QP6 -> EP_MODE
+    bool ep_output_enable  = false; // QP7 -> EP_OE
   } _sr;
 
   void sr_push_bits();
