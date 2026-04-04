@@ -85,6 +85,8 @@ public:
     // Rendering
     // -------------------------------------------------------------------------
     void paint() { _painter.paint(buffer); }
+    void paintLater() { _painter.paintLater(buffer); }
+
     void clear(const EPD_Painter::Rect *rects = nullptr, int num_rects = 0, EPD_Painter::ClearMode mode = EPD_Painter::ClearMode::HARD) { _painter.clear(rects, num_rects, mode); }
     int computeDirtyRects(EPD_Painter::Rect *out, int max, int tolerance = 0) const { return _painter.computeDirtyRects(out, max, tolerance); }
     void clearDirtyAreas(int tolerance = 0, EPD_Painter::ClearMode mode = EPD_Painter::ClearMode::SOFT) { _painter.clearDirtyAreas(buffer, tolerance, mode); }
@@ -102,6 +104,35 @@ public:
     // Access to the underlying driver if needed
     // -------------------------------------------------------------------------
     EPD_Painter &driver() { return _painter; }
+
+    // Direct framebuffer access — 8bpp, one byte per pixel, width*height bytes.
+    uint8_t* getBuffer() { return buffer; }
+
+    // Override fillRect to use memset directly on the 8bpp buffer instead of the
+    // Adafruit GFX pixel-by-pixel loop.  Falls back to the base class if a
+    // rotation is active (rare — MagiTrac runs landscape with rotation=0).
+    void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) override {
+        if (rotation != 0) {
+            Adafruit_GFX::fillRect(x, y, w, h, color);
+            return;
+        }
+        // Clamp to buffer bounds
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > WIDTH)  w = WIDTH  - x;
+        if (y + h > HEIGHT) h = HEIGHT - y;
+        if (w <= 0 || h <= 0) return;
+
+        uint8_t c = static_cast<uint8_t>(color);
+        if (x == 0 && w == WIDTH) {
+            // Full-width span is contiguous — single memset.
+            memset(buffer + static_cast<int32_t>(y) * WIDTH, c,
+                   static_cast<int32_t>(w) * h);
+        } else {
+            for (int16_t r = 0; r < h; r++)
+                memset(buffer + static_cast<int32_t>(y + r) * WIDTH + x, c, w);
+        }
+    }
 
     // Shutdown — call setAutoShutdown(false) BEFORE begin() to intercept
     // the shutdown yourself. Then check shutdown()->isPending() in loop().
