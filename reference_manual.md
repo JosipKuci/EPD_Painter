@@ -629,11 +629,7 @@ void setup() {
     display.setTextSize(3);
     display.setCursor(40, 260);
 
-    if (display.getPreset() == &EPD_M5PAPER_S3_PRESET) {
-        display.print("Press reset to power off.");
-    } else {
-        display.print("Press power button to power off.");
-    }
+    display.print("Press reset to power off.");
 
     display.paint();
 }
@@ -685,7 +681,7 @@ void drawShutdownScreen() {
     if (display.getPreset() == &EPD_M5PAPER_S3_PRESET) {
         display.print("Press reset to wake");
     } else {
-        display.print("Press power button to wake");
+        display.print("Press and hold  power button to wake");
     }
 }
 
@@ -722,11 +718,7 @@ void setup() {
     display.setTextSize(3);
     display.setCursor(40, 260);
 
-    if (display.getPreset() == &EPD_M5PAPER_S3_PRESET) {
-        display.print("Press reset to power off.");
-    } else {
-        display.print("Press power button to power off.");
-    }
+    display.print("Press reset to power off.");
 
     display.paint();
 }
