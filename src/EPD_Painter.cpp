@@ -585,19 +585,12 @@ void EPD_Painter::_paint_task_body() {
       } else if (_config.quality == Quality::QUALITY_NORMAL) {
         EPD_DELAY_MS(2);
       }
-    memset(dma_buffer1, 0x00, packed_row_bytes);
-    memset(dma_buffer2, 0x00, packed_row_bytes);
-    for (int row = 0; row < _config.height; ++row) {
-      sendRow(row == 0, row == _config.height - 1);
-    }
-      //  vTaskDelay(10);  // yield once per frame: feeds WDT and lets application task run
-
     }
 #ifdef EPD_ASM_TIMING
     printf("[paint_task] convert_packed_fb_to_ink (all passes, all rows, darker+lighter): %lld us\n", _conv_total);
 #endif
 
-  //  vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
+    vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
 
     memset(dma_buffer1, 0x00, packed_row_bytes);
     memset(dma_buffer2, 0x00, packed_row_bytes);
