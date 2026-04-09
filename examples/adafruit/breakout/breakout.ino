@@ -167,7 +167,6 @@ void setup() {
   epd.paint();
   epd.fillScreen(0);
   epd.paint();
-  
 
   const auto& cfg = epd.getConfig();
 

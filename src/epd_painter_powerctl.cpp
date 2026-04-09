@@ -322,15 +322,22 @@ void epd_painter_powerctl_74HCT4094D::sr_push_bits() {
 
 }
 
-void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_le(bool val) {
-  _sr.ep_latch_enable = val;
+void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_bit(uint8_t index, bool val) {
+  bool* fields[8] = {
+    &_sr.ep_latch_enable,  // QP0
+    &_sr.q1_unused,        // QP1
+    &_sr.q2_unused,        // QP2
+    &_sr.q3_unused,        // QP3
+    &_sr.ep_stv,           // QP4
+    &_sr.power_enable,     // QP5
+    &_sr.ep_mode,          // QP6
+    &_sr.ep_output_enable, // QP7
+  };
+  if (index < 8) *fields[index] = val;
   sr_push_bits();
-  if(val && config->shift.le_time > 0) EPD_DELAY_US(config->shift.le_time);
-}
-
-void IRAM_ATTR epd_painter_powerctl_74HCT4094D::sr_set_stv(bool val) {
-  _sr.ep_stv = val;
-  sr_push_bits();
+  // LE (QP0) going high needs the board-specific hold time before the next edge
+  if (index == 0 && val && config->shift.le_time > 0)
+    EPD_DELAY_US(config->shift.le_time);
 }
 
 bool epd_painter_powerctl_74HCT4094D::powerOn() {

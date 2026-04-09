@@ -98,13 +98,13 @@
     inline EPD_Painter::Config EPD_LILYGO_T5_S3_H752_PRESET = {
         .width    = 960,
         .height   = 540,
-        .pin_pwr  = -1,   // shift register
-        .pin_sph  = 9,    // STH  — direct GPIO
-        .pin_oe   = -1,   // shift register
-        .pin_cl   = 10,   // CKH  — direct GPIO
-        .pin_spv  = -1,   // EP_STV / SPV via shift register Q4
-        .pin_ckv  = 39,   // CKV  — direct GPIO
-        .pin_le   = -1,   // EP_LE via shift register Q0
+        .pin_pwr  = -1,            // shift register (power managed by shiftctl->powerOn/Off)
+        .pin_sph  = 9,             // STH  — direct GPIO
+        .pin_oe   = -1,            // shift register (power managed by shiftctl->powerOn/Off)
+        .pin_cl   = 10,            // CKH  — direct GPIO
+        .pin_spv  = EPD_SR_PIN(4), // EP_STV / SPV — shift register QP4
+        .pin_ckv  = 39,            // CKV  — direct GPIO
+        .pin_le   = EPD_SR_PIN(0), // EP_LE — shift register QP0
         .quality  = EPD_Painter::Quality::QUALITY_NORMAL,
         .data_pins = { 11, 12, 13, 14, 21, 47, 45, 38 },
         .i2c = { .sda = 6, .scl = 5, .freq = 100000 },   // I2C bus exposed for peripherals on H752

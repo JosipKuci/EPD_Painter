@@ -17,6 +17,7 @@
 #include "EPD_Painter.h"
 #include <epd_painter_powerctl.h>
 #include "epd_painter_bootctl.h"
+#include "epd_pin_driver.h"
 
 #ifdef ARDUINO
   #include "Wire.h"
@@ -43,9 +44,6 @@ static const uint8_t kDataSignals[8] = {
   LCD_DATA_OUT7_IDX,
 };
 
-epd_painter_powerctl *powerctl = nullptr;
-epd_painter_powerctl_74HCT4094D *shiftctl = nullptr;
-uint8_t shiftReg = 0;
 
 // Assembly routines — see EPD_Painter.S for full documentation
 extern "C" void epd_painter_compact_pixels(
@@ -106,21 +104,6 @@ static inline void epd_gpio_func_sel(int pin) {
   esp_rom_gpio_pad_select_gpio((gpio_num_t)pin);
 }
 
-static inline void gpio_set_fast(uint8_t pin) {
-  if (pin < 32) {
-    REG_WRITE(GPIO_OUT_W1TS_REG, 1UL << pin);
-  } else {
-    REG_WRITE(GPIO_OUT1_W1TS_REG, 1UL << (pin - 32));
-  }
-}
-
-static inline void gpio_clear_fast(uint8_t pin) {
-  if (pin < 32) {
-    REG_WRITE(GPIO_OUT_W1TC_REG, 1UL << pin);
-  } else {
-    REG_WRITE(GPIO_OUT1_W1TC_REG, 1UL << (pin - 32));
-  }
-}
 
 #define PASS_COUNT 13
 
@@ -163,40 +146,22 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
   }
 
   if (firstLine) {
-    if(shiftctl){
-      shiftctl->sr_set_stv(false);
-      gpio_clear_fast(_config.pin_ckv);
-      EPD_DELAY_US(1);
-      gpio_set_fast(_config.pin_ckv);
-      shiftctl->sr_set_stv(true);
-    } else {
-      gpio_clear_fast(_config.pin_spv);
-      gpio_clear_fast(_config.pin_ckv);
-      EPD_DELAY_US(1);
-      gpio_set_fast(_config.pin_ckv);
-      gpio_set_fast(_config.pin_spv);
-    }
-
+    _pin_spv->set(false);
+    _pin_ckv->set(false);
+    EPD_DELAY_US(1);
+    _pin_ckv->set(true);
+    _pin_spv->set(true);
   } else {
-    if(shiftctl){
-      shiftctl->sr_set_le(true);
-      shiftctl->sr_set_le(false);
-      gpio_clear_fast(_config.pin_ckv);
-      EPD_DELAY_US(1);
-      gpio_set_fast(_config.pin_ckv);
-    } else {
-      gpio_set_fast(_config.pin_le);
-      gpio_clear_fast(_config.pin_le);
-      gpio_clear_fast(_config.pin_ckv);
-      EPD_DELAY_US(1);
-      gpio_set_fast(_config.pin_ckv);
-    }
+    _pin_le->set(true);
+    _pin_le->set(false);
+    _pin_ckv->set(false);
+    EPD_DELAY_US(1);
+    _pin_ckv->set(true);
   }
 
   // Reset ownership, flush AFIFO, and restart GDMA from the correct descriptor.
   // This prevents free-running DMA from preloading the next buffer into the AFIFO
   // before the CPU has written new row data there (which caused left-side artifacts).
-  desc->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
   LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
   gdma_start(dma_chan, (intptr_t)desc);
 
@@ -204,18 +169,10 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool skipRow) {
   if (lastLine) {
     while (LCD_CAM.lcd_user.lcd_start) {}
 
-    if(shiftctl){
-      gpio_clear_fast(_config.pin_ckv);
-      shiftctl->sr_set_le(true);
-      shiftctl->sr_set_le(false);
-      gpio_set_fast(_config.pin_ckv);
-    } else {
-      gpio_clear_fast(_config.pin_ckv);
-      gpio_set_fast(_config.pin_le);
-      EPD_DELAY_US(1);
-      gpio_clear_fast(_config.pin_le);
-      gpio_set_fast(_config.pin_ckv);
-    }
+    _pin_ckv->set(false);
+    _pin_le->set(true);
+    _pin_le->set(false);
+    _pin_ckv->set(true);
   }
 }
 
@@ -242,13 +199,14 @@ bool EPD_Painter::begin() {
 
 
   // ---- Configure EPD control pins ----
-  // Pins managed by powerctl (PCA9555 or shift register) are set to -1.
-  if (_config.pin_pwr >= 0) EPD_PIN_OUTPUT(_config.pin_pwr);
-  if (_config.pin_spv >= 0) EPD_PIN_OUTPUT(_config.pin_spv);
+  // Pins managed by powerctl (PCA9555) or encoded as EPD_SR_PIN() (shift register)
+  // are skipped here — their hardware is initialised elsewhere.
+  if (_config.pin_pwr >= 0 && !epd_pin_is_sr(_config.pin_pwr)) EPD_PIN_OUTPUT(_config.pin_pwr);
+  if (_config.pin_spv >= 0 && !epd_pin_is_sr(_config.pin_spv)) EPD_PIN_OUTPUT(_config.pin_spv);
   EPD_PIN_OUTPUT(_config.pin_ckv);
   EPD_PIN_OUTPUT(_config.pin_sph);
-  if (_config.pin_oe  >= 0) EPD_PIN_OUTPUT(_config.pin_oe);
-  if (_config.pin_le  >= 0) EPD_PIN_OUTPUT(_config.pin_le);
+  if (_config.pin_oe  >= 0 && !epd_pin_is_sr(_config.pin_oe))  EPD_PIN_OUTPUT(_config.pin_oe);
+  if (_config.pin_le  >= 0 && !epd_pin_is_sr(_config.pin_le))  EPD_PIN_OUTPUT(_config.pin_le);
   EPD_PIN_OUTPUT(_config.pin_cl);
 
 
@@ -331,14 +289,12 @@ bool EPD_Painter::begin() {
   dma_buffer = dma_buffer1;
 
   // ---- Set up DMA descriptors (one per buffer, stopped after each row) ----
-  dma_desc2.dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
   dma_desc2.dw0.suc_eof = 1;
   dma_desc2.dw0.size = packed_row_bytes;
   dma_desc2.dw0.length = packed_row_bytes;
   dma_desc2.buffer = const_cast<uint8_t *>(dma_buffer2);
   dma_desc2.next = nullptr;
 
-  dma_desc1.dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
   dma_desc1.dw0.suc_eof = 1;
   dma_desc1.dw0.size = packed_row_bytes;
   dma_desc1.dw0.length = packed_row_bytes;
@@ -359,22 +315,32 @@ bool EPD_Painter::begin() {
   bitmask = static_cast<uint32_t *>(
     heap_caps_aligned_alloc(4, _config.height * 4, MALLOC_CAP_INTERNAL));
 
-  // ── If a TPS chip is present, initialise the power controller ──
+  // ── Create the power driver for this board ──
   if (_config.power.tps_addr != -1) {
     printf("\n── PowerCtl Init ──\n");
-    powerctl = new epd_painter_powerctl();
-    if (!powerctl->begin(_config)) {
+    auto* pc = new epd_painter_powerctl();
+    if (!pc->begin(_config)) {
       printf("FATAL: powerctl init failed!\n");
       while (1) EPD_DELAY_MS(1000);
     }
+    _powerDriver = pc;
+  } else if (_config.shift.data >= 0) {
+    _shiftReg = new epd_painter_powerctl_74HCT4094D();
+    _shiftReg->begin(_config);
+    _powerDriver = _shiftReg;
+  } else {
+    _powerDriver = new EPD_GpioPowerDriver(_config.pin_oe, _config.pin_pwr);
   }
-  // ── If a shift register is present, initialise the shift controller ──
-  if( _config.shift.data >= 0) {
-    shiftctl = new epd_painter_powerctl_74HCT4094D();
-    if (shiftctl != nullptr) {
-      shiftctl->begin(_config);
-    }
-  }
+
+  // ── Create per-pin drivers (GPIO or SR, determined by preset encoding) ──
+  auto make_pin = [this](int16_t p) -> EPD_PinDriver* {
+    if (epd_pin_is_sr(p)) return new EPD_SRPin(_shiftReg, epd_pin_sr_bit(p));
+    return new EPD_GpioPin(uint8_t(p));
+  };
+  _pin_spv = make_pin(_config.pin_spv);
+  _pin_ckv = new EPD_GpioPin(uint8_t(_config.pin_ckv));
+  _pin_le  = make_pin(_config.pin_le);
+  _pin_sph = new EPD_GpioPin(uint8_t(_config.pin_sph));
 
   if (!(dma_buffer && packed_fastbuffer && packed_screenbuffer)) return false;
 
@@ -419,50 +385,21 @@ bool EPD_Painter::end() {
 // Power control
 // =============================================================================
 void EPD_Painter::powerOn() {
-  if (shiftctl) {
-    shiftctl->sr_set_le(false);
-    shiftctl->sr_set_stv(false);
-  } else {
-    EPD_PIN_LOW(_config.pin_spv);
-  } 
-  EPD_PIN_LOW(_config.pin_sph);
+  _pin_le->set(false);
+  _pin_spv->set(false);
+  _pin_sph->set(false);
 
-  if (shiftctl) {
-    shiftctl->powerOn();
-  } else if (powerctl) {
-    powerctl->powerOn();
-  } else {
-    EPD_PIN_HIGH(_config.pin_oe);
-    EPD_DELAY_US(100);
-    EPD_PIN_HIGH(_config.pin_pwr);
-    EPD_DELAY_US(100);
-  }
+  _powerDriver->powerOn();
 
-  if (!shiftctl) {
-    gpio_clear_fast(_config.pin_spv);
-  }
-  gpio_clear_fast(_config.pin_ckv);
+  _pin_spv->set(false);
+  _pin_ckv->set(false);
   EPD_DELAY_US(1);
-
-  gpio_set_fast(_config.pin_ckv);
-  if (shiftctl) {
-    shiftctl->sr_set_stv(true);
-  } else {
-    gpio_set_fast(_config.pin_spv);
-  }
+  _pin_ckv->set(true);
+  _pin_spv->set(true);
 }
 
 void EPD_Painter::powerOff() {
-  if (powerctl) {
-    powerctl->powerOff();
-  } else if (shiftctl) {
-    shiftctl->powerOff();
-  } else {
-    EPD_PIN_LOW(_config.pin_oe);
-    EPD_DELAY_US(100);
-    EPD_PIN_LOW(_config.pin_pwr);
-    EPD_DELAY_US(100);
-  }
+  _powerDriver->powerOff();
 }
 
 // Waveform tables are defined per-device in EPD_Painter_presets.h
@@ -664,41 +601,6 @@ void EPD_Painter::_paint_task_body() {
 // Clock one bit: set/clear data, then pulse clk
 #define SHIFT_BIT(data_set, data_clr, clk_mask) \
   data_set; clk_mask; clk_mask
-
-static void IRAM_ATTR shift_send(uint8_t reg,
-                                  uint32_t data_mask,
-                                  uint32_t clk_set,
-                                  uint32_t clk_clr,
-                                  uint32_t strobe_mask) {
-  #define SEND_BIT(n) \
-    if ((reg) & (1U << (n))) { GPIO_SET(data_mask); } else { GPIO_CLR(data_mask); } \
-    GPIO_SET(clk_set); GPIO_CLR(clk_clr);
-
-  SEND_BIT(7) SEND_BIT(6) SEND_BIT(5) SEND_BIT(4)
-  SEND_BIT(3) SEND_BIT(2) SEND_BIT(1) SEND_BIT(0)
-  #undef SEND_BIT
-
-  GPIO_SET(strobe_mask);
-  GPIO_CLR(strobe_mask);
-}
-
-void EPD_Painter::shiftOn(int bits) {
-  shiftReg |= (uint8_t)bits;
-  shift_send(shiftReg,
-    1U << _config.shift.data,
-    1U << _config.shift.clk,
-    1U << _config.shift.clk,
-    1U << _config.shift.strobe);
-}
-
-void EPD_Painter::shiftOff(int bits) {
-  shiftReg &= ~(uint8_t)bits;
-  shift_send(shiftReg,
-    1U << _config.shift.data,
-    1U << _config.shift.clk,
-    1U << _config.shift.clk,
-    1U << _config.shift.strobe);
-}
 
 // =============================================================================
 // clearBuffers()

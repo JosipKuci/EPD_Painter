@@ -2,6 +2,16 @@
 #define EPD_Painter_H
 
 #include <stddef.h>
+#include <stdint.h>
+
+// Pin encoding: set bit 8 to indicate the pin lives on the 74HCT4094D shift
+// register.  Bits 0–7 hold the output index (QP0..QP7).
+// Example: EPD_SR_PIN(4) → shift-register output QP4 (EP_STV/SPV on H752).
+// A value of -1 means the pin is absent / managed elsewhere.
+#define EPD_SR_PIN(n)  (int16_t(0x100 | (n)))
+
+static inline bool    epd_pin_is_sr(int16_t p)  { return (p & 0x100) != 0; }
+static inline uint8_t epd_pin_sr_bit(int16_t p) { return uint8_t(p & 0xFF); }
 
 #if !defined(EPD_PAINTER_PRESET_M5PAPER_S3) && \
     !defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS) && \
@@ -12,8 +22,11 @@
   #endif
 #endif
 
-// Forward declaration — avoids circular include with epd_painter_shutdown.h
+// Forward declarations — avoid circular includes
 class EPD_PainterShutdown;
+class EPD_PinDriver;
+class EPD_PowerDriver;
+class epd_painter_powerctl_74HCT4094D;
 
 // FreeRTOS headers — available in both Arduino-ESP32 and pure ESP-IDF
 #include "freertos/FreeRTOS.h"
@@ -205,14 +218,19 @@ private:
   EPD_PainterShutdown* _shutdown = nullptr;
 
 
+  // ---- Hardware drivers (created in begin()) ----
+  EPD_PowerDriver*                 _powerDriver = nullptr;
+  epd_painter_powerctl_74HCT4094D* _shiftReg    = nullptr;  // non-null only on SR boards
+  EPD_PinDriver* _pin_spv = nullptr;
+  EPD_PinDriver* _pin_ckv = nullptr;
+  EPD_PinDriver* _pin_le  = nullptr;
+  EPD_PinDriver* _pin_sph = nullptr;
+
   // ---- Internal helpers ----
   void powerOn();
   void powerOff();
   bool autoDetectBoard();
   void sendRow(bool firstLine, bool lastLine=false, bool skipRow=false);
-
-  void shiftOn(int bitmask);
-  void shiftOff(int bitmask);
 
   // ---- Dual-core paint task ----
   SemaphoreHandle_t _paint_active_sem = nullptr;  // signals task to start

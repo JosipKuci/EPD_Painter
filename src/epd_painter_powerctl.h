@@ -2,8 +2,9 @@
 
 #include "build_opt.h"
 #include <EPD_Painter.h>
+#include "epd_pin_driver.h"
 
-class epd_painter_powerctl {
+class epd_painter_powerctl : public EPD_PowerDriver {
 public:
   epd_painter_powerctl();
 
@@ -59,7 +60,36 @@ private:
   bool tpsRead(uint8_t reg, uint8_t& val);
 };
 
-class epd_painter_powerctl_74HCT4094D {
+// =============================================================================
+// EPD_GpioPowerDriver — direct GPIO power control (e.g. M5PaperS3).
+// Used when there is no PMIC or shift register managing the panel rails.
+// =============================================================================
+class EPD_GpioPowerDriver : public EPD_PowerDriver {
+public:
+    EPD_GpioPowerDriver(int8_t pin_oe, int8_t pin_pwr)
+        : _pin_oe(pin_oe), _pin_pwr(pin_pwr) {}
+
+    bool powerOn() override {
+        EPD_PIN_HIGH(_pin_oe);
+        EPD_DELAY_US(100);
+        EPD_PIN_HIGH(_pin_pwr);
+        EPD_DELAY_US(100);
+        return true;
+    }
+
+    void powerOff() override {
+        EPD_PIN_LOW(_pin_oe);
+        EPD_DELAY_US(100);
+        EPD_PIN_LOW(_pin_pwr);
+        EPD_DELAY_US(100);
+    }
+
+private:
+    int8_t _pin_oe;
+    int8_t _pin_pwr;
+};
+
+class epd_painter_powerctl_74HCT4094D : public EPD_PowerDriver {
 public:
   epd_painter_powerctl_74HCT4094D();
 
@@ -68,8 +98,7 @@ public:
   bool powerOn();
   void powerOff();
 
-  void IRAM_ATTR sr_set_le(bool val);
-  void IRAM_ATTR sr_set_stv(bool val);
+  void IRAM_ATTR sr_set_bit(uint8_t index, bool val);
 
 private:
   EPD_Painter::Config* config;
