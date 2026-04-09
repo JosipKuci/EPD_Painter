@@ -89,25 +89,29 @@ private:
     int8_t _pin_pwr;
 };
 
-class epd_painter_powerctl_74HCT4094D : public EPD_PowerDriver {
+// =============================================================================
+// epd_painter_powerctl_74HCT4094D — shift-register power driver for H752.
+// QP5 = PWR_EN, QP1-3 unused.
+// =============================================================================
+class epd_painter_powerctl_74HCT4094D : public EPD_PowerDriver, public EPD_ISRController {
 public:
   epd_painter_powerctl_74HCT4094D();
 
   bool begin(EPD_Painter::Config& config);
 
-  bool powerOn();
-  void powerOff();
+  bool powerOn() override;
+  void powerOff() override;
 
-  void IRAM_ATTR sr_set_bit(uint8_t index, bool val);
+  void IRAM_ATTR sr_set_bit(uint8_t index, bool val) override;
 
 private:
   EPD_Painter::Config* config;
 
   struct ShiftState {
     bool ep_latch_enable   = false; // QP0 -> EP_LE
-    bool q1_unused         = false; // QP1 -> not used by the driver
-    bool q2_unused         = false; // QP2 -> not used by the driver
-    bool q3_unused         = false; // QP3 -> not used by the driver
+    bool q1_unused         = false; // QP1
+    bool q2_unused         = false; // QP2
+    bool q3_unused         = false; // QP3
     bool ep_stv            = false; // QP4 -> EP_STV / SPV
     bool power_enable      = false; // QP5 -> PWR_EN
     bool ep_mode           = false; // QP6 -> EP_MODE
@@ -115,4 +119,45 @@ private:
   } _sr;
 
   void sr_push_bits();
+};
+
+// =============================================================================
+// EPD_H716PowerDriver — shift-register power driver for LilyGo EPD47 H716.
+//
+// Uses the same 74HCT4094D chip but with a different bit layout:
+//   QP0 = EP_LE      QP4 = EP_STV
+//   QP1 = PWR_DIS    QP5 = SCAN_DIR
+//   QP2 = POS_PWR    QP6 = EP_MODE
+//   QP3 = NEG_PWR    QP7 = EP_OE
+//
+// Power sequence: clear PWR_DIS → enable NEG_PWR → enable POS_PWR
+// (mirrors the epd_poweron() sequence in the upstream epdiy/EPD47 driver).
+// =============================================================================
+class EPD_H716PowerDriver : public EPD_PowerDriver, public EPD_ISRController {
+public:
+  bool begin(const EPD_Painter::Shift& shift);
+
+  bool powerOn() override;
+  void powerOff() override;
+
+  void IRAM_ATTR sr_set_bit(uint8_t index, bool val) override;
+
+private:
+  struct H716State {
+    bool ep_latch_enable  = false; // QP0
+    bool power_disable    = true;  // QP1 (active-high disable; starts true)
+    bool pos_power_enable = false; // QP2
+    bool neg_power_enable = false; // QP3
+    bool ep_stv           = false; // QP4
+    bool ep_scan_direction = true; // QP5 (starts true)
+    bool ep_mode          = false; // QP6
+    bool ep_output_enable = false; // QP7
+  } _sr;
+
+  int _data;
+  int _clk;
+  int _str;
+  int _le_time;
+
+  void IRAM_ATTR sr_push_bits();
 };

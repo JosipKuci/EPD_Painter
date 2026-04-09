@@ -325,9 +325,17 @@ bool EPD_Painter::begin() {
     }
     _powerDriver = pc;
   } else if (_config.shift.data >= 0) {
-    _shiftReg = new epd_painter_powerctl_74HCT4094D();
-    _shiftReg->begin(_config);
-    _powerDriver = _shiftReg;
+    if (_config.shift.driver == Shift::H716) {
+      auto* h716 = new EPD_H716PowerDriver();
+      h716->begin(_config.shift);
+      _shiftReg    = h716;
+      _powerDriver = h716;
+    } else {
+      auto* h752 = new epd_painter_powerctl_74HCT4094D();
+      h752->begin(_config);
+      _shiftReg    = h752;
+      _powerDriver = h752;
+    }
   } else {
     _powerDriver = new EPD_GpioPowerDriver(_config.pin_oe, _config.pin_pwr);
   }
@@ -577,19 +585,26 @@ void EPD_Painter::_paint_task_body() {
       } else if (_config.quality == Quality::QUALITY_NORMAL) {
         EPD_DELAY_MS(2);
       }
+    memset(dma_buffer1, 0x00, packed_row_bytes);
+    memset(dma_buffer2, 0x00, packed_row_bytes);
+    for (int row = 0; row < _config.height; ++row) {
+      sendRow(row == 0, row == _config.height - 1);
+    }
+      //  vTaskDelay(10);  // yield once per frame: feeds WDT and lets application task run
 
     }
 #ifdef EPD_ASM_TIMING
     printf("[paint_task] convert_packed_fb_to_ink (all passes, all rows, darker+lighter): %lld us\n", _conv_total);
 #endif
 
-    vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
+  //  vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
 
     memset(dma_buffer1, 0x00, packed_row_bytes);
     memset(dma_buffer2, 0x00, packed_row_bytes);
     for (int row = 0; row < _config.height; ++row) {
       sendRow(row == 0, row == _config.height - 1);
     }
+
 
   }
 }
@@ -973,8 +988,12 @@ bool EPD_Painter::autoDetectBoard() {
       printf("[EPD] Probing board %d on SDA=%d, SCL=%d, addr=0x%x\n", i, probe.i2c_sda, probe.i2c_scl, probe.i2c_addr);
       TwoWire _w(1);   // use bus 1 just for the probe; will be deleted
       _w.begin(probe.i2c_sda, probe.i2c_scl, 100000);
+      // Suppress ESP-IDF i2c_master NACK error logs — a NACK simply means
+      // this board isn't here, which is expected for every non-matching probe.
+      esp_log_level_set("i2c.master", ESP_LOG_NONE);
       _w.beginTransmission(probe.i2c_addr);
       bool found = (_w.endTransmission() == 0);
+      esp_log_level_set("i2c.master", ESP_LOG_WARN);
       _w.end();
       // Reset Pins to output
       EPD_PIN_OUTPUT(probe.i2c_sda);

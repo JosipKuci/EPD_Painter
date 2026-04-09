@@ -180,7 +180,7 @@ void setup() {
  }
  #endif
 
-  pinMode(0, INPUT);
+  //pinMode(0, INPUT);
 
   epd.setTextSize(3);
   initGame();

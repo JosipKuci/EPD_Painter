@@ -13,9 +13,10 @@
 static inline bool    epd_pin_is_sr(int16_t p)  { return (p & 0x100) != 0; }
 static inline uint8_t epd_pin_sr_bit(int16_t p) { return uint8_t(p & 0xFF); }
 
-#if !defined(EPD_PAINTER_PRESET_M5PAPER_S3) && \
+#if !defined(EPD_PAINTER_PRESET_M5PAPER_S3)       && \
     !defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS) && \
-    !defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_H752)
+    !defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_H752) && \
+    !defined(EPD_PAINTER_PRESET_LILYGO_EPD47_H716)
   
   #ifndef EPD_PAINTER_PRESET_AUTO
     #define EPD_PAINTER_PRESET_AUTO
@@ -26,7 +27,7 @@ static inline uint8_t epd_pin_sr_bit(int16_t p) { return uint8_t(p & 0xFF); }
 class EPD_PainterShutdown;
 class EPD_PinDriver;
 class EPD_PowerDriver;
-class epd_painter_powerctl_74HCT4094D;
+class EPD_ISRController;
 
 // FreeRTOS headers — available in both Arduino-ESP32 and pure ESP-IDF
 #include "freertos/FreeRTOS.h"
@@ -84,10 +85,11 @@ struct PowerCtlConfig {
   };
 
   struct Shift {
-    int8_t data   = -1;
-    int8_t clk    = -1; 
-    int8_t strobe = -1;
+    int8_t data    = -1;
+    int8_t clk     = -1;
+    int8_t strobe  = -1;
     int8_t le_time = 0;
+    enum Driver { H752, H716 } driver = H752;
   };
 
 
@@ -219,8 +221,8 @@ private:
 
 
   // ---- Hardware drivers (created in begin()) ----
-  EPD_PowerDriver*                 _powerDriver = nullptr;
-  epd_painter_powerctl_74HCT4094D* _shiftReg    = nullptr;  // non-null only on SR boards
+  EPD_PowerDriver*   _powerDriver = nullptr;
+  EPD_ISRController* _shiftReg    = nullptr;  // non-null only on SR boards
   EPD_PinDriver* _pin_spv = nullptr;
   EPD_PinDriver* _pin_ckv = nullptr;
   EPD_PinDriver* _pin_le  = nullptr;

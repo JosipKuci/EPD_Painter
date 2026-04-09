@@ -38,21 +38,30 @@ private:
 };
 
 // =============================================================================
-// EPD_SRPin — shift-register output via 74HCT4094D.
-// Implementation is in epd_pin_driver.cpp to avoid a circular include with
-// epd_painter_powerctl.h.
+// EPD_ISRController — minimal interface for shift-register bit manipulation.
+// Both board-specific SR power drivers implement this so EPD_SRPin can work
+// with any SR-based board without knowing the concrete power driver type.
 // =============================================================================
-class epd_painter_powerctl_74HCT4094D;  // forward declaration
+class EPD_ISRController {
+public:
+    virtual void sr_set_bit(uint8_t index, bool val) = 0;
+    virtual ~EPD_ISRController() = default;
+};
 
+// =============================================================================
+// EPD_SRPin — shift-register output via any EPD_ISRController.
+// =============================================================================
 class EPD_SRPin : public EPD_PinDriver {
 public:
-    EPD_SRPin(epd_painter_powerctl_74HCT4094D* sr, uint8_t index)
+    EPD_SRPin(EPD_ISRController* sr, uint8_t index)
         : _sr(sr), _index(index) {}
 
-    void set(bool high) override;  // defined in epd_pin_driver.cpp
+    void set(bool high) override {
+        _sr->sr_set_bit(_index, high);
+    }
 
 private:
-    epd_painter_powerctl_74HCT4094D* _sr;
+    EPD_ISRController* _sr;
     uint8_t _index;
 };
 

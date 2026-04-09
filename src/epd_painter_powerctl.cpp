@@ -374,3 +374,116 @@ void epd_painter_powerctl_74HCT4094D::powerOff() {
   _sr.power_enable = false;
   sr_push_bits();
 }
+
+// =============================================================================
+// EPD_H716PowerDriver implementation
+// =============================================================================
+
+bool EPD_H716PowerDriver::begin(const EPD_Painter::Shift& shift) {
+  _data    = shift.data;
+  _clk     = shift.clk;
+  _str     = shift.strobe;
+  _le_time = shift.le_time;
+
+  gpio_reset_pin((gpio_num_t)_clk);
+  EPD_PIN_OUTPUT(_data);
+  EPD_PIN_OUTPUT(_clk);
+  EPD_PIN_OUTPUT(_str);
+  EPD_PIN_LOW(_str);
+
+  _sr = H716State{};  // initial state: power_disable=true, scan_direction=true
+  sr_push_bits();
+  return true;
+}
+
+void EPD_H716PowerDriver::sr_push_bits() {
+  uint8_t byte =
+    (_sr.ep_output_enable   ? 0x80 : 0) | // QP7 -> EP_OE
+    (_sr.ep_mode            ? 0x40 : 0) | // QP6 -> EP_MODE
+    (_sr.ep_scan_direction  ? 0x20 : 0) | // QP5 -> SCAN_DIR
+    (_sr.ep_stv             ? 0x10 : 0) | // QP4 -> EP_STV
+    (_sr.neg_power_enable   ? 0x08 : 0) | // QP3 -> NEG_PWR
+    (_sr.pos_power_enable   ? 0x04 : 0) | // QP2 -> POS_PWR
+    (_sr.power_disable      ? 0x02 : 0) | // QP1 -> PWR_DIS (active-high)
+    (_sr.ep_latch_enable    ? 0x01 : 0);  // QP0 -> EP_LE
+
+#define SR_NOP6  __asm volatile("nop;nop;nop;nop;nop;nop;" ::: "memory")
+#define SR_NOP2  __asm volatile("nop;nop;" ::: "memory")
+
+  iram_pin_clr(_str);
+  for (int i = 7; i >= 0; i--) {
+    iram_pin_clr(_clk);
+    SR_NOP2;
+    if ((byte >> i) & 1) iram_pin_set(_data);
+    else                  iram_pin_clr(_data);
+    SR_NOP6;
+    iram_pin_set(_clk);
+    SR_NOP2;
+  }
+  iram_pin_clr(_clk);
+  iram_pin_set(_str);
+
+#undef SR_NOP6
+#undef SR_NOP2
+}
+
+void EPD_H716PowerDriver::sr_set_bit(uint8_t index, bool val) {
+  bool* fields[8] = {
+    &_sr.ep_latch_enable,   // QP0
+    &_sr.power_disable,     // QP1
+    &_sr.pos_power_enable,  // QP2
+    &_sr.neg_power_enable,  // QP3
+    &_sr.ep_stv,            // QP4
+    &_sr.ep_scan_direction, // QP5
+    &_sr.ep_mode,           // QP6
+    &_sr.ep_output_enable,  // QP7
+  };
+  if (index < 8) *fields[index] = val;
+  sr_push_bits();
+  if (index == 0 && val && _le_time > 0)
+    EPD_DELAY_US(_le_time);
+}
+
+bool EPD_H716PowerDriver::powerOn() {
+  // Initial state: all drive outputs low, power disabled.
+  _sr.ep_latch_enable  = false;
+  _sr.ep_stv           = false;
+  _sr.ep_output_enable = false;
+  _sr.ep_mode          = false;
+  _sr.pos_power_enable = false;
+  _sr.neg_power_enable = false;
+  _sr.ep_scan_direction = true;
+  _sr.power_disable    = false;  // clear power-disable → rails start ramping
+  sr_push_bits();
+  EPD_DELAY_US(100);
+
+  _sr.neg_power_enable = true;   // negative supply on
+  sr_push_bits();
+  EPD_DELAY_US(500);
+
+  _sr.pos_power_enable = true;   // positive supply on
+  sr_push_bits();
+  EPD_DELAY_US(100);
+
+  _sr.ep_stv = true;             // STV high — panel scan ready
+  _sr.ep_mode = true;
+  _sr.ep_output_enable = true;
+  sr_push_bits();
+  return true;
+}
+
+void EPD_H716PowerDriver::powerOff() {
+  _sr.pos_power_enable = false;
+  sr_push_bits();
+  EPD_DELAY_US(10);
+
+  _sr.neg_power_enable = false;
+  sr_push_bits();
+  EPD_DELAY_US(100);
+
+  _sr.ep_mode          = false;
+  _sr.ep_output_enable = false;
+  _sr.ep_stv           = false;
+  _sr.power_disable    = true;   // re-engage power-disable
+  sr_push_bits();
+}
