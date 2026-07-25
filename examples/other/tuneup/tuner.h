@@ -28,7 +28,9 @@
 // coarse steps from d (saturating), big lifts from w (15-30 units), fine
 // steps from r (re-darkens fire in small fresh-response steps), and the
 // float gap as the fine-trim knob (a gap before the re-darkens weakens
-// them a few units — the hand-tuner's trick).
+// them — the hand-tuner's trick). How much it weakens them is measured,
+// not assumed: see tuneProbeGap(). A float pass buys a whole pass period
+// of field-free settle, so the old guess of "a few units" was never safe.
 //
 // Convergence policy (lessons from two failed shapes before this one):
 // - The panel DRIFTS under heavy exercise (the deep end wanders tens of
@@ -64,6 +66,37 @@
 static const float TUNE_TOL        = 4.5f;
 static const int   TUNE_MAX_CYCLES = 34;
 static const int   TUNE_WARMUP     = 2;
+static const float TUNE_AVG_BELOW  = 8.0f;   // average 2 scans once this close
+static const float TUNE_AVG_BELOW3 = 5.0f;   // and 3 once this close
+// Below this, a measured gap gain is indistinguishable from scan noise and
+// the knob is switched off rather than floored (see tuneProbeGap). A scan
+// reads to a unit or two, and the first LilyGo run spread 2.4 units across
+// its three bases while averaging to -0.5.
+static const float TUNE_GAP_NOISE  = 1.5f;   // units/pass
+// Levels the seeder reserves as whiten-only shapes (whitens, no re-darkens)
+// so tuneCalibrateGains() always has something to solve the whiten gain
+// from. Two, not one, so the figure is an average rather than a single read.
+static const int   TUNE_WHITEN_PROBES = 2;
+// Banding is a function of the SPACING between adjacent levels, not of any
+// one level's absolute placement, and until these the converger only ever
+// looked at the latter. On a ~97-unit full scale a level step is ~6.5
+// units, so a level could sit 4.5 out — 69% of a step — and still pass:
+// two neighbours in tolerance with opposite signs halve or double a gap.
+// TUNE_GAP_TOL bounds |err[i] - err[i+1]| directly; TUNE_SPACING_W is how
+// hard the planner weighs it against absolute placement when choosing a
+// shape.
+//
+// The tolerance is set from what it does to the ramp, not by feel. One
+// scanner unit is ~2.62 lum units here and a level step is 6.49 units
+// (17 lum), so a gap error G leaves steps of 17 +/- 2.62G:
+//     G = 5.0 -> steps 4..30 lum   (run 2 measured G = 4.0 and banded)
+//     G = 2.5 -> steps 10..24      usable
+//     G = 1.5 -> steps 13..21      good
+// 5.0 would have passed run 2 unchanged, which is the false pass that
+// started this. 2.5 is close to the scan-noise floor, which is why
+// TUNE_AVG_BELOW/3 below buy the precision to measure it honestly.
+static const float TUNE_GAP_TOL    = 2.5f;   // scanner units between neighbours
+static const float TUNE_SPACING_W  = 0.5f;   // per neighbour, in the plan score
 // Must be a resolution the scanner natively offers — eSCL servers snap an
 // unsupported value to the nearest supported one, silently returning a
 // much smaller image than asked for (100 dpi became 75 on the Canon,
@@ -482,7 +515,7 @@ static void tuneColSpan(int i, int *px0, int *px1) {
 
 // Measure the match card via the anchors: per-column means of the ref and
 // native bands. No thresholding — geometry is fixed.
-static bool tuneMeasureCard(float ref[16], float nat[16]) {
+static bool tuneMeasureCardOnce(float ref[16], float nat[16]) {
   tuneRepaint = tuneRepaintCard;
   if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
   const int H = epd.height();
@@ -499,6 +532,29 @@ static bool tuneMeasureCard(float ref[16], float nat[16]) {
 
 // Gradient-corrected errors: the L0 and L15 pairs are identical drives top
 // and bottom; interpolate their deltas by level.
+// Average several scans of the SAME painted card.
+//
+// Once the errors are down near the tolerance, a scan's own noise — a
+// unit or two — is a large fraction of what is being corrected, and the
+// converger starts chasing that noise instead of the panel. Averaging two
+// reads cuts it by root two. The card is still on the glass after a scan,
+// so this costs only the extra scan: no repaint, no extra drive, and the
+// panel is not disturbed between the two reads.
+static int tuneScansPerMeasure = 1;
+
+static bool tuneMeasureCard(float ref[16], float nat[16]) {
+  if (!tuneMeasureCardOnce(ref, nat)) return false;
+  for (int k = 1; k < tuneScansPerMeasure; k++) {
+    float r2[16], n2[16];
+    if (!tuneMeasureCardOnce(r2, n2)) break;      // keep the reads we have
+    for (int i = 0; i < 16; i++) {
+      ref[i] = (ref[i] * k + r2[i]) / (k + 1);
+      nat[i] = (nat[i] * k + n2[i]) / (k + 1);
+    }
+  }
+  return true;
+}
+
 static void tuneErrors(const float ref[16], const float nat[16], float err[16]) {
   const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
   for (int i = 0; i < 16; i++)
@@ -635,7 +691,149 @@ static float tunePredict(const TuneLv &L, int d, int w, int g, int r) {
   return tuneDose[dd] + w * L.gw - r * L.gr + g * L.gg;
 }
 
-static void tuneSeedModel();      // defined below, used by the probe
+static void tuneSeedModel(bool reserveProbes);  // defined below, used by the probe
+
+// ============================================================================
+// Float-gap gain probe.
+//
+// The gap was the one knob whose gain was never measured. tuneCalibrateGains()
+// solves the whiten and re-darken gains from the first card, but gg kept its
+// seeded guess of 5, and the online learner can only correct it AFTER a gap
+// edit has been taken — which the planner will not do while it believes the
+// move is worth a handful of units. Chicken-and-egg: the knob has to be
+// selected once before its gain can be learned, and its gain is what decides
+// whether it gets selected.
+//
+// That guess was never safe. A float pass is not a brief pause: at the
+// 16-grey pass period it hands the pixel a WHOLE period of field-free settle
+// on top of the inter-pass floor (4 ms of a 15-20 ms period), so the true
+// effect can be several times the assumed 5. And the error runs in the
+// direction that keeps the knob from ever being tried — the same failure
+// tuneCalibrateGains() warns about for the whiten ("being 40% wrong about a
+// 30-unit move is what produced the overshoot cascades").
+//
+// Method mirrors the dose ladder: hold (d, w, r) fixed per base, sweep g
+// across the columns, read every column from one scan — so all cells share
+// one panel state and drift is common-mode. Three bases, because one base is
+// one panel region's opinion. The gap needs w > 0 and r > 0 to be legal, and
+// every cell here fits d+w+g+r <= 13 at g = 3.
+// ============================================================================
+static bool tuneProbeGap() {
+  Serial.println("[tune] float-gap ladder...");
+  struct Base { uint8_t d, w, r; };
+  static const Base bases[] = { { 4, 1, 1 }, { 6, 1, 2 }, { 3, 2, 1 } };
+  const int NB = (int)(sizeof(bases) / sizeof(bases[0]));
+  const int NG = 4;                       // g = 0..3, the planner's own range
+
+  uint8_t t[13];
+  int col[NB][NG];
+  int c = 1;
+  for (int b = 0; b < NB; b++)
+    for (int g = 0; g < NG; g++, c++) {
+      col[b][g] = (c <= 14) ? c : 0;
+      if (!col[b][g]) continue;
+      memset(t, 0, 13);
+      int p = 0;                          // same emitter shape as tuneTrainOf()
+      for (int i = 0; i < bases[b].d && p < 13; i++) t[p++] = 1;
+      for (int i = 0; i < bases[b].w && p < 13; i++) t[p++] = 2;
+      p += g;
+      if (p > 13) p = 13;
+      for (int i = 0; i < bases[b].r && p < 13; i++) t[p++] = 1;
+      epd.driver().setDecisionTrain((uint8_t)(col[b][g] << 1), t);
+    }
+
+  // Column 15 is the deep anchor the gradient correction needs; any columns
+  // the bases did not claim get the same drive so they cannot mislead a scan.
+  memset(t, 0, 13);
+  for (int i = 0; i < 13; i++) t[i] = 1;
+  epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
+  for (int lv = c; lv <= 14; lv++)
+    epd.driver().setDecisionTrain((uint8_t)(lv << 1), t);
+
+  tunePaintMatchCard();
+  tuneClear();
+  tunePaint();
+  // A slope over four columns is more noise-sensitive than an absolute
+  // landing, and this one number seeds every shape the converger starts
+  // from — so take the averaged read here regardless of how far out the
+  // run currently is. Costs one extra scan, no repaint, no extra drive.
+  const int savedScans = tuneScansPerMeasure;
+  tuneScansPerMeasure = max(savedScans, 2);
+  float ref[16], nat[16];
+  const bool measured = tuneMeasureCard(ref, nat);
+  tuneScansPerMeasure = savedScans;
+  if (!measured) return false;
+  tunePrintBands("gap", ref, nat);
+
+  const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
+  float land[16];
+  for (int i = 0; i < 16; i++)
+    land[i] = nat[i] - (g0 + (g15 - g0) * (i / 15.0f));
+
+  // Least-squares slope of landing vs gap length, per base.
+  float slope[NB];
+  float sum = 0;
+  int n = 0;
+  for (int b = 0; b < NB; b++) {
+    float sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int m = 0;
+    for (int g = 0; g < NG; g++) {
+      if (!col[b][g]) continue;
+      const float y = land[col[b][g]];
+      sx += g; sy += y; sxx += (float)g * g; sxy += g * y; m++;
+    }
+    if (m < 2) continue;
+    const float den = m * sxx - sx * sx;
+    if (fabsf(den) < 1e-3f) continue;
+    slope[n] = (m * sxy - sx * sy) / den;
+    Serial.printf("[tune] gap base (%d,%d,%d): %+.1f units/pass\n",
+                  bases[b].d, bases[b].w, bases[b].r, slope[n]);
+    sum += slope[n]; n++;
+  }
+  if (!n) return false;
+
+  // A null result must set the gain to ZERO, not to some floor. Clamping a
+  // measured nothing up to a minimum makes the gap the FINEST knob in the
+  // set, and the seeder then reaches for it to mop up every last unit of
+  // quantisation residual — buying predicted units the panel never delivers,
+  // at one pass of train length each.
+  //
+  // Two tests, because a mean on its own hides disagreement. The effect must
+  // clear scan noise AND the bases must agree on its sign. (First LilyGo run
+  // at the 20 ms NORMAL period: -2.1, +0.2, +0.3 — mean -0.5 with the sign
+  // split three ways, and the old floor turned that into a confident 1.0.)
+  //
+  // Zero is final for the run: tunePredict() then values a gap at nothing,
+  // the length penalty makes it strictly negative-scoring, so tunePlanOne()
+  // never takes one and the online learner never gets a lastOp==4 to revise.
+  // That is the intent — the probe decides, not a guess that outlived it.
+  const float mean = sum / n;
+  bool agree = true;
+  for (int i = 1; i < n; i++)
+    if ((slope[i] < 0) != (slope[0] < 0)) agree = false;
+
+  float gg = 0.0f;
+  if (fabsf(mean) >= TUNE_GAP_NOISE && agree)
+    gg = constrain(fabsf(mean), TUNE_GAP_NOISE, 40.0f);
+
+  for (int lv = 1; lv <= 15; lv++) tl[lv].gg = gg;
+
+  if (gg == 0.0f) {
+    Serial.printf("[tune] gap gain: none detected (mean %+.1f, bases %s) — "
+                  "treating float gaps as neutral\n",
+                  mean, agree ? "agree" : "disagree on sign");
+  } else {
+    // tunePredict() carries the gap as +g*gg and the online learner stores
+    // magnitudes, so a genuine DARKENING gap cannot be represented — say so
+    // rather than bury the sign in the fabsf() below.
+    if (mean < 0)
+      Serial.println("[tune] WARNING: gap darkened the landing consistently — "
+                     "tunePredict's +g*gg sign is wrong for this panel");
+    Serial.printf("[tune] measured gap gain: %.1f units/pass (%d bases, "
+                  "5.0 was assumed)\n", gg, n);
+  }
+  return true;
+}
 
 // ============================================================================
 // Pure-dose ladder probe. Column n runs {1 x n}; measured against the same
@@ -680,38 +878,107 @@ static bool tuneProbe() {
   // search runs over the whole (d,w,g,r) grammar. Levels 1-5 keep their
   // shipped shapes: they encode ghost behaviour, and the converger can
   // now refine them with the same grammar.
-  tuneSeedModel();
+  //
+  // The gap gain must be real BEFORE seeding: tuneSeedModel() scores shapes
+  // through tunePredict(), so a wrong gg biases which shapes it picks, not
+  // just how the converger edits them later.
+  if (!tuneProbeGap())
+    Serial.println("[tune] gap probe failed - keeping the assumed gap gain");
+  tuneSeedModel(true);   // pre-calibration: guarantee the whiten probes
   return true;
+}
+
+// Best shape for one level under the model. whitenOnly restricts the search
+// to shapes carrying whitens and NO re-darkens — the structure
+// tuneCalibrateGains() needs in order to solve the whiten gain at all.
+// Returns the score of the shape it chose, so callers can compare what a
+// restriction costs against the free choice.
+static float tuneSolveShape(const TuneLv &L, float target, bool whitenOnly,
+                            int *od, int *ow, int *og, int *orr) {
+  const int w0 = whitenOnly ? 1 : 0;
+  const int rmax = whitenOnly ? 0 : 5;
+  int bd = 1, bw = w0, bg = 0, br = 0;
+  float best = 1e9f;
+  for (int d = 1; d <= 13; d++)
+    for (int w = w0; w <= 4; w++)
+      for (int g = 0; g <= 3; g++)
+        for (int r = 0; r <= rmax; r++) {
+          if (w == 0 && (r || g)) continue;   // re-darkens need a whiten first
+          if (r == 0 && g) continue;          // a gap only weakens re-darkens
+          if (d + w + g + r > 13) continue;
+          const float score = fabsf(tunePredict(L, d, w, g, r) - target)
+                            + 0.10f * (d + w + g + r);
+          if (score < best) { best = score; bd = d; bw = w; bg = g; br = r; }
+        }
+  *od = bd; *ow = bw; *og = bg; *orr = br;
+  return best;
 }
 
 // Build each level's shape from the model. Deliberately varies the
 // structure across levels (some with re-darkens, some without) — that
 // spread is what lets tuneCalibrateGains() solve for the real gains from
-// the first measurement.
-static void tuneSeedModel() {
+// the first measurement. reserveProbes ENFORCES that spread; pass it only
+// for the seeding that precedes calibration, since afterwards the gains are
+// already solved and the constraint would cost seed fit for nothing.
+static void tuneSeedModel(bool reserveProbes) {
+  int sd[15], sw[15], sg[15], sr[15];   // the shape each level will take
+  int qd[15], qw[15];                   // its best whiten-only alternative
+  float cost[15];                       // what taking that alternative costs
+
+  for (int lv = 6; lv <= 14; lv++) {
+    int d, w, g, r;
+    const float free_score =
+        tuneSolveShape(tl[lv], probeRef[lv], false, &d, &w, &g, &r);
+    sd[lv] = d; sw[lv] = w; sg[lv] = g; sr[lv] = r;
+
+    int ad, aw, ag, ar;
+    const float probe_score =
+        tuneSolveShape(tl[lv], probeRef[lv], true, &ad, &aw, &ag, &ar);
+    qd[lv] = ad; qw[lv] = aw;
+    cost[lv] = probe_score - free_score;
+  }
+
+  // tuneCalibrateGains() can solve the whiten gain ONLY from levels carrying
+  // whitens and no re-darkens. The comment above always claimed that spread
+  // was deliberate, but nothing enforced it — and on the first LilyGo run
+  // with the gap knob switched off, every level 6-14 seeded with re-darkens.
+  // n came out 0 and gw fell back to a constant measured on a DIFFERENT
+  // board, roughly twice this panel's own figure, on the largest knob the
+  // planner owns. Convert wherever the constraint costs least, and report
+  // both the level and the price so a bad trade is visible rather than silent.
+  if (reserveProbes) {
+    int have = 0;
+    for (int lv = 6; lv <= 14; lv++)
+      if (sw[lv] > 0 && sr[lv] == 0) have++;
+
+    while (have < TUNE_WHITEN_PROBES) {
+      int pick = -1;
+      for (int lv = 6; lv <= 14; lv++) {
+        if (sw[lv] > 0 && sr[lv] == 0) continue;   // already serves as a probe
+        if (qw[lv] <= 0) continue;                 // no legal whiten-only shape
+        if (pick < 0 || cost[lv] < cost[pick]) pick = lv;
+      }
+      if (pick < 0) break;
+      sd[pick] = qd[pick]; sw[pick] = qw[pick]; sg[pick] = 0; sr[pick] = 0;
+      Serial.printf("[tune] L%d reserved as a whiten probe (+%.1f seed error)\n",
+                    pick, cost[pick]);
+      have++;
+    }
+    if (have < TUNE_WHITEN_PROBES)
+      Serial.printf("[tune] WARNING: only %d whiten probe(s) — gw may fall back "
+                    "to the built-in constant\n", have);
+  }
+
   for (int lv = 6; lv <= 14; lv++) {
     TuneLv &L = tl[lv];
-    int bd = 1, bw = 0, bg = 0, br = 0;
-    float bestScore = 1e9f;
-    for (int d = 1; d <= 13; d++)
-      for (int w = 0; w <= 4; w++)
-        for (int g = 0; g <= 3; g++)
-          for (int r = 0; r <= 5; r++) {
-            if (w == 0 && (r || g)) continue;
-            if (r == 0 && g) continue;
-            if (d + w + g + r > 13) continue;
-            const float score = fabsf(tunePredict(L, d, w, g, r) - probeRef[lv])
-                              + 0.10f * (d + w + g + r);
-            if (score < bestScore) {
-              bestScore = score; bd = d; bw = w; bg = g; br = r;
-            }
-          }
-    L.d = bd; L.w = bw; L.g = bg; L.r = br;
+    L.d = sd[lv]; L.w = sw[lv]; L.g = sg[lv]; L.r = sr[lv];
     L.bestAbs = 1e9f;                    // shapes changed: old bests are void
-    L.bd = bd; L.bw = bw; L.bg = bg; L.br = br;
-    L.gd = constrain(fabsf(tuneDose[min(bd + 1, 13)] - tuneDose[bd]), 2.0f, 30.0f);
+    L.bd = L.d; L.bw = L.w; L.bg = L.g; L.br = L.r;
+    L.gd = constrain(fabsf(tuneDose[min((int)L.d + 1, 13)] - tuneDose[(int)L.d]),
+                     2.0f, 30.0f);
     Serial.printf("[tune] seed L%-2d (%d,%d,%d,%d) -> %.0f  (ref %.0f)\n",
-                  lv, bd, bw, bg, br, tunePredict(L, bd, bw, bg, br), probeRef[lv]);
+                  lv, L.d, L.w, L.g, L.r,
+                  tunePredict(L, L.d, L.w, L.g, L.r), probeRef[lv]);
   }
 }
 
@@ -742,7 +1009,9 @@ static void tuneCalibrateGains() {
     const TuneLv &L = tl[lv];
     if (L.r > 0) {
       const float landing = probeRef[lv] + L.err;
-      const float without_r = tuneDose[constrain((int)L.d, 1, 13)] + L.w * gw + L.g * 5.0f;
+      // L.gg is measured by tuneProbeGap() before this runs; using the old
+      // hardcoded 5.0 here would contradict it and corrupt the re-darken solve.
+      const float without_r = tuneDose[constrain((int)L.d, 1, 13)] + L.w * gw + L.g * L.gg;
       sr += (without_r - landing) / L.r;
       nr++;
     }
@@ -772,6 +1041,35 @@ static void tuneCalibrateGains() {
 // curve for its darken run, plus each whiten's lift, minus each
 // re-darken's bite, plus the float gap's weakening of those re-darkens.
 // ============================================================================
+// ---- spacing ----------------------------------------------------------
+// The reference ladder already defines the intended spacing, so the gap
+// the eye sees between levels i and i+1 is
+//     (ref[i] - ref[i+1]) + (err[i] - err[i+1]).
+// Only the second term is ours. A uniform bias shifts the whole ramp and
+// the image dither absorbs it; opposite-signed neighbours halve or double
+// a step, and THAT is what reads as a band. So banding is governed by the
+// DIFFERENCE of adjacent errors, which is what these measure.
+//
+// Levels 0 and 15 anchor the ends: tuneErrors() pins both to exactly zero
+// by construction, so they are honest neighbours for L1 and L14.
+static float tuneGapErr(int lv) {
+  const float a = fabsf(tl[lv].err - tl[lv - 1].err);
+  const float b = fabsf(tl[lv].err - tl[lv + 1].err);
+  return max(a, b);
+}
+
+static float tuneGapMax() {
+  float g = 0;
+  for (int i = 0; i <= 14; i++) g = max(g, fabsf(tl[i].err - tl[i + 1].err));
+  return g;
+}
+
+// How bad a level is overall: its own placement plus what it does to the
+// two gaps it sits between.
+static float tuneBadness(int lv) {
+  return fabsf(tl[lv].err) + TUNE_SPACING_W * tuneGapErr(lv);
+}
+
 // Enumerate legal shapes near the current one and take the best damped
 // move. Returns false when nothing helps (level is quantisation-limited).
 static bool tunePlanOne(int lv) {
@@ -790,6 +1088,14 @@ static bool tunePlanOne(int lv) {
         for (int r = 0; r <= 5; r++) {
           if (w == 0 && (r || g)) continue;   // re-darkens need a whiten first
           if (r == 0 && g) continue;          // a gap only weakens re-darkens
+          // Gap measured inert (tuneProbeGap gated gg to zero): such an edit
+          // predicts NO move, and on a quantisation-limited level where every
+          // real move overshoots, |e| + costs beats |e + move| + costs — so the
+          // planner takes the no-op, reports success, and burns a cycle while
+          // padding the train. Run 2 left L7 as (1,1,3,2), three dead floats.
+          // Candidates with g == 0 stay enumerated, so a level carrying a gap
+          // from a loaded blob can still shed it.
+          if (g && L.gg <= 0.0f) continue;
           if (d + w + g + r > 13) continue;
           if (d == L.d && w == L.w && g == L.g && r == L.r) continue;
 
@@ -801,9 +1107,16 @@ static bool tunePlanOne(int lv) {
           const float uncert = (L.nvalid == 0) ? 2.0f : (L.nvalid == 1 ? 1.4f : 1.0f);
           if (fabsf(move) * uncert > 1.7f * fabsf(e)) continue;
           const int changed = (d != L.d) + (w != L.w) + (g != L.g) + (r != L.r);
-          // primary: residual error; then prefer simpler edits and
-          // shorter trains (a shorter train paints faster)
-          const float score = fabsf(e + move) + 0.35f * changed
+          // primary: residual error, PLUS what this landing does to the two
+          // gaps the level sits between — a move that fixes its own error
+          // while opening a hole against a neighbour trades a band for a
+          // number. Then prefer simpler edits and shorter trains (a shorter
+          // train paints faster).
+          const float eNew = e + move;
+          const float gapPen = fabsf(eNew - tl[lv - 1].err)
+                             + fabsf(eNew - tl[lv + 1].err);
+          const float score = fabsf(eNew) + TUNE_SPACING_W * gapPen
+                            + 0.35f * changed
                             + 0.10f * (d + w + g + r);
           if (score < bestScore) {
             bestScore = score;
@@ -839,11 +1152,16 @@ static void tunePlanEdits() {
     tl[lv].edited = false;
     if (tl[lv].skip) { tl[lv].skip = false; continue; }
     if (tl[lv].frozen) continue;
-    if (fabsf(tl[lv].err) > TUNE_TOL) order[n++] = lv;
+    // Eligible on EITHER count. A level can sit well inside TUNE_TOL and
+    // still be the reason the ramp bands, if its neighbour leans the other
+    // way — that case was previously invisible to the planner and simply
+    // never got edited.
+    if (fabsf(tl[lv].err) > TUNE_TOL || tuneGapErr(lv) > TUNE_GAP_TOL)
+      order[n++] = lv;
   }
-  for (int i = 0; i < n; i++)          // sort by |err| desc
+  for (int i = 0; i < n; i++)          // worst first, placement + spacing
     for (int j = i + 1; j < n; j++)
-      if (fabsf(tl[order[j]].err) > fabsf(tl[order[i]].err)) {
+      if (tuneBadness(order[j]) > tuneBadness(order[i])) {
         int t = order[i]; order[i] = order[j]; order[j] = t;
       }
   int edited = 0;
@@ -1252,7 +1570,25 @@ static bool runSelfTune() {
 
     mx = 0;
     for (int lv = 1; lv <= 14; lv++) mx = max(mx, fabsf(tl[lv].err));
-    Serial.printf("[tune] cycle %2d  maxerr %5.1f  |", cyc, mx);
+    const float gmx = tuneGapMax();   // worst neighbour spacing error
+    // Close to home: average more scans per measurement so the remaining
+    // edits are made against the panel rather than scan noise. Precision has
+    // to keep pace with the tolerance — TUNE_GAP_TOL is 2.5 units and one
+    // scan reads to a unit or two, so the spacing figure only becomes
+    // meaningful once it is averaged. Gated on the WORSE of placement and
+    // spacing, matching what convergence now asks for. Root-N: the third
+    // read buys less than the second, so it is only worth its extra scan
+    // right at the end.
+    const float close = max(mx, gmx);
+    const int wantScans = (close <= TUNE_AVG_BELOW3) ? 3
+                        : (close <= TUNE_AVG_BELOW)  ? 2 : 1;
+    if (wantScans > tuneScansPerMeasure) {
+      tuneScansPerMeasure = wantScans;
+      Serial.printf("[tune] within %.0f - averaging %d scans per measurement now\n",
+                    (wantScans == 3) ? TUNE_AVG_BELOW3 : TUNE_AVG_BELOW,
+                    tuneScansPerMeasure);
+    }
+    Serial.printf("[tune] cycle %2d  maxerr %5.1f  gap %4.1f  |", cyc, mx, gmx);
     for (int lv = 1; lv <= 15; lv++) Serial.printf("%+3.0f", tl[lv].err);
     Serial.println();
 
@@ -1260,13 +1596,18 @@ static bool runSelfTune() {
     // shapes from the now-measured physics before any editing starts.
     if (cyc == 0) {
       tuneCalibrateGains();
-      tuneSeedModel();
+      tuneSeedModel(false);  // gains are solved now; take the best-fitting shapes
       for (int lv = 1; lv <= 14; lv++) tl[lv].nvalid = 1;   // gains measured now
       continue;
     }
     if (cyc < TUNE_WARMUP) { Serial.println("[tune] (warm-up, no edits)"); continue; }
-    if (mx <= TUNE_TOL) { converged = true; break; }
-    if (mx < bestMax - 0.7f) { bestMax = mx; stall = 0; } else stall++;
+    // Both conditions: a ramp whose levels are each in tolerance but whose
+    // steps vary 5x is exactly the "converged, still bands" case that
+    // started this. Stall tracking follows the same combined figure, so the
+    // loop does not give up while spacing is still improving.
+    if (mx <= TUNE_TOL && gmx <= TUNE_GAP_TOL) { converged = true; break; }
+    const float progress = max(mx, gmx);
+    if (progress < bestMax - 0.7f) { bestMax = progress; stall = 0; } else stall++;
     if (stall >= 8) { Serial.println("[tune] stalled"); break; }
     tunePlanEdits();
   }
@@ -1276,6 +1617,7 @@ static bool runSelfTune() {
   // has to be verified rather than assumed — but it is still a far better
   // starting point than wherever the loop happened to stop.
   if (!converged) {
+    tuneScansPerMeasure = 2;        // the set we keep is worth measuring well
     for (int lv = 1; lv <= 14; lv++)
       if (tl[lv].bestAbs < 1e8f) {
         tl[lv].d = tl[lv].bd; tl[lv].w = tl[lv].bw;
@@ -1324,10 +1666,18 @@ static bool runSelfTune() {
   // white and level 15 the deepest black this panel reached. The levels
   // are NOT evenly spaced, so image conversion must quantise against this
   // curve rather than assume even steps.
+  //
+  // ref[] here is the FINAL card's reference, not probeRef[] from the
+  // ladder at the start of the run. probeRef was read minutes and dozens
+  // of paints earlier, and the panel drifts over a session — mixing a
+  // start-of-run reference with an end-of-run error put that drift
+  // straight into the curve the image dither quantises against. Since
+  // tuneErrors() defines err = (nat - ref) - gradient, ref[i] + err[i] is
+  // exactly the gradient-corrected native landing, with no reconstruction.
   uint8_t lum[16];
   {
     float meas[16];
-    for (int i = 0; i < 16; i++) meas[i] = probeRef[i] + tl[i].err;
+    for (int i = 0; i < 16; i++) meas[i] = ref[i] + tl[i].err;
     const float white = meas[0], black = meas[15];
     const float span = (white - black) > 1.0f ? (white - black) : 1.0f;
     Serial.print("[tune] measured level curve (255=white): ");

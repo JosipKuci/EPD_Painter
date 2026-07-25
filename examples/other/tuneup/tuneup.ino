@@ -39,8 +39,8 @@
 // ---------------------------------------------------------------------------
 // >>> YOUR NETWORK GOES HERE <<<
 // ---------------------------------------------------------------------------
-#define WIFI_SSID ""
-#define WIFI_PASS ""
+#define WIFI_SSID "REDACTED"
+#define WIFI_PASS "REDACTED"
 
 // Choose your board (or leave all commented for auto-probe).
 //#define EPD_PAINTER_PRESET_M5PAPER_S3
@@ -367,6 +367,14 @@ static size_t esclScan(float x0mm, float y0mm, float wmm, float hmm, int dpi) {
 
   // Some scanners block the GET until the page is ready; others answer 503
   // until then. Handle both.
+  //
+  // Do NOT retry a 404 here. On the MG5200's NAS bridge the GET performs the
+  // whole scan inline, and when scanimage finally gives up the bridge marks
+  // the job done and answers 503 — so the 503 retry below immediately draws
+  // a 404 from the now-dead job. That 404 means "this job is finished",
+  // never "not yet", and retrying it can only burn the timeout. Failing fast
+  // is correct: the rig's outer retry POSTs a FRESH job, which is the only
+  // thing that can succeed once the Canon's BJNP stack has wedged.
   uint32_t t0 = millis();
   for (;;) {
     if (!httpTxn("GET", location + "/NextDocument", "", scanBuf, SCAN_BUF_MAX, &len, &status, nullptr, 120000))
