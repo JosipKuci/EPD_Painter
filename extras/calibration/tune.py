@@ -85,16 +85,14 @@ def write_row(s, tbl, row, vals):
 
 
 def chart_and_measure(s, tag, transform=None):
-    lines = rig.command(s, "P", terminator=("DONE",))
-    temp = re.search(r"T=(-?\d+)", lines[-1])
-    temp = int(temp.group(1)) if temp else None
+    rig.command(s, "P", terminator=("DONE",))
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    png = os.path.join(rig.RESULTS_DIR, f"{stamp}_{tag}_T{temp}.png")
+    png = os.path.join(rig.RESULTS_DIR, f"{stamp}_{tag}.png")
     os.makedirs(rig.RESULTS_DIR, exist_ok=True)
     rig.scan(png)
     out, tr = rig.measure(png, transform)
-    rig.log_result(tag, temp, out)
-    return out, tr, temp
+    rig.log_result(tag, None, out)
+    return out, tr
 
 
 # ------------------------------------------------------------------ main ----
@@ -118,7 +116,7 @@ def main():
     history = []
     prev_errs = {}
     for it in range(1, a.max_iters + 1):
-        out, transform, temp = chart_and_measure(s, f"{a.tag}_i{it}", transform)
+        out, transform = chart_and_measure(s, f"{a.tag}_i{it}", transform)
         lb, lw = out["black"]["lstar"], out["white"]["lstar"]
         errs, edits = {}, []
         for grey, frac in TARGETS.items():
@@ -145,9 +143,9 @@ def main():
                 edits.append((row, cur_nd, cur_nl))
 
         prev_errs = errs
-        print(f"[iter {it}] T={temp}°C  "
+        print(f"[iter {it}] "
               + "  ".join(f"{g}: err {e:+.1f}L*" for g, e in errs.items()), flush=True)
-        history.append({"iter": it, "temp": temp, "errs": errs,
+        history.append({"iter": it, "errs": errs,
                         "ND": {r: v[:] for r, v in nd.items()},
                         "NL": {r: v[:] for r, v in nl.items()}})
 
@@ -175,8 +173,7 @@ def main():
     print(f"Worst patch-region residual vs white: {worst:.1f} grey levels "
           f"({'OK' if worst < 4 else 'GHOSTING — lighter rows need work'})")
 
-    final = {"temp_end": history[-1]["temp"] if history else None,
-             "normal_darker": [nd[r] for r in (0, 1, 2)] if 2 in nd else
+    final = {"normal_darker": [nd[r] for r in (0, 1, 2)] if 2 in nd else
                               [nd.get(0), nd.get(1)],
              "normal_lighter": [nl[r] for r in (0, 1, 2)] if 2 in nl else
                                [nl.get(0), nl.get(1)],

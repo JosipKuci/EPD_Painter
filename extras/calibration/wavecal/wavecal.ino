@@ -7,13 +7,12 @@
 //
 // Protocol (newline-terminated ASCII, responses end with a line "DONE", "OK",
 // "ERR ..." or a data line):
-//   T                     -> "TEMP <c>"  panel temp from TPS65185 thermistor
 //   Q F|N|H               -> set quality FAST/NORMAL/HIGH
 //   W <TBL> <row> <v...>  -> replace one waveform row. TBL: FL FD NL ND HL HD
 //                            (fast/normal/high, lighter/darker). 7 values for
 //                            F*, 13 for the rest. Values 0..3.
 //   G                     -> dump all waveform tables
-//   P                     -> hard clear, draw patch chart, paint, "DONE T=<c>"
+//   P                     -> hard clear, draw patch chart, paint, "DONE"
 //   U                     -> paint all-white (round trip; exercises lighter)
 //   K                     -> paint all-black (panel exercise / cold wake-up)
 //   C                     -> hard clear
@@ -171,10 +170,7 @@ static void handle(char* cmd) {
     tok[ntok++] = p;
   if (!ntok) return;
 
-  if (!strcmp(tok[0], "T")) {
-    Serial.printf("TEMP %d\n", epd.readPanelTemperatureC());
-
-  } else if (!strcmp(tok[0], "Q") && ntok == 2) {
+  if (!strcmp(tok[0], "Q") && ntok == 2) {
     switch (tok[1][0]) {
       case 'F': epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);   break;
       case 'N': epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL); break;
@@ -213,7 +209,7 @@ static void handle(char* cmd) {
     epd.paint();
     delay(2500);  // paint() returns before the sweeps finish — let them
     setCpuFrequencyMhz(80);   // low idle heat for cold-session accuracy
-    Serial.printf("DONE T=%d\n", epd.readPanelTemperatureC());
+    Serial.println("DONE");
 
   } else if (!strcmp(tok[0], "M")) {
     setCpuFrequencyMhz(240);
@@ -222,7 +218,7 @@ static void handle(char* cmd) {
     epd.paint();
     delay(2500);
     setCpuFrequencyMhz(80);
-    Serial.printf("DONE T=%d\n", epd.readPanelTemperatureC());
+    Serial.println("DONE");
 
   } else if (!strcmp(tok[0], "U")) {
     setCpuFrequencyMhz(240);
@@ -230,7 +226,7 @@ static void handle(char* cmd) {
     epd.paint();
     delay(2500);
     setCpuFrequencyMhz(80);
-    Serial.printf("DONE T=%d\n", epd.readPanelTemperatureC());
+    Serial.println("DONE");
 
   } else if (!strcmp(tok[0], "K")) {
     setCpuFrequencyMhz(240);
@@ -238,7 +234,7 @@ static void handle(char* cmd) {
     epd.paint();
     delay(2500);
     setCpuFrequencyMhz(80);
-    Serial.printf("DONE T=%d\n", epd.readPanelTemperatureC());
+    Serial.println("DONE");
 
   } else if (!strcmp(tok[0], "C")) {
     epd.clear();
@@ -273,7 +269,7 @@ void setup() {
   // Idle at 80MHz to minimize self-heating while the chilled board sits on
   // the scanner (paints temporarily restore 240MHz for authentic timing).
   setCpuFrequencyMhz(80);
-  Serial.printf("READY T=%d\n", epd.readPanelTemperatureC());
+  Serial.println("READY");
 }
 
 void loop() {

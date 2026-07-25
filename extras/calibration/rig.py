@@ -7,7 +7,6 @@ scans the panel face-down on the Canon MG5200 (SANE pixma backend), locates
 the panel via the fiducials, and measures each patch's reflectance.
 
 Usage:
-  python3 rig.py temp                      # read panel temperature
   python3 rig.py chart [--tag NAME]        # P -> scan -> measure -> log
   python3 rig.py measure scan.png          # re-measure an existing scan
   python3 rig.py send "W ND 1 1 1 ..."     # raw serial command
@@ -56,7 +55,7 @@ def open_serial(port=None):
     return s
 
 
-def command(s, cmd, terminator=("DONE", "OK", "ERR", "TEMP", "READY", "BQTEMP"), timeout=120):
+def command(s, cmd, terminator=("DONE", "OK", "ERR", "READY", "BQTEMP"), timeout=120):
     s.write((cmd + "\n").encode())
     lines, t0 = [], time.time()
     while time.time() - t0 < timeout:
@@ -294,7 +293,7 @@ def log_result(tag, temp, out):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["temp", "chart", "measure", "send", "get"])
+    ap.add_argument("action", choices=["chart", "measure", "send", "get"])
     ap.add_argument("arg", nargs="?")
     ap.add_argument("--tag", default="")
     ap.add_argument("--port")
@@ -305,26 +304,20 @@ def main():
         return
 
     s = open_serial(a.port)
-    if a.action == "temp":
-        print("\n".join(command(s, "T")))
-    elif a.action == "send":
+    if a.action == "send":
         print("\n".join(command(s, a.arg)))
     elif a.action == "get":
         print("\n".join(command(s, "G", terminator=("DONE",))))
     elif a.action == "chart":
         lines = command(s, "P", terminator=("DONE",))
         print("\n".join(lines))
-        temp = ""
-        m = re.search(r"T=(-?\d+)", lines[-1])
-        if m:
-            temp = m.group(1)
         os.makedirs(RESULTS_DIR, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         tag = a.tag or "chart"
-        png = os.path.join(RESULTS_DIR, f"{stamp}_{tag}_T{temp}.png")
+        png = os.path.join(RESULTS_DIR, f"{stamp}_{tag}.png")
         scan(png)
         out, _ = measure(png)
-        log_result(tag, temp, out)
+        log_result(tag, None, out)
 
 
 if __name__ == "__main__":

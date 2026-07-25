@@ -4,7 +4,7 @@
 Uses the wavecal 'M' chart: each grey patch is split into a dithered
 reference half (66%/33% black dots made of the panel's own black+white) and a
 driven half. Correct grey levels make the halves match, which puts the four
-levels at linear-reflectance spacing — exactly what dither() assumes. The
+levels at linear-reflectance spacing, which is what image conversion wants. The
 reference is in-frame, so scanner tone response cancels out.
 
 Usage:
