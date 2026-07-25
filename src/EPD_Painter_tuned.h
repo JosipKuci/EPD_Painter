@@ -128,6 +128,10 @@ inline bool install(EPD_Painter &p, const uint8_t *data, size_t len) {
   haveLumFlag() = any;
   p._config.trains.g16_apply  = installedApply();
   p._config.trains.g16_remove = installedRemove();
+  // Point the driver at the measured level curve too, so drawGray8() dithers
+  // against what this panel really renders instead of an assumed even ramp.
+  // Null when the blob carried no measurements, which drawGray8() handles.
+  p._config.level_lum = levelLuminance();
   p._config.g16_pass_us_normal = (int)b.pass_us_normal;
   p.rebuildDecisionTrains();
   return true;

@@ -224,6 +224,50 @@ display.clearBuffers();
 
 ---
 
+### `drawGray8()` / `drawGray8Fit()`
+
+Draw an 8bpp greyscale image (0=black … 255=white) into the canvas, converting it to the driver's level codes with Floyd-Steinberg error diffusion.
+
+```cpp
+// whole image at a position
+epd.drawGray8(pixels, imgW, imgH, x, y);
+
+// scaled to fit the panel, centred on white — the photo case
+epd.drawGray8Fit(pixels, imgW, imgH);
+```
+
+Quantises against the panel's **measured** level curve — `Config::level_lum`, which `EPD_PainterTuned::install()` points at the tuned blob — rather than assuming levels are evenly spaced. They are not: on a measured LilyGo the gaps between neighbouring levels ran from 6 to 32 units against an ideal 17. Error diffusion copes perfectly well with uneven levels, producing more grain where gaps are wide; it only produces visible *banding* when it is wrong about where the levels sit. On an untuned board `level_lum` is null and an even ramp is assumed, which still works but will band on smooth gradients.
+
+Targets whichever level count is active — 16 after `setGreyLevels(16)`, otherwise 4.
+
+**Streaming.** Floyd-Steinberg only needs the current error row, so an image can be converted as it decodes and never held whole:
+
+```cpp
+EPD_Painter::GrayDither d;
+d.begin(painter, fb, W, H, srcW, srcH, dx, dy, dw, dh);
+for each source row, top to bottom:  d.row(pixels, y);
+d.end();
+```
+
+Rows must arrive top-to-bottom and complete. Costs ~4 KB of error rows regardless of image size — a 1600×1200 photo needs no 1.9 MB buffer. Scaling happens in the same pass, so a shrunk image diffuses across the pixels it will actually occupy.
+
+### Loading JPEG / PNG
+
+The library has **no image decoder dependency**. `EPD_Painter_Image.h` is an optional layer for those who have one installed:
+
+```cpp
+#define EPD_PAINTER_HAVE_JPEGDEC 1     // github.com/bitbank2/JPEGDEC
+#include "EPD_Painter_Image.h"
+
+EPD_PainterImage::drawJpegFit(epd, bytes, len);   // decode, fit, dither
+```
+
+Explicit defines rather than `__has_include`: the Arduino builder only adds a library to the include path when it sees an unconditional include, so `__has_include` is false on the first pass and the feature silently never compiles in.
+
+Both `drawJpegFit()` and `drawPngFit()` stream — the decoded picture never exists in memory. JPEG needs a small strip buffer (`srcW × 16`) because JPEGDEC delivers MCU blocks rather than rows; PNG holds one row. `drawJpegFit()` also picks the decoder's built-in shrink automatically: the largest that still leaves the image at least panel-sized, so a 12 MP photo is not decoded in full only to be thrown away.
+
+---
+
 ### `packBuffer()`
 
 Packs an 8bpp framebuffer into the driver's 2bpp format, respecting the current rotation setting. Returns a PSRAM-allocated buffer that the caller must free with `heap_caps_free()`. Returns `nullptr` on allocation failure.
@@ -847,6 +891,8 @@ void loop() {
 | `computeDirtyRects()` | no | Return dirty rectangles between screen state and new framebuffer |
 | `fxClear()` | yes | Animated sweep-bar clear effect |
 | `clearBuffers()` | no | Zero all packed buffers — reset DC-balance baseline |
+| `drawGray8()` | no | Draw 8bpp greyscale, dithered against the measured level curve |
+| `drawGray8Fit()` | no | As above, scaled to fit and centred |
 | `packBuffer()` | no | Pack 8bpp framebuffer to 2bpp — for use with custom shutdown images |
 | `setQuality(q)` | — | Set waveform timing for next paint |
 | `setAutoShutdown(bool)` | — | If `false`, `EPD_BootCtl` must be managed manually |

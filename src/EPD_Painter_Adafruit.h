@@ -85,6 +85,27 @@ public:
     void clearDirtyAreas(int tolerance = 0, EPD_Painter::ClearMode mode = EPD_Painter::ClearMode::SOFT) { _painter.clearDirtyAreas(buffer, tolerance, mode); }
     void fxClear() { _painter.fxClear(); }
 
+    // Draw an 8bpp greyscale image (0=black … 255=white) into the canvas,
+    // Floyd-Steinberg dithered against the panel's measured level curve.
+    // See EPD_Painter::drawGray8().
+    void drawGray8(const uint8_t *src, int srcW, int srcH, int x = 0, int y = 0) {
+        _painter.drawGray8(buffer, _painter._config.width, _painter._config.height,
+                           src, srcW, srcH, x, y);
+    }
+
+    // Scale an 8bpp greyscale image to fit the canvas, preserving aspect,
+    // centred on a white surround, dithered against the measured level curve.
+    // The photo-on-a-panel case in one call.
+    void drawGray8Fit(const uint8_t *src, int srcW, int srcH) {
+        const int W = _painter._config.width, H = _painter._config.height;
+        if (srcW <= 0 || srcH <= 0) return;
+        memset(buffer, 0, (size_t)W * H);          // level 0 = paper white
+        const float s = min((float)W / srcW, (float)H / srcH);
+        const int dw = max(1, (int)(srcW * s)), dh = max(1, (int)(srcH * s));
+        _painter.drawGray8(buffer, W, H, src, srcW, srcH,
+                           (W - dw) / 2, (H - dh) / 2, dw, dh);
+    }
+
     // Pack the current framebuffer to 2bpp. Returns a PSRAM-allocated buffer
     // the caller must free with heap_caps_free(). Returns nullptr on failure.
     // Use this to supply packed image data to EPD_BootCtl::IImageProvider.

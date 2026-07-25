@@ -149,6 +149,19 @@ struct PowerCtlConfig {
       // these automatically.
       TrainTables trains{};
 
+      // What each grey level ACTUALLY renders as, 255 = paper white down to
+      // 0 = the deepest black this panel reaches. Measured by the tuner and
+      // carried in the tuned blob; EPD_PainterTuned::install() points this at
+      // it, exactly as it does the train tables.
+      //
+      // drawGray8() quantises against this rather than assuming levels are
+      // evenly spaced - they are not. On a measured LilyGo the gaps between
+      // neighbouring levels ran from 6 to 32 units against an ideal 17, and
+      // diffusing error against an assumed even ramp is what banding looks
+      // like. Null means the panel has never been measured, in which case
+      // an even ramp is the only honest guess available.
+      const uint8_t *level_lum = nullptr;
+
       // Returns a copy of this config with rotation set — lets you write:
       //   EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_CW));
       Config withRotation(Rotation r) const { Config c = *this; c.rotation = r; return c; }
@@ -307,6 +320,68 @@ struct PowerCtlConfig {
   bool setTemplate(const uint8_t *fb, Quality quality);
   void releaseTemplate();
   bool hasTemplate() const { return _has_template; }
+
+  // Draw an 8bpp greyscale image (0 = black … 255 = white) into an 8bpp
+  // canvas, converting it to the driver's level codes with Floyd-Steinberg
+  // error diffusion. This is the replacement for the old dither(): that one
+  // hardcoded {255,170,85,0} — an evenly spaced 4-level ramp no panel
+  // actually produces — so it quantised against levels that were not where
+  // it believed them to be.
+  //
+  // Quantises against Config::level_lum when the panel has been measured,
+  // falling back to an even ramp otherwise, and targets whichever level count
+  // is active (16 after setGreyLevels(16), else 4). Error diffusion copes
+  // perfectly well with unevenly spaced levels — it just produces more grain
+  // where the gaps are wide. It only produces visible BANDS when it is wrong
+  // about where the levels sit, which is exactly what an assumed ramp does.
+  //
+  // src is not modified, so the same image can be drawn repeatedly. Clipped
+  // to the destination. Allocates one row of int16 scratch internally
+  // (~2 KB for a 960-wide panel).
+  //
+  // The library deliberately has no image decoder. Feed it 8bpp greyscale
+  // from wherever you like — see EPD_Painter_Image.h for optional helpers
+  // that use JPEGDEC or PNGdec if you have them installed.
+  // STREAMING dither. Floyd-Steinberg only ever needs the current error row,
+  // never the whole image, so an image can be converted as it decodes and the
+  // full-size buffer never has to exist. A 1600x1200 photo costs ~4 KB of
+  // error rows here against ~1.9 MB decoded.
+  //
+  //   EPD_Painter::GrayDither d;
+  //   d.begin(painter, fb, W, H, srcW, srcH, dx, dy, dw, dh);
+  //   for each source row, top to bottom:  d.row(pixels, y);
+  //   d.end();
+  //
+  // Rows MUST arrive top-to-bottom and complete (a partial row would diffuse
+  // error from pixels that are not there yet). Rows may be skipped or
+  // repeated by the scaler, which handles both shrinking and enlarging.
+  // end() is safe to call twice and is called by the destructor.
+  class GrayDither {
+   public:
+    ~GrayDither() { end(); }
+    bool begin(const EPD_Painter &p, uint8_t *dst, int dstW, int dstH,
+               int srcW, int srcH, int dx = 0, int dy = 0,
+               int dw = 0, int dh = 0);
+    void row(const uint8_t *src, int srcY);
+    void end();
+   private:
+    uint8_t *_dst = nullptr;
+    int16_t *_cur = nullptr, *_next = nullptr;
+    uint8_t  _lum[16] = {0};
+    int _dstW = 0, _dstH = 0, _srcW = 0, _srcH = 0;
+    int _dx = 0, _dy = 0, _dw = 0, _dh = 0;
+    int _levels = 4, _nextY = 0;
+    void emit(const uint8_t *src, int y);
+  };
+
+  // dw/dh scale the image into a destination rectangle (nearest-neighbour
+  // sampling), 0 meaning "same size as the source". Scaling happens in the
+  // SAME pass as the dither, so a photo larger than the panel never needs an
+  // intermediate full-size buffer — which matters when the source is a phone
+  // photo and the board has 8 MB of PSRAM to work with.
+  void drawGray8(uint8_t *dst, int dstW, int dstH,
+                 const uint8_t *src, int srcW, int srcH,
+                 int dx = 0, int dy = 0, int dw = 0, int dh = 0) const;
 
   // Pack an 8bpp framebuffer to the driver's 2bpp packed format, respecting
   // the current rotation setting. Returns a PSRAM-allocated buffer the caller

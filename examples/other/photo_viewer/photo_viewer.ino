@@ -37,11 +37,18 @@
 #include <SD.h>
 #include <SD_MMC.h>
 #include <LittleFS.h>
-#include <JPEGDEC.h>
+#define EPD_PAINTER_HAVE_JPEGDEC 1
+#include "EPD_Painter_Image.h"
 #include <esp_heap_caps.h>
 #include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_tuned.h"
 #include <gt911_lite.h>
+#include <Preferences.h>
+
+// Declared up here rather than beside the drawing code: the Arduino builder
+// auto-generates function prototypes and inserts them ABOVE the sketch body,
+// so any type used in a signature must already exist by then.
+struct Btn { int x, y, w, h; };
 
 static EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
@@ -143,86 +150,104 @@ static bool touchTapped(int &px, int &py) {
 }
 
 // ============================================================================
-// JPEG -> greyscale
-// ============================================================================
-static JPEGDEC   jpeg;
-static uint8_t  *fileBuf = nullptr;    // the compressed file
-static uint8_t  *grayBuf = nullptr;    // decoded greyscale
-static int       grayW = 0, grayH = 0;
-
-static int jpegDrawCb(JPEGDRAW *d) {
-  const uint8_t *src = (const uint8_t *)d->pPixels;
-  for (int y = 0; y < d->iHeight; y++) {
-    const int dy = d->y + y;
-    if (dy < 0 || dy >= grayH) continue;
-    uint8_t *row = grayBuf + (size_t)dy * grayW;
-    for (int x = 0; x < d->iWidth; x++) {
-      const int dx = d->x + x;
-      if (dx >= 0 && dx < grayW) row[dx] = src[(size_t)y * d->iWidth + x];
-    }
-  }
-  return 1;
-}
-
-// ============================================================================
-// Floyd-Steinberg onto the panel's real levels
+// Photo rendering
 //
-// The quantiser searches the MEASURED luminance of each level rather than
-// assuming an even ramp, and diffuses the true residual. That is what
-// keeps gradients smooth on a panel whose levels bunch together at one
-// end. src is 8bpp grey (255 = white) at src_w x src_h; it is scaled to
-// fit the canvas, centred, and dithered in one pass.
+// The library does all of it now, and it STREAMS: the JPEG is dithered row by
+// row as it decodes, so the decoded photo never exists in memory. This sketch
+// used to allocate the full greyscale image - ~1.9 MB for a phone photo - and
+// carry its own Floyd-Steinberg loop. Both are gone.
+//
+// Quantising happens against the panel's MEASURED level curve, which reaches
+// the driver through EPD_PainterTuned::install() pointing Config::level_lum at
+// the tuned blob. On an untuned board that is null and the library falls back
+// to an even ramp: still works, but smooth gradients will band.
+//// ============================================================================
+static uint8_t  *fileBuf = nullptr;    // whole JPEG, read from the card
+
+// The curve reaches the driver through EPD_PainterTuned::install(), which
+// points Config::level_lum at the tuned blob's measurements. On an untuned
+// board level_lum is null and the library falls back to an even ramp: still
+// works, but smooth gradients will band.
 // ============================================================================
-static void renderDithered(const uint8_t *src, int sw, int sh) {
-  const uint8_t *lum = EPD_PainterTuned::levelLuminance();
-  uint8_t even[16];
-  if (!lum) {
-    for (int i = 0; i < 16; i++) even[i] = (uint8_t)(255 - i * 255 / 15);
-    lum = even;
-  }
-
-  uint8_t *fb = epd.getBuffer();
-  memset(fb, 0, (size_t)panelW * panelH);          // white surround
-
-  // fit, preserving aspect
-  const float s = min((float)panelW / sw, (float)panelH / sh);
-  const int dw = max(1, (int)(sw * s)), dh = max(1, (int)(sh * s));
-  const int ox = (panelW - dw) / 2, oy = (panelH - dh) / 2;
-
-  static int16_t errCur[2048], errNext[2048];
-  memset(errCur, 0, sizeof(int16_t) * dw);
-  for (int y = 0; y < dh; y++) {
-    memset(errNext, 0, sizeof(int16_t) * dw);
-    const uint8_t *srow = src + (size_t)((int)(y / s)) * sw;
-    uint8_t *drow = fb + (size_t)(oy + y) * panelW + ox;
-    for (int x = 0; x < dw; x++) {
-      int v = (int)srow[(int)(x / s)] + errCur[x];
-      if (v < 0) v = 0; else if (v > 255) v = 255;
-      int lv = 0, best = 1000;
-      for (int i = 0; i < 16; i++) {
-        const int d = abs((int)lum[i] - v);
-        if (d < best) { best = d; lv = i; }
-      }
-      const int err = v - (int)lum[lv];
-      drow[x] = (uint8_t)lv;
-      if (x + 1 < dw) errCur[x + 1]  += (int16_t)(err * 7 / 16);
-      if (x > 0)      errNext[x - 1] += (int16_t)(err * 3 / 16);
-      errNext[x]                     += (int16_t)(err * 5 / 16);
-      if (x + 1 < dw) errNext[x + 1] += (int16_t)(err * 1 / 16);
-    }
-    memcpy(errCur, errNext, sizeof(int16_t) * dw);
-  }
-}
 
 // ============================================================================
 // Photo list
 // ============================================================================
+// How long each photo stays up before the next one loads. This is DWELL time
+// - the clock starts when a photo finishes painting - so the interval means
+// the same thing whatever the image costs to render.
+// ---- settings, persisted in NVS -------------------------------------------
+// Dwell choices rather than a free number: on a touch panel with no keyboard,
+// cycling a short list is the whole interaction, and these are the values
+// anyone actually wants.
+static const uint32_t DWELL_CHOICES[] = { 5000, 8000, 15000, 30000, 60000, 300000 };
+static const int      N_DWELL = sizeof(DWELL_CHOICES) / sizeof(DWELL_CHOICES[0]);
+
+// ---- frontlight (LilyGo) ---------------------------------------------------
+// The T5 S3 GPS carries a frontlight on GPIO 11, driven by LEDC PWM. Other
+// boards in this family do not, so the setting only appears where the hardware
+// is: the panel presets differ by I2C pins, which is enough to tell them
+// apart at runtime under auto-probe, where a compile-time #ifdef cannot.
+#define VIEWER_BL_PIN   11
+#define VIEWER_BL_FREQ  5000
+#define VIEWER_BL_BITS  8
+
+static bool hasBacklight = false;      // set in setup() from the detected board
+static const uint8_t BL_CHOICES[] = { 0, 64, 128, 192, 255 };
+static const int     N_BL = sizeof(BL_CHOICES) / sizeof(BL_CHOICES[0]);
+static int           blIdx = 0;        // -> off
+
+static void applyBacklight() {
+  if (!hasBacklight) return;
+  ledcWrite(VIEWER_BL_PIN, BL_CHOICES[blIdx]);
+}
+
+static Preferences prefs;
+static int      dwellIdx    = 1;       // -> 8 s
+static int      flashClears = 4;       // rail-to-rail clears between photos
+static bool     slideshow   = true;
+static uint32_t lastShownMs = 0;
+static bool     inSettings  = false;
+
+static uint32_t dwellMs() { return DWELL_CHOICES[dwellIdx]; }
+
+static void loadSettings() {
+  prefs.begin("viewer", true);
+  slideshow   = prefs.getBool("slide", true);
+  dwellIdx    = prefs.getInt("dwell", 1);
+  flashClears = prefs.getInt("flash", 4);
+  blIdx       = prefs.getInt("bl", 0);
+  prefs.end();
+  if (blIdx < 0 || blIdx >= N_BL) blIdx = 0;
+  if (dwellIdx < 0 || dwellIdx >= N_DWELL) dwellIdx = 1;
+  if (flashClears < 0 || flashClears > 8)  flashClears = 4;
+}
+
+static void saveSettings() {
+  prefs.begin("viewer", false);
+  prefs.putBool("slide", slideshow);
+  prefs.putInt("dwell", dwellIdx);
+  prefs.putInt("flash", flashClears);
+  prefs.putInt("bl", blIdx);
+  prefs.end();
+}
+
+
+
 static const int MAX_PHOTOS = 200;
 static String photos[MAX_PHOTOS];
 static int    nPhotos = 0, current = 0;
 
 static bool isJpeg(const char *name) {
-  const char *dot = strrchr(name, '.');
+  // Skip dotfiles, and AppleDouble stubs in particular. macOS writes a "._"
+  // sidecar beside every real file on a FAT/exFAT card: same .jpg extension,
+  // no image inside. Matching on the extension alone means half the entries
+  // on a Mac-copied card are metadata that cannot decode.
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (base[0] == '.') return false;
+
+  const char *dot = strrchr(base, '.');
   if (!dot) return false;
   return !strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".jpeg");
 }
@@ -232,6 +257,16 @@ static void scanPhotos() {
   File dir = openPath(PHOTO_DIR);
   if (!dir || !dir.isDirectory()) {
     Serial.printf("[viewer] no %s folder on the card\n", PHOTO_DIR);
+    // Say what IS there. "No photos" with nothing else to go on sends people
+    // hunting for a card fault when it is usually a name or a case mismatch.
+    File root = openPath("/");
+    if (root && root.isDirectory()) {
+      Serial.println("[viewer] card root contains:");
+      for (File e = root.openNextFile(); e; e = root.openNextFile())
+        Serial.printf("[viewer]   %s%s\n", e.name(), e.isDirectory() ? "/" : "");
+    } else {
+      Serial.println("[viewer] cannot open the card root either");
+    }
     return;
   }
   for (File f = dir.openNextFile(); f && nPhotos < MAX_PHOTOS; f = dir.openNextFile()) {
@@ -265,6 +300,111 @@ static void showMessage(const char *l1, const char *l2) {
   while (!epd.driver().paintIdle()) delay(10);
 }
 
+// Rail-to-rail flash to clear ghosting between photos. Same approach as the
+// tuner's activation flash; the count is a trade between how thoroughly the
+// previous image is erased and how long the panel spends flashing.
+
+// ============================================================================
+// On-screen controls
+//
+// E-paper has no hover and a slow redraw, so the controls are drawn INTO the
+// photo rather than composited over it - they cost nothing extra to display
+// and vanish the moment the slideshow takes over.
+//
+// In slideshow mode the picture is left completely clean and a tap anywhere
+// opens settings. In manual mode there is nowhere to discover the controls
+// from, so prev/next/settings are drawn along the bottom.
+// ============================================================================
+static const int BAR_H = 64;
+
+static Btn btnPrev, btnNext, btnSettings;
+
+static bool hit(const Btn &b, int x, int y) {
+  return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+}
+
+static void drawButton(const Btn &b, const char *label, int textSize = 3) {
+  epd.fillRect(b.x, b.y, b.w, b.h, 0);            // white plate
+  epd.drawRect(b.x, b.y, b.w, b.h, 15);
+  epd.setTextColor(15);
+  epd.setTextSize(textSize);
+  const int cw = 6 * textSize, ch = 8 * textSize;
+  epd.setCursor(b.x + (b.w - (int)strlen(label) * cw) / 2,
+                b.y + (b.h - ch) / 2);
+  epd.print(label);
+}
+
+// Lay the bar out for the current panel size, then draw it into the canvas.
+static void drawNavBar() {
+  const int y = panelH - BAR_H, third = panelW / 3;
+  btnPrev     = { 0,           y, third,            BAR_H };
+  btnNext     = { third * 2,   y, panelW - third*2, BAR_H };
+  btnSettings = { third,       y, third,            BAR_H };
+  drawButton(btnPrev,     "<");
+  drawButton(btnSettings, "SETTINGS", 2);
+  drawButton(btnNext,     ">");
+}
+
+// ---- settings page ---------------------------------------------------------
+static Btn rowSlide, rowDwell, rowFlash, rowLight, rowDone;
+
+static void drawSettings() {
+  epd.fillScreen(0);
+  epd.setTextColor(15);
+  epd.setTextSize(4);
+  epd.setCursor(30, 24);
+  epd.print("SETTINGS");
+
+  const int x = 30, w = panelW - 60, h = 78;
+  int y = 96;
+  char buf[64];
+
+  auto row = [&](Btn &b, const char *label, const char *value) {
+    b = { x, y, w, h };
+    epd.drawRect(x, y, w, h, 15);
+    epd.setTextSize(3);
+    epd.setCursor(x + 16, y + (h - 24) / 2);
+    epd.print(label);
+    epd.setCursor(x + w - 16 - (int)strlen(value) * 18, y + (h - 24) / 2);
+    epd.print(value);
+    y += h + 14;
+  };
+
+  row(rowSlide, "Slideshow", slideshow ? "ON" : "OFF");
+
+  if (dwellMs() >= 60000) snprintf(buf, sizeof(buf), "%lu min", (unsigned long)(dwellMs() / 60000));
+  else                    snprintf(buf, sizeof(buf), "%lu sec", (unsigned long)(dwellMs() / 1000));
+  row(rowDwell, "Time per photo", buf);
+
+  snprintf(buf, sizeof(buf), "%d", flashClears);
+  row(rowFlash, "Flash clears", buf);
+
+  if (hasBacklight) {
+    if (!blIdx) snprintf(buf, sizeof(buf), "OFF");
+    else        snprintf(buf, sizeof(buf), "%d%%", BL_CHOICES[blIdx] * 100 / 255);
+    row(rowLight, "Frontlight", buf);
+  }
+
+  epd.setTextSize(2);
+  epd.setCursor(x + 4, y + 6);
+  epd.print("Tap a row to change it. More flashes erase more");
+  epd.setCursor(x + 4, y + 26);
+  epd.print("ghosting but take longer between pictures.");
+
+  rowDone = { panelW / 2 - 110, panelH - BAR_H - 16, 220, BAR_H };
+  drawButton(rowDone, "DONE");
+
+  epd.paint();
+  while (!epd.driver().paintIdle()) delay(10);
+}
+
+static void deepClear() {
+  for (int i = 0; i < flashClears; i++) {
+    epd.clear();
+    while (!epd.driver().paintIdle()) delay(2);
+  }
+}
+
 static bool showPhoto(int idx) {
   if (idx < 0 || idx >= nPhotos) return false;
   const uint32_t t0 = millis();
@@ -279,37 +419,50 @@ static bool showPhoto(int idx) {
   f.read(fileBuf, len);
   f.close();
 
-  if (!jpeg.openRAM(fileBuf, (int)len, jpegDrawCb)) {
-    Serial.printf("[viewer]   not a readable JPEG (%d)\n", jpeg.getLastError());
+  // One call: decodes, shrinks, fits, centres and dithers against the panel's
+  // measured level curve - STREAMING, so the decoded photo never exists in
+  // memory. Only a ~26 KB strip and the error rows, against the ~1.9 MB this
+  // sketch used to allocate for a phone photo.
+  //
+  // The decode scale is chosen for us: the largest built-in shrink that still
+  // leaves the image at least panel-sized, so a 12 MP photo is not decoded in
+  // full only to be thrown away.
+  // 1) STREAM the photo into the framebuffer (PSRAM). Nothing reaches the
+  //    panel yet, so the screen keeps the previous picture while this runs -
+  //    several seconds for a large JPEG, and a white screen for that long
+  //    would look like a fault.
+  if (!EPD_PainterImage::drawJpegFit(epd, fileBuf, len)) {
+    // Say so on the PANEL as well as the wire. A silent failure leaves
+    // whatever was on screen before, which reads as "the viewer is broken"
+    // rather than "that one file would not decode".
+    Serial.println("[viewer]   decode failed");
+    showMessage("CANNOT SHOW THIS ONE", photos[idx].c_str());
     return false;
   }
-  jpeg.setPixelType(EIGHT_BIT_GRAYSCALE);
+  // In manual mode the controls go INTO the picture - drawn after the photo,
+  // before the paint, so they cost nothing extra and disappear cleanly when
+  // the slideshow is running.
+  if (!slideshow) drawNavBar();
 
-  // Decode at the largest built-in scale that stays within our buffer —
-  // a phone photo is far larger than the panel, and decoding it full size
-  // would need more PSRAM than the board has.
-  int w = jpeg.getWidth(), h = jpeg.getHeight(), opt = 0;
-  static const int opts[] = { 0, JPEG_SCALE_HALF, JPEG_SCALE_QUARTER, JPEG_SCALE_EIGHTH };
-  for (int shift = 0; shift <= 3; shift++) {
-    if ((w >> shift) <= MAX_DECODE_W || shift == 3) {
-      opt = opts[shift]; w >>= shift; h >>= shift;
-      break;
-    }
-  }
-  grayW = w; grayH = h;
-  if (grayBuf) heap_caps_free(grayBuf);
-  grayBuf = (uint8_t *)heap_caps_malloc((size_t)grayW * grayH, MALLOC_CAP_SPIRAM);
-  if (!grayBuf) { jpeg.close(); Serial.println("[viewer]   no PSRAM for image"); return false; }
-  memset(grayBuf, 255, (size_t)grayW * grayH);
+  // 2) DEEP CLEAR, the way the tuner does before a measurement. Photographs
+  //    put every level on the glass at once, and going straight from one to
+  //    the next leaves the previous image faintly readable in the flats.
+  //    Rail-to-rail flashing agitates the ink and lands every pixel in the
+  //    same physical state, so the new paint starts from a known page.
+  //
+  //    Hard clears specifically, rather than painting black then white: a
+  //    hard clear is DC balanced by construction, so flashing between every
+  //    photo adds no net charge no matter how long the viewer runs. Back to
+  //    back with no settle - a pause just lets the particles relax again.
+  deepClear();
 
-  const bool ok = jpeg.decode(0, 0, opt);
-  jpeg.close();
-  if (!ok) { Serial.printf("[viewer]   decode failed (%d)\n", jpeg.getLastError()); return false; }
-
-  renderDithered(grayBuf, grayW, grayH);
+  // 3) PAINT. The driver sees a known-white screen and the framebuffer we
+  //    prepared in (1), so this is a full, clean redraw.
   epd.paint();
   while (!epd.driver().paintIdle()) delay(10);
-  Serial.printf("[viewer]   %dx%d -> panel in %lu ms\n", grayW, grayH, millis() - t0);
+  // Start the dwell clock only now the picture is actually on the glass.
+  lastShownMs = millis();
+  Serial.printf("[viewer]   drawn in %lu ms\n", millis() - t0);
   return true;
 }
 
@@ -391,6 +544,24 @@ void setup() {
     for (;;) delay(1000);
   }
 
+  loadSettings();
+
+  // Only the LilyGo T5 S3 GPS in this family has the frontlight. Identify it
+  // by the I2C pins the preset actually resolved to, which works under
+  // auto-probe where a compile-time check cannot.
+  {
+    const auto &i2c = epd.driver()._config.i2c;
+    hasBacklight = (i2c.sda == 39 && i2c.scl == 40);
+    if (hasBacklight) {
+      ledcAttach(VIEWER_BL_PIN, VIEWER_BL_FREQ, VIEWER_BL_BITS);
+      applyBacklight();
+      Serial.printf("[viewer] frontlight on GPIO %d, %s\n", VIEWER_BL_PIN,
+                    blIdx ? "on" : "off");
+    } else {
+      Serial.println("[viewer] no frontlight on this board");
+    }
+  }
+
   scanPhotos();
   if (!nPhotos) {
     showMessage("NO PHOTOS", "Put .jpg files in /photos on the SD card");
@@ -402,18 +573,76 @@ void setup() {
 
 void loop() {
   int px, py;
-  if (touchTapped(px, py)) {
-    step(px >= panelW / 2 ? +1 : -1);
+
+  // ---- settings page owns the screen while it is open ----
+  if (inSettings) {
+    if (touchTapped(px, py)) {
+      bool dirty = true;
+      if      (hit(rowSlide, px, py)) slideshow = !slideshow;
+      else if (hit(rowDwell, px, py)) dwellIdx  = (dwellIdx + 1) % N_DWELL;
+      else if (hit(rowFlash, px, py)) flashClears = (flashClears + 1) % 9;
+      else if (hasBacklight && hit(rowLight, px, py)) {
+        blIdx = (blIdx + 1) % N_BL;
+        applyBacklight();            // immediate, so the choice is visible
+      }
+      else if (hit(rowDone,  px, py)) {
+        saveSettings();
+        inSettings = false;
+        lastShownMs = millis();
+        showPhoto(current);          // back to the picture, controls as set
+        return;
+      } else dirty = false;
+      if (dirty) drawSettings();     // redraw with the new value
+    }
+    delay(8);
     return;
   }
+
+  // ---- normal viewing ----
+  if (touchTapped(px, py)) {
+    if (slideshow) {
+      // Nothing is drawn over a running slideshow, so there is nowhere to aim
+      // - any tap opens settings, which is where the stop button lives.
+      inSettings = true;
+      drawSettings();
+    } else if (hit(btnSettings, px, py)) {
+      inSettings = true;
+      drawSettings();
+    } else if (hit(btnPrev, px, py)) step(-1);
+    else if (hit(btnNext, px, py))   step(+1);
+    else {
+      // Above the bar: keep the old left/right halves, so tapping the picture
+      // still works for anyone used to it.
+      step(px >= panelW / 2 ? +1 : -1);
+    }
+    return;
+  }
+
   if (Serial.available()) {
     const int c = Serial.read();
     if (c == 'n' || c == ' ') step(+1);
     else if (c == 'p')        step(-1);
-    else if (c == 'i')
-      Serial.printf("[viewer] %d/%d %s\n", current + 1, nPhotos,
-                    nPhotos ? photos[current].c_str() : "-");
+    else if (c == 'c')      { inSettings = true; drawSettings(); }
+    else if (c == 's') {
+      slideshow = !slideshow;
+      saveSettings();
+      lastShownMs = millis();
+      Serial.printf("[viewer] slideshow %s\n", slideshow ? "on" : "off");
+      showPhoto(current);            // redraw so the bar appears/disappears
+    } else if (c == 'i')
+      Serial.printf("[viewer] %d/%d %s  (slideshow %s, %lus, %d clears)\n",
+                    current + 1, nPhotos, nPhotos ? photos[current].c_str() : "-",
+                    slideshow ? "on" : "off",
+                    (unsigned long)(dwellMs() / 1000), flashClears);
     return;
   }
+
+  // Auto-advance. Timed from when the last photo FINISHED painting, not from
+  // when it started: a large JPEG takes several seconds to decode, clear and
+  // paint, and measuring from the start would make the dwell shrink with image
+  // size - big photos would flick past fastest, which is backwards.
+  if (slideshow && nPhotos > 1 && millis() - lastShownMs >= dwellMs())
+    step(+1);
+
   delay(8);      // fast enough for the touch driver's confirmation window
 }

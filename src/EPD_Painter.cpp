@@ -1639,6 +1639,111 @@ void EPD_Painter::fxClear() {
 
 
 // =============================================================================
+// GrayDither — streaming Floyd-Steinberg against the measured level curve
+//
+// Error distribution:
+//          [x]  →  right:        7/16
+//   below-left:  3/16   below:  5/16   below-right:  1/16
+// =============================================================================
+bool EPD_Painter::GrayDither::begin(const EPD_Painter &p,
+                                    uint8_t *dst, int dstW, int dstH,
+                                    int srcW, int srcH,
+                                    int dx, int dy, int dw, int dh) {
+    end();
+    if (!dst || srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return false;
+    if (dw <= 0) dw = srcW;
+    if (dh <= 0) dh = srcH;
+
+    _dst = dst; _dstW = dstW; _dstH = dstH;
+    _srcW = srcW; _srcH = srcH;
+    _dx = dx; _dy = dy; _dw = dw; _dh = dh;
+    _levels = p._grey16 ? 16 : 4;
+    _nextY = 0;
+
+    // What each level renders as: the panel's measured curve when it has been
+    // tuned, an even ramp otherwise. The even ramp is the only honest guess
+    // available, and is also exactly the assumption that produces banding.
+    if (p._config.level_lum)
+        for (int i = 0; i < _levels; i++) _lum[i] = p._config.level_lum[i];
+    else
+        for (int i = 0; i < _levels; i++)
+            _lum[i] = (uint8_t)(255 - i * 255 / (_levels - 1));
+
+    // Error rows follow the DESTINATION width - diffusion happens in output
+    // space, so a shrunk image spreads error across the pixels it will really
+    // occupy rather than across source pixels that get thrown away.
+    const size_t erow = (size_t)(_dw + 2) * sizeof(int16_t);
+    _cur  = (int16_t *)heap_caps_malloc(erow, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    _next = (int16_t *)heap_caps_malloc(erow, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!_cur || !_next) { end(); return false; }
+    memset(_cur,  0, erow);
+    memset(_next, 0, erow);
+    return true;
+}
+
+void EPD_Painter::GrayDither::emit(const uint8_t *src, int y) {
+    const size_t erow = (size_t)(_dw + 2) * sizeof(int16_t);
+    memset(_next, 0, erow);
+    const int ty = _dy + y;
+
+    for (int x = 0; x < _dw; x++) {
+        int v = (int)src[(int)((int64_t)x * _srcW / _dw)] + _cur[x + 1];
+        if (v < 0) v = 0; else if (v > 255) v = 255;
+
+        // Nearest level BY MEASURED LUMINANCE. Linear over at most 16 entries
+        // — nothing beside the paint — and the curve is not guaranteed
+        // monotonic on a poorly tuned panel, so a binary search is not safe.
+        int best = 0, bestd = 1000;
+        for (int i = 0; i < _levels; i++) {
+            const int d = abs((int)_lum[i] - v);
+            if (d < bestd) { bestd = d; best = i; }
+        }
+        const int e = v - (int)_lum[best];        // what could not be shown
+
+        const int tx = _dx + x;
+        if (tx >= 0 && tx < _dstW && ty >= 0 && ty < _dstH)
+            _dst[(size_t)ty * _dstW + tx] = (uint8_t)best;
+
+        // Diffuse even where clipped: an error dropped at the edge bands
+        // along it.
+        _cur [x + 2] += (int16_t)((e * 7) >> 4);
+        _next[x    ] += (int16_t)((e * 3) >> 4);
+        _next[x + 1] += (int16_t)((e * 5) >> 4);
+        _next[x + 2] += (int16_t)((e * 1) >> 4);
+    }
+    int16_t *t = _cur; _cur = _next; _next = t;
+}
+
+void EPD_Painter::GrayDither::row(const uint8_t *src, int srcY) {
+    if (!_cur || !src) return;
+    // Emit every destination row this source row is responsible for. Shrinking
+    // skips source rows; enlarging repeats one. Driving the loop from the
+    // DESTINATION side means the scale factor never has to divide evenly.
+    while (_nextY < _dh && (int)((int64_t)_nextY * _srcH / _dh) <= srcY) {
+        emit(src, _nextY);
+        _nextY++;
+    }
+}
+
+void EPD_Painter::GrayDither::end() {
+    if (_cur)  { heap_caps_free(_cur);  _cur  = nullptr; }
+    if (_next) { heap_caps_free(_next); _next = nullptr; }
+    _dst = nullptr;
+}
+
+// =============================================================================
+// drawGray8() — the whole-image convenience over GrayDither
+// =============================================================================
+void EPD_Painter::drawGray8(uint8_t *dst, int dstW, int dstH,
+                            const uint8_t *src, int srcW, int srcH,
+                            int dx, int dy, int dw, int dh) const {
+    GrayDither d;
+    if (!d.begin(*this, dst, dstW, dstH, srcW, srcH, dx, dy, dw, dh)) return;
+    for (int y = 0; y < srcH; y++) d.row(src + (size_t)y * srcW, y);
+    d.end();
+}
+
+// =============================================================================
 // packBuffer()
 // =============================================================================
 uint8_t* EPD_Painter::packBuffer(const uint8_t* fb) const {

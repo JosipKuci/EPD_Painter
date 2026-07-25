@@ -105,6 +105,8 @@ Use an explicit preset when you know the target hardware at compile time and wan
 | `computeDirtyRects()` | Return dirty rectangles between current display state and new framebuffer |
 | `fxClear()` | Animated sweep-bar clear effect |
 | `clearBuffers()` | Zero all packed buffers — reset DC-balance baseline before power-off |
+| `drawGray8()` | Draw an 8bpp greyscale image, Floyd-Steinberg dithered against the panel's measured level curve |
+| `drawGray8Fit()` | As above, scaled to fit the canvas and centred — the photo case |
 | `setQuality(q)` | `QUALITY_HIGH` / `QUALITY_NORMAL` / `QUALITY_FAST` — trades refresh speed for black depth |
 
 **Ghosting removal:**
