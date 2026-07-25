@@ -63,20 +63,65 @@
 #if TUNEUP_HAVE_JPEGDEC
 
 // ---- knobs -----------------------------------------------------------------
-static const float TUNE_TOL        = 4.5f;
+// ---- tolerances are fractions of a LEVEL STEP, not scanner units ---------
+//
+// Every threshold below used to be an absolute number of scanner units,
+// which silently hard-coded one panel and one scanner. Full scale here is
+// ~97 units across 15 intervals, so a level step is ~6.5 - but a different
+// panel, a different scan resolution or a different lamp changes that
+// number, and every absolute tolerance then means something different.
+// A tolerance of "4.5 units" is meaningless; "0.7 of a level step" is not.
+//
+// tuneStep() below measures the step from the panel's own dither reference
+// ladder, so these fractions carry to any device. The values are the ratios
+// the absolute constants happened to have on the LilyGo H716, so behaviour
+// on that board is unchanged.
+static const float TUNE_TOL_STEPS       = 0.70f;  // was 4.5 units
+// Looser than the placement tolerance, and that is not a concession - it is
+// arithmetic. A gap is the DIFFERENCE of two neighbouring errors, so it runs
+// larger than either and can reach twice the worst placement error. Gating
+// gaps tighter than placement therefore makes convergence unreachable by
+// construction, which is exactly what happened: every run on 0.54 ended
+// converged=0, stalling on gap while maxerr was already inside tolerance
+// (attempt 1 finished at maxerr 5.6, gap 6.9 - a ratio of 1.2, which is
+// typical). 1.1 still catches the cases that actually band, like the 39/2
+// step pair one run produced, without demanding the impossible.
+static const float TUNE_GAP_TOL_STEPS   = 1.10f;  // was 0.54, unreachable
+static const float TUNE_AVG_BELOW_STEPS = 1.23f;  // was 8.0
+static const float TUNE_AVG_BELOW3_STEPS= 0.77f;  // was 5.0
+static const float TUNE_PROBE_COST_STEPS= 0.92f;  // was 6.0
+static const float TUNE_MAX_RISK_STEPS  = 1.85f;  // was 12.0
+static const float TUNE_GAP_NOISE_STEPS = 0.23f;  // was 1.5 units/pass
 static const int   TUNE_MAX_CYCLES = 34;
+// Whole-run retries when an attempt stalls instead of converging. Restarting
+// from a fresh probe escapes a bad basin; three attempts at ~5 min is a
+// better use of the time than a fourth parameter tweak.
+static const int   TUNE_MAX_ATTEMPTS = 1;
+// How many stuck levels one run may hand to the rescue. Each costs one extra
+// scan and targets a different level, so this is "how many stubborn levels do
+// we expect", not a retry count.
+static const int   TUNE_MAX_RESCUES  = 6;
+// Quiet time between attempts, for the SCANNER's benefit rather than the
+// panel's. Flatbeds wedge on sustained scan RATE, not scan length, and
+// back-to-back attempts turn a 6-minute run into 20 minutes of continuous
+// scanning - which is exactly what stopped the Canon answering mid-run and
+// cost a power cycle. A minute of silence is cheap against a five-minute
+// wedge plus hands on the hardware.
+static const uint32_t TUNE_ATTEMPT_COOLDOWN_MS = 60000;
 static const int   TUNE_WARMUP     = 2;
-static const float TUNE_AVG_BELOW  = 8.0f;   // average 2 scans once this close
-static const float TUNE_AVG_BELOW3 = 5.0f;   // and 3 once this close
-// Below this, a measured gap gain is indistinguishable from scan noise and
-// the knob is switched off rather than floored (see tuneProbeGap). A scan
-// reads to a unit or two, and the first LilyGo run spread 2.4 units across
-// its three bases while averaging to -0.5.
-static const float TUNE_GAP_NOISE  = 1.5f;   // units/pass
 // Levels the seeder reserves as whiten-only shapes (whitens, no re-darkens)
 // so tuneCalibrateGains() always has something to solve the whiten gain
 // from. Two, not one, so the figure is an average rather than a single read.
 static const int   TUNE_WHITEN_PROBES = 2;
+// Ceiling on what reserving a probe may cost that level's seed fit (see
+// TUNE_PROBE_COST_STEPS). Beyond ~one level step the trade is bad: an
+// inaccurate gw is recoverable by the online learner, a level seeded a whole
+// step off target is a visible band.
+//
+// How wrong the measured gains are assumed to be. Three runs put this
+// panel's whiten gain at 15.1 / 20.2 / 24.4, so +/-25% is if anything
+// generous. This one is genuinely dimensionless and needs no scaling.
+static const float TUNE_GAIN_ERR   = 0.25f;
 // Banding is a function of the SPACING between adjacent levels, not of any
 // one level's absolute placement, and until these the converger only ever
 // looked at the latter. On a ~97-unit full scale a level step is ~6.5
@@ -93,9 +138,12 @@ static const int   TUNE_WHITEN_PROBES = 2;
 //     G = 2.5 -> steps 10..24      usable
 //     G = 1.5 -> steps 13..21      good
 // 5.0 would have passed run 2 unchanged, which is the false pass that
-// started this. 2.5 is close to the scan-noise floor, which is why
-// TUNE_AVG_BELOW/3 below buy the precision to measure it honestly.
-static const float TUNE_GAP_TOL    = 2.5f;   // scanner units between neighbours
+// started this. 2.5 was then tried and proved unreachable - three runs sat
+// at gapMax 4 against 1-2 units of scan noise, so convergence never fired
+// and every result came from the best-shape fallback. A gate that cannot
+// pass is not a gate, and the planner spends its edits chasing it. 0.54 of
+// a step (3.5 units here) is the compromise: measurably tighter than the 4
+// the panel keeps landing on, still above the noise floor.
 static const float TUNE_SPACING_W  = 0.5f;   // per neighbour, in the plan score
 // Must be a resolution the scanner natively offers — eSCL servers snap an
 // unsupported value to the nearest supported one, silently returning a
@@ -133,12 +181,41 @@ struct TuneLv {
   bool   skip;                 // cool-down after a bad edit
   float  bestAbs;              // smallest |err| ever measured for this level …
   int8_t bd, bw, bg, br;       // … and the shape that achieved it
+  // A level the rescue has taken over. Its train is stored literally rather
+  // than as (d,w,g,r), because the rescue mutates the DRIVE SEQUENCE - it can
+  // insert and delete passes, producing shapes the grammar cannot express
+  // (leading floats, alternating d,w,d,w tails - exactly the shapes the
+  // hand-tuned direct trains needed). Once a level goes raw the planner
+  // leaves it alone; only a later rescue may change it again.
+  bool    hasRaw;
+  uint8_t raw[13];
   uint8_t bad;                 // edits that made this level worse
   bool   frozen;               // give up editing: keep the best-known shape
 };
 static TuneLv tl[16];
 static float tuneDose[14];     // landing of {1 x n} (monotone-enforced), n=1..13
 static float probeRef[16];     // dither reference means from the probe frame
+
+// ---- the unit every tolerance is expressed in ------------------------------
+// One level step, in scanner units, measured from this panel's own dither
+// reference ladder: white to black over 15 intervals. This is what makes the
+// tuner portable - a different panel, scan resolution or lamp changes the
+// absolute numbers, and every threshold scales with it automatically.
+//
+// probeRef[] is filled by tuneProbe(), so these are only valid after it has
+// run; every caller is downstream of that. The floor stops a failed or
+// nonsense probe turning into absurdly tight tolerances.
+static float tuneStep() {
+  const float span = probeRef[0] - probeRef[15];
+  return (span > 20.0f ? span : 20.0f) / 15.0f;
+}
+static float tuneTol()        { return TUNE_TOL_STEPS        * tuneStep(); }
+static float tuneGapTol()     { return TUNE_GAP_TOL_STEPS    * tuneStep(); }
+static float tuneAvgBelow()   { return TUNE_AVG_BELOW_STEPS  * tuneStep(); }
+static float tuneAvgBelow3()  { return TUNE_AVG_BELOW3_STEPS * tuneStep(); }
+static float tuneProbeMaxCost(){ return TUNE_PROBE_COST_STEPS * tuneStep(); }
+static float tuneMaxRisk()    { return TUNE_MAX_RISK_STEPS   * tuneStep(); }
+static float tuneGapNoise()   { return TUNE_GAP_NOISE_STEPS  * tuneStep(); }
 static int   removeExtra[16];
 
 // ============================================================================
@@ -416,6 +493,40 @@ static bool tuneScan(float x0, float y0, float w, float h) {
 
 // Adaptive bounding box for the wide registration scan: cutoffs derive
 // from the strongest row/column counts, not the window size.
+// Pick the dark/light split from the scan itself rather than assuming one.
+//
+// The threshold here used to be a hardcoded 120: a pixel counted as "dark"
+// only if it scanned below that. That silently encoded ONE panel's contrast.
+// A second LilyGo, whose black renders lighter under the preset tables, put
+// no pixels at all below 120 - so registration reported "no dark panel found"
+// with the board sitting plainly on the glass.
+//
+// The scan is reliably bimodal at this point (bright scanner bed, dark panel
+// painted full black), so the split can be measured. Percentiles rather than
+// min/max, because a single hot pixel or a shadow at the platen edge would
+// drag either extreme. Returns 0 if the image has no usable contrast, which
+// is the honest answer when nothing is on the glass.
+static uint8_t tuneDarkThreshold() {
+  const int W = grayW, H = grayH;
+  uint32_t hist[256] = {0};
+  const size_t n = (size_t)W * H;
+  for (size_t i = 0; i < n; i++) hist[grayImg[i]]++;
+
+  const uint32_t lowCut = (uint32_t)(n * 0.02f), highCut = (uint32_t)(n * 0.98f);
+  int lo = 0, hi = 255;
+  uint32_t acc = 0;
+  for (int v = 0; v < 256; v++) { acc += hist[v]; if (acc >= lowCut)  { lo = v; break; } }
+  acc = 0;
+  for (int v = 0; v < 256; v++) { acc += hist[v]; if (acc >= highCut) { hi = v; break; } }
+
+  // Too little spread means there is no panel/bed distinction to find.
+  if (hi - lo < 25) return 0;
+  // 45% of the way up from dark to light: comfortably above the panel's own
+  // black, comfortably below the bed, and it tracks whatever contrast this
+  // particular panel and scanner happen to produce.
+  return (uint8_t)(lo + 0.45f * (hi - lo));
+}
+
 static bool tuneBBoxAdaptive(uint8_t thresh, int *bx0, int *by0,
                              int *bx1, int *by1) {
   const int W = grayW, H = grayH;
@@ -581,7 +692,9 @@ static bool tuneRegister() {
   tuneRepaint = tuneRepaintBlack;
   if (!tuneScan(0, 0, TUNE_REG_W_MM, TUNE_REG_H_MM)) return false;
   int x0, y0, x1, y1;
-  if (!tuneBBoxAdaptive(120, &x0, &y0, &x1, &y1)) {
+  const uint8_t dth = tuneDarkThreshold();
+  Serial.printf("[tune] dark threshold %d (measured from the scan)\n", dth);
+  if (!dth || !tuneBBoxAdaptive(dth, &x0, &y0, &x1, &y1)) {
     Serial.println("[tune] no dark panel found - is the board face-down on the glass?");
     return false;
   }
@@ -603,7 +716,8 @@ static bool tuneRegister() {
   tunePaint();
   tuneRepaint = tuneRepaintQuad;
   if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
-  if (!tuneBBoxAdaptive(120, &x0, &y0, &x1, &y1)) {
+  const uint8_t qth = tuneDarkThreshold();
+  if (!qth || !tuneBBoxAdaptive(qth, &x0, &y0, &x1, &y1)) {
     Serial.println("[tune] quadrant mark not found");
     return false;
   }
@@ -628,14 +742,32 @@ static bool tuneRegister() {
 // ============================================================================
 // Trains: (d, w, g, r) grammar
 // ============================================================================
-static void tuneTrainOf(int lv, uint8_t out[13]) {
+static void tuneTrainOfShape(int d, int w, int g, int r, uint8_t out[13]) {
   memset(out, 0, 13);
   int p = 0;
-  for (int i = 0; i < tl[lv].d && p < 13; i++) out[p++] = 1;
-  for (int i = 0; i < tl[lv].w && p < 13; i++) out[p++] = 2;
-  p += tl[lv].g;                       // float gap
+  for (int i = 0; i < d && p < 13; i++) out[p++] = 1;
+  for (int i = 0; i < w && p < 13; i++) out[p++] = 2;
+  p += g;                              // float gap
   if (p > 13) p = 13;
-  for (int i = 0; i < tl[lv].r && p < 13; i++) out[p++] = 1;
+  for (int i = 0; i < r && p < 13; i++) out[p++] = 1;
+}
+
+static void tuneTrainOf(int lv, uint8_t out[13]) {
+  if (tl[lv].hasRaw) { memcpy(out, tl[lv].raw, 13); return; }
+  tuneTrainOfShape(tl[lv].d, tl[lv].w, tl[lv].g, tl[lv].r, out);
+}
+
+// Net charge of whatever train a level ACTUALLY has: darkens minus whitens,
+// counted from the drive sequence rather than inferred from (d,w,g,r).
+// Inferring it breaks the moment a level goes raw - the remove would be
+// charge-matched to a shape the level no longer has, and a DC imbalance is
+// ghosting.
+static int tuneNetOf(int lv) {
+  uint8_t t[13];
+  tuneTrainOf(lv, t);
+  int net = 0;
+  for (int i = 0; i < 13; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
+  return net;
 }
 
 static void tuneUploadApplies() {
@@ -813,8 +945,8 @@ static bool tuneProbeGap() {
     if ((slope[i] < 0) != (slope[0] < 0)) agree = false;
 
   float gg = 0.0f;
-  if (fabsf(mean) >= TUNE_GAP_NOISE && agree)
-    gg = constrain(fabsf(mean), TUNE_GAP_NOISE, 40.0f);
+  if (fabsf(mean) >= tuneGapNoise() && agree)
+    gg = constrain(fabsf(mean), tuneGapNoise(), 40.0f);
 
   for (int lv = 1; lv <= 15; lv++) tl[lv].gg = gg;
 
@@ -959,6 +1091,20 @@ static void tuneSeedModel(bool reserveProbes) {
         if (pick < 0 || cost[lv] < cost[pick]) pick = lv;
       }
       if (pick < 0) break;
+      // A probe is only worth having if the constraint is CHEAP. Without this
+      // ceiling the loop took the least-bad candidate no matter how bad it
+      // was: tuneSolveShape(whitenOnly) always returns something, so a level
+      // whose best whiten-only shape lands a whole level-step off target got
+      // reserved anyway. That is how one run put L6 twenty-two units light and
+      // came out coarser than the built-in tables - one wrecked level ruining
+      // an otherwise tight set. Falling back to the constant gw costs accuracy
+      // in one gain estimate; wrecking a level costs a visible band.
+      if (cost[pick] > tuneProbeMaxCost()) {
+        Serial.printf("[tune] no cheap whiten probe left (best L%d would cost "
+                      "%.1f > %.1f) - not reserving\n",
+                      pick, cost[pick], tuneProbeMaxCost());
+        break;
+      }
       sd[pick] = qd[pick]; sw[pick] = qw[pick]; sg[pick] = 0; sr[pick] = 0;
       Serial.printf("[tune] L%d reserved as a whiten probe (+%.1f seed error)\n",
                     pick, cost[pick]);
@@ -972,6 +1118,7 @@ static void tuneSeedModel(bool reserveProbes) {
   for (int lv = 6; lv <= 14; lv++) {
     TuneLv &L = tl[lv];
     L.d = sd[lv]; L.w = sw[lv]; L.g = sg[lv]; L.r = sr[lv];
+    L.hasRaw = false;                    // re-seeding returns it to the grammar
     L.bestAbs = 1e9f;                    // shapes changed: old bests are void
     L.bd = L.d; L.bw = L.w; L.bg = L.g; L.br = L.r;
     L.gd = constrain(fabsf(tuneDose[min((int)L.d + 1, 13)] - tuneDose[(int)L.d]),
@@ -1106,6 +1253,27 @@ static bool tunePlanOne(int lv) {
           // costs two cycles (the bad measurement plus the revert).
           const float uncert = (L.nvalid == 0) ? 2.0f : (L.nvalid == 1 ? 1.4f : 1.0f);
           if (fabsf(move) * uncert > 1.7f * fabsf(e)) continue;
+
+          // The line above bounds the move's EXPECTED size, which is not the
+          // same as bounding its risk. A restructure that trades whitens for
+          // re-darkens predicts ~0 because the terms cancel in the model - but
+          // their ERRORS do not cancel. (w=1,r=1) -> (w=4,r=5) predicts about
+          // -1 unit; at gains known to +/-25% it can land 18 out. That is how
+          // a level sitting at err 0 got thrown to -52 in one cycle, with the
+          // proportional damping raising no objection because 1.7*|e| was ~0.
+          //
+          // So bound the total DRIVE CHANGE an edit makes, scaled by how well
+          // the gains are known. Single-parameter nudges pass; wholesale
+          // restructures do not. TUNE_MAX_RISK is a judgement call, not a
+          // measurement - it is set to admit a modest two-parameter edit and
+          // reject the 147-unit restructures that were wrecking levels.
+          const float risk =
+                fabsf((float)(w - L.w)) * L.gw
+              + fabsf((float)(r - L.r)) * L.gr
+              + fabsf((float)(g - L.g)) * L.gg
+              + fabsf(tuneDose[constrain(d, 1, 13)]
+                    - tuneDose[constrain((int)L.d, 1, 13)]);
+          if (risk * TUNE_GAIN_ERR > tuneMaxRisk()) continue;
           const int changed = (d != L.d) + (w != L.w) + (g != L.g) + (r != L.r);
           // primary: residual error, PLUS what this landing does to the two
           // gaps the level sits between — a move that fixes its own error
@@ -1143,6 +1311,159 @@ static bool tunePlanOne(int lv) {
   return true;
 }
 
+// ============================================================================
+// Rescue a stuck level by spending the WHOLE card on it.
+//
+// The converger edits one level per cycle and measures one outcome, which is
+// a poor deal for a level that will not settle: L10 spent eight cycles
+// limit-cycling -10 -> +8 -> -10 -> +11 -> -11, one scan each.
+//
+// But the card's 16 columns take their train from their OWN level index, so
+// columns can be borrowed as experiment slots - the same trick the gap ladder
+// already uses. Paint fourteen DIFFERENT candidate trains for one level, read
+// all fourteen landings from a single scan, keep the best. Fourteen
+// candidates per ~4 s instead of one per cycle.
+//
+// Columns 0 and 15 stay as the gradient anchors, so slots are 1..14. The
+// reference half of each column is a dither of ITS density and is therefore
+// meaningless here - candidates are judged on absolute gradient-corrected
+// landing against the target level's own reference, exactly as the dose
+// ladder judges doses.
+//
+// Returns true if it improved on the incumbent.
+static bool tuneRescueLevel(int lv) {
+  const float before = fabsf(tl[lv].err);   // incumbent, as the card measures it
+
+  // Candidates are RAW DRIVE SEQUENCES, not (d,w,g,r) tuples.
+  //
+  // The grammar can only stretch runs: more darkens, more whitens, a gap of a
+  // given width. It cannot insert a float mid-train, cannot delete a pass, and
+  // cannot produce the alternating d,w,d,w tails the hand-tuned direct trains
+  // needed. A level the planner has failed to move is exactly where those
+  // shapes are worth trying, so the rescue edits the sequence itself:
+  // substitute a pass, INSERT one (shifting the rest right, dropping the
+  // last), or DELETE one (shifting left, padding with a float).
+  uint8_t cand[15][13];
+  uint8_t cur[13];
+  tuneTrainOf(lv, cur);
+
+  // Slot 1 is the incumbent, so the scan re-measures it under the SAME
+  // conditions as its challengers - that is what lets column bias cancel.
+  //
+  // Seed the RNG from something that varies: Arduino's random() is a
+  // deterministic PRNG, and unseeded it replays one sequence every boot, so
+  // every rescue would test identical candidates.
+  randomSeed(micros() ^ (uint32_t)(lv * 2654435761u));
+
+  memcpy(cand[1], cur, 13);
+  int n = 1;
+  for (int s = 2; s <= 14; s++) {
+    for (int tries = 0; tries < 60; tries++) {
+      uint8_t c[13];
+      memcpy(c, cur, 13);
+      const int edits = 1 + (int)random(0, 2);      // one or two edits
+      for (int e = 0; e < edits; e++) {
+        const int pos = (int)random(0, 13);
+        switch ((int)random(0, 3)) {
+          case 0:                                    // substitute
+            c[pos] = (uint8_t)random(0, 3);
+            break;
+          case 1:                                    // insert, shift right
+            for (int i = 12; i > pos; i--) c[i] = c[i - 1];
+            c[pos] = (uint8_t)random(0, 3);
+            break;
+          default:                                   // delete, shift left
+            for (int i = pos; i < 12; i++) c[i] = c[i + 1];
+            c[12] = 0;
+            break;
+        }
+      }
+      // A train of nothing but floats drives no ink; skip it rather than
+      // waste a slot measuring paper.
+      bool any = false;
+      for (int i = 0; i < 13; i++) if (c[i]) { any = true; break; }
+      if (!any) continue;
+      bool dup = false;
+      for (int j = 1; j <= n && !dup; j++)
+        if (!memcmp(cand[j], c, 13)) dup = true;
+      if (dup) continue;
+      memcpy(cand[++n], c, 13);
+      break;
+    }
+  }
+  Serial.printf("[tune] rescue L%d: %d distinct candidates (raw edits)\n", lv, n);
+
+  uint8_t t[13];
+  for (int s = 1; s <= n; s++)
+    epd.driver().setDecisionTrain((uint8_t)(s << 1), cand[s]);
+  memset(t, 0, 13);                        // column 15: deep anchor
+  for (int i = 0; i < 13; i++) t[i] = 1;
+  epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
+
+  tunePaintMatchCard();
+  tuneClear();
+  tunePaint();
+  float ref[16], nat[16];
+  if (!tuneMeasureCard(ref, nat)) { tuneUploadApplies(); return false; }
+
+  // Judge candidates RELATIVE TO THE INCUMBENT measured in the same frame,
+  // not against an absolute target.
+  //
+  // The first version compared each candidate's landing in column s against
+  // probeRef[lv], a reference measured in column lv. That carries whatever
+  // horizontal variation exists across the card, and on this panel it was
+  // worth ~13 units: the incumbent shape read -12.7 on the normal card and
+  // +0.5 here, so the rescue "improved" a level by adopting its own shape
+  // unchanged. Slot 1 holds the incumbent precisely so that bias can be
+  // cancelled - measure how far each candidate sits FROM the incumbent, and
+  // apply that delta to the incumbent's known error. Column bias affects
+  // both terms and drops out.
+  const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
+  const float incumbent = nat[1] - (g0 + (g15 - g0) * (1 / 15.0f));
+  const float curErr = tl[lv].err;          // incumbent's error, normal card
+
+  int best = -1;
+  float bestErr = fabsf(curErr);
+  for (int s = 2; s <= n; s++) {
+    const float landing = nat[s] - (g0 + (g15 - g0) * (s / 15.0f));
+    const float e = fabsf(curErr + (landing - incumbent));
+    if (e < bestErr) { bestErr = e; best = s; }
+  }
+
+  bool improved = false;
+  if (best > 1 && bestErr < before - 0.5f) {
+    // The level is now rescue-owned: store the sequence literally, because
+    // it may be off-grammar and (d,w,g,r) could not represent it.
+    tl[lv].hasRaw = true;
+    memcpy(tl[lv].raw, cand[best], 13);
+    // Record the new shape as this level's best-known ONLY if it really is
+    // better than what was already banked. Blindly resetting bestAbs threw
+    // away a good shape the converger had found earlier, and the best-shape
+    // assembly at the end then had nothing better to fall back on - which
+    // cost a run more than the failed rescue itself did.
+    // bestAbs/bd..br describe a GRAMMAR shape and cannot hold a raw train, so
+    // invalidate the banked best rather than let the end-of-run assembly
+    // reinstate a shape this level no longer uses.
+    tl[lv].bestAbs = 1e9f;
+    tl[lv].frozen = false;
+    improved = true;
+    Serial.print("[tune] rescue L");
+    Serial.print(lv);
+    Serial.print(": err ");
+    Serial.print(before, 1);
+    Serial.print(" -> ");
+    Serial.print(bestErr, 1);
+    Serial.print("  {");
+    for (int i = 0; i < 13; i++) { Serial.print(cand[best][i]); if (i < 12) Serial.print(","); }
+    Serial.println("}");
+  } else {
+    Serial.printf("[tune] rescue L%d: nothing beat %.1f (best challenger %.1f)\n",
+                  lv, before, bestErr);
+  }
+  tuneUploadApplies();                     // put every level's real train back
+  return improved;
+}
+
 // Pick the worst 1-2 out-of-tolerance levels and edit them.
 static void tunePlanEdits() {
   int order[14];
@@ -1152,11 +1473,15 @@ static void tunePlanEdits() {
     tl[lv].edited = false;
     if (tl[lv].skip) { tl[lv].skip = false; continue; }
     if (tl[lv].frozen) continue;
+    // Rescue-owned levels carry a raw sequence the (d,w,g,r) planner cannot
+    // represent; editing them would silently overwrite it with a grammar
+    // shape. They are the rescue's to change from here.
+    if (tl[lv].hasRaw) continue;
     // Eligible on EITHER count. A level can sit well inside TUNE_TOL and
     // still be the reason the ramp bands, if its neighbour leans the other
     // way — that case was previously invisible to the planner and simply
     // never got edited.
-    if (fabsf(tl[lv].err) > TUNE_TOL || tuneGapErr(lv) > TUNE_GAP_TOL)
+    if (fabsf(tl[lv].err) > tuneTol() || tuneGapErr(lv) > tuneGapTol())
       order[n++] = lv;
   }
   for (int i = 0; i < n; i++)          // worst first, placement + spacing
@@ -1255,12 +1580,17 @@ static void tuneAbsorb(const float err[16]) {
 static void tuneRemoveOf(int lv, uint8_t out[13]) {
   memset(out, 0, 13);
   if (lv == 0) return;
-  const int net = tl[lv].d + tl[lv].r - tl[lv].w;
+  const int net = tuneNetOf(lv);          // from the real train, raw or not
   if (net <= 0) {
     out[0] = 1; out[1] = 2; out[2] = 1; out[3] = 2;   // charge-neutral scrub
     return;
   }
-  int wr = max(net, max(3, tl[lv].d / 2 + 3) + removeExtra[lv]);
+  // Depth proxy: the darken count of the actual train, so a raw shape sizes
+  // its remove sensibly too.
+  int darks = 0;
+  { uint8_t t[13]; tuneTrainOf(lv, t);
+    for (int i = 0; i < 13; i++) if (t[i] == 1) darks++; }
+  int wr = max(net, max(3, darks / 2 + 3) + removeExtra[lv]);
   if (wr > 13) wr = 13;
   int k = wr - net;
   if (k < 0) k = 0;
@@ -1552,11 +1882,52 @@ static bool runSelfTune() {
   if (!tuneRegister()) { tuneResultScreen(false, 0, 0); return false; }
   if (!tuneProbe())    { tuneResultScreen(false, 0, 0); return false; }
 
+  // ---- attempts -----------------------------------------------------------
+  // A run that stalls is not a run that has found the best tables - it is one
+  // that fell into a bad basin. Measured evidence: two runs of the IDENTICAL
+  // binary produced +3.3% and a result bad enough to discard, so the spread
+  // between attempts is as large as the differences between code versions.
+  // With scanning down to ~4 s a whole attempt costs about five minutes, so
+  // the cheapest way to a good table is to take the best of several rather
+  // than to keep tuning the converger.
+  //
+  // Geometry is NOT repeated - the anchor ring is a property of where the
+  // panel sits on the glass, not of the attempt. Everything downstream of it
+  // starts fresh, including the probe, so each attempt gets its own
+  // measurement noise and its own seeds.
   float ref[16], nat[16], err[16];
+  int8_t keepD[16], keepW[16], keepG[16], keepR[16];
+  float  keepScore = 1e9f;
+  bool   haveKeep = false;
+  bool   converged = false;
+  float  mx = 999;
+
+  for (int attempt = 1; attempt <= TUNE_MAX_ATTEMPTS; attempt++) {
+  if (attempt > 1) {
+    // Let the scanner settle before hammering it again - see the constant.
+    // Polled rather than one long delay so 'q' still aborts promptly.
+    Serial.printf("[tune] cooling down %lus before the next attempt "
+                  "(scanner rate limit)\n",
+                  (unsigned long)(TUNE_ATTEMPT_COOLDOWN_MS / 1000));
+    const uint32_t t0 = millis();
+    while (millis() - t0 < TUNE_ATTEMPT_COOLDOWN_MS) {
+      if (tuneAbortRequested()) { Serial.println("[tune] aborted"); break; }
+      delay(100);
+    }
+    if (tuneAbortRequested()) break;
+
+    Serial.printf("[tune] ---- attempt %d of %d (previous did not converge) ----\n",
+                  attempt, TUNE_MAX_ATTEMPTS);
+    tuneSeedShapes();
+    tuneScansPerMeasure = 1;
+    if (!tuneProbe()) break;
+  }
+
   float bestMax = 1e9f;
   int   stall = 0, cyc = 0;
-  bool  converged = false;
-  float mx = 999;
+  int   rescues = 0;
+  converged = false;
+  mx = 999;
 
   for (cyc = 0; cyc < TUNE_MAX_CYCLES; cyc++) {
     if (tuneAbortRequested()) { Serial.println("[tune] aborted"); break; }
@@ -1580,12 +1951,12 @@ static bool runSelfTune() {
     // read buys less than the second, so it is only worth its extra scan
     // right at the end.
     const float close = max(mx, gmx);
-    const int wantScans = (close <= TUNE_AVG_BELOW3) ? 3
-                        : (close <= TUNE_AVG_BELOW)  ? 2 : 1;
+    const int wantScans = (close <= tuneAvgBelow3()) ? 3
+                        : (close <= tuneAvgBelow())  ? 2 : 1;
     if (wantScans > tuneScansPerMeasure) {
       tuneScansPerMeasure = wantScans;
       Serial.printf("[tune] within %.0f - averaging %d scans per measurement now\n",
-                    (wantScans == 3) ? TUNE_AVG_BELOW3 : TUNE_AVG_BELOW,
+                    (wantScans == 3) ? tuneAvgBelow3() : tuneAvgBelow(),
                     tuneScansPerMeasure);
     }
     Serial.printf("[tune] cycle %2d  maxerr %5.1f  gap %4.1f  |", cyc, mx, gmx);
@@ -1605,10 +1976,38 @@ static bool runSelfTune() {
     // steps vary 5x is exactly the "converged, still bands" case that
     // started this. Stall tracking follows the same combined figure, so the
     // loop does not give up while spacing is still improving.
-    if (mx <= TUNE_TOL && gmx <= TUNE_GAP_TOL) { converged = true; break; }
+    if (mx <= tuneTol() && gmx <= tuneGapTol()) { converged = true; break; }
     const float progress = max(mx, gmx);
     if (progress < bestMax - 0.7f) { bestMax = progress; stall = 0; } else stall++;
-    if (stall >= 8) { Serial.println("[tune] stalled"); break; }
+    if (stall >= 8) {
+      // Stalled means the one-edit-per-cycle search has run out of ideas, not
+      // that the level is unimprovable. Before giving up, spend a whole card
+      // on the worst offender - fourteen candidates in one scan beats another
+      // eight cycles of the same nudges. Only once per attempt: if a rescue
+      // does not help, the retry loop's fresh probe is the better lever.
+      // Stalling is the trigger for the SECOND strategy, not the end of the
+      // run: the one-edit-per-cycle planner has run out of ideas, so hand the
+      // worst level to the rescue and carry on. Repeatedly - a run that needs
+      // three levels unstuck should get three rescues, not one and then a
+      // shrug. Bounded so a level that cannot be helped cannot loop forever.
+      if (rescues < TUNE_MAX_RESCUES) {
+        rescues++;
+        int worst = 0;
+        for (int lv = 1; lv <= 14; lv++)
+          if (!worst || tuneBadness(lv) > tuneBadness(worst)) worst = lv;
+        Serial.printf("[tune] stalled - rescue %d/%d on worst level L%d\n",
+                      rescues, TUNE_MAX_RESCUES, worst);
+        stall = 0;
+        bestMax = 1e9f;              // give the planner a clean slate after it
+        if (tuneRescueLevel(worst)) continue;
+        // Nothing beat the incumbent: freeze that level so the next stall
+        // picks a different one rather than retrying the same dead end.
+        tl[worst].frozen = true;
+        continue;
+      }
+      Serial.println("[tune] stalled");
+      break;
+    }
     tunePlanEdits();
   }
 
@@ -1638,6 +2037,54 @@ static bool runSelfTune() {
       for (int lv = 1; lv <= 15; lv++) Serial.printf("%+3.0f", tl[lv].err);
       Serial.println();
       mx = bmx;                       // this is the set we are keeping
+    }
+  }
+
+  // Score this attempt on the WORSE of placement and spacing - the same
+  // figure convergence is gated on, so "best attempt" means the same thing
+  // as "closest to converged" rather than being a second opinion.
+  {
+    const float score = max(mx, tuneGapMax());
+    Serial.printf("[tune] attempt %d scores %.1f (maxerr %.1f, gap %.1f)%s\n",
+                  attempt, score, mx, tuneGapMax(),
+                  (score < keepScore) ? " - best so far" : "");
+    if (score < keepScore) {
+      keepScore = score;
+      haveKeep = true;
+      for (int lv = 1; lv <= 15; lv++) {
+        keepD[lv] = tl[lv].d; keepW[lv] = tl[lv].w;
+        keepG[lv] = tl[lv].g; keepR[lv] = tl[lv].r;
+      }
+    }
+  }
+  if (converged) break;
+  if (tuneAbortRequested()) break;
+  }  // ---- end attempts ----
+
+  // Reinstate the best attempt's shapes. Without this the tables kept would
+  // be whichever attempt happened to run last, which is not the same thing.
+  if (haveKeep) {
+    for (int lv = 1; lv <= 15; lv++) {
+      tl[lv].d = keepD[lv]; tl[lv].w = keepW[lv];
+      tl[lv].g = keepG[lv]; tl[lv].r = keepR[lv];
+    }
+    mx = keepScore;
+    // ref[] and tl[].err are currently whatever the LAST attempt left behind,
+    // which is not necessarily the attempt whose shapes we just reinstated.
+    // That matters: lum[] is built from ref[i] + tl[i].err and is the curve
+    // the image dither quantises against - the one thing that demonstrably
+    // fixed banding. Re-measure so the curve describes the set being kept.
+    tuneUploadApplies();
+    tunePaintMatchCard();
+    tuneClear();
+    tunePaint();
+    if (tuneMeasureCard(ref, nat)) {
+      tuneErrors(ref, nat, err);
+      for (int lv = 1; lv <= 14; lv++) tl[lv].err = err[lv];
+      mx = 0;
+      for (int lv = 1; lv <= 14; lv++) mx = max(mx, fabsf(tl[lv].err));
+      Serial.printf("[tune] kept set re-measured: maxerr %.1f gap %.1f\n",
+                    mx, tuneGapMax());
     }
   }
 
