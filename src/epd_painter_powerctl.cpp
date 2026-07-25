@@ -154,40 +154,6 @@ uint8_t epd_painter_powerctl::readTpsPg() {
   return val;
 }
 
-int epd_painter_powerctl::readTemperatureC() {
-  if (_mtx) xSemaphoreTake(_mtx, portMAX_DELAY);
-  int r = readTemperatureCLocked();
-  if (_mtx) xSemaphoreGive(_mtx);
-  return r;
-}
-
-int epd_painter_powerctl::readTemperatureCLocked() {
-  // The TPS65185 only answers I2C in STANDBY/ACTIVE (WAKEUP high). If it is
-  // asleep, raise WAKEUP for the read and drop it again afterwards.
-  bool wasAwake = (_pca_out[1] >> (PIN_WAKEUP - 8)) & 0x01;
-  if (!wasAwake) {
-    if (!pcaWrite(PIN_WAKEUP, true)) return TEMP_UNAVAILABLE;
-    EPD_DELAY_MS(4);  // datasheet: I2C ready ~1.8ms after WAKEUP
-  }
-
-  int result = TEMP_UNAVAILABLE;
-  uint8_t t1 = 0;
-  if (tpsRead(TPS_TMST1, t1) && tpsWrite(TPS_TMST1, t1 | 0x80)) {  // READ_THERM
-    for (int i = 0; i < 50; ++i) {
-      if (!tpsRead(TPS_TMST1, t1)) break;
-      if (t1 & 0x20) {  // CONV_END
-        uint8_t v = 0;
-        if (tpsRead(TPS_TMST_VALUE, v)) result = (int8_t)v;
-        break;
-      }
-      EPD_DELAY_MS(1);
-    }
-  }
-
-  if (!wasAwake) pcaWrite(PIN_WAKEUP, false);
-  return result;
-}
-
 uint8_t epd_painter_powerctl::readPcaPort(uint8_t port) {
   uint8_t val = 0;
   if (port > 1) return 0;

@@ -101,7 +101,7 @@
             // references (extras/calibration match chart, 2026-07-18): each
             // driven grey matches a 66%/33% black-dot dither of the panel's
             // own black+white to within ~3 scanner grey levels, i.e. the
-            // levels are linear-reflectance spaced and dither()-safe. Each
+            // levels are linear-reflectance spaced. Each
             // darker+lighter row pair is DC balanced (#1s == #2s).
             .normal_lighter = { { 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3 },
                                 { 3, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
@@ -156,7 +156,7 @@
             // NORMAL tables dither-match calibrated (extras/calibration,
             // 2026-07-18): each driven grey matches a 66%/33% black-dot
             // dither of the panel's own black+white to within ~1 scanner
-            // grey level — linear-reflectance spacing, dither()-safe. The
+            // grey level — linear-reflectance spacing. The
             // original hand-tuned rows were already near-perfect; dark grey
             // needed one darkening step (plus the row-1 DC balance fix).
             .normal_lighter = { { 1, 1, 1, 1, 2, 2, 3, 2, 2, 2, 2, 2, 2 },

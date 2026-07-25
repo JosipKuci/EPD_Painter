@@ -105,7 +105,6 @@ Use an explicit preset when you know the target hardware at compile time and wan
 | `computeDirtyRects()` | Return dirty rectangles between current display state and new framebuffer |
 | `fxClear()` | Animated sweep-bar clear effect |
 | `clearBuffers()` | Zero all packed buffers — reset DC-balance baseline before power-off |
-| `dither()` | Floyd-Steinberg dither an 8bpp greyscale buffer in-place to 4-level encoding |
 | `setQuality(q)` | `QUALITY_HIGH` / `QUALITY_NORMAL` / `QUALITY_FAST` — trades refresh speed for black depth |
 
 **Ghosting removal:**

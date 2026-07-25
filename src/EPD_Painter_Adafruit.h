@@ -84,7 +84,6 @@ public:
     int computeDirtyRects(EPD_Painter::Rect *out, int max, int tolerance = 0) const { return _painter.computeDirtyRects(out, max, tolerance); }
     void clearDirtyAreas(int tolerance = 0, EPD_Painter::ClearMode mode = EPD_Painter::ClearMode::SOFT) { _painter.clearDirtyAreas(buffer, tolerance, mode); }
     void fxClear() { _painter.fxClear(); }
-    void dither() { EPD_Painter::dither(buffer, _painter._config.width, _painter._config.height); }
 
     // Pack the current framebuffer to 2bpp. Returns a PSRAM-allocated buffer
     // the caller must free with heap_caps_free(). Returns nullptr on failure.
@@ -95,8 +94,6 @@ public:
     // Quality
     // -------------------------------------------------------------------------
     void setQuality(EPD_Painter::Quality q) { _painter.setQuality(q); }
-
-    int readPanelTemperatureC() { return _painter.readPanelTemperatureC(); }
 
     const EPD_Painter::Config& getConfig() { return _painter.getConfig(); }
     const EPD_Painter::Config* getPreset() const { return _painter.getPreset(); }

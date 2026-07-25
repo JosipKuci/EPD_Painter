@@ -240,21 +240,6 @@ heap_caps_free(packed);
 uint8_t* packed = driver.packBuffer(my_8bpp_buffer);
 ```
 
----
-
-### `dither()`
-
-Floyd-Steinberg error-diffusion dither. Converts an 8bpp greyscale framebuffer (0=black … 255=white) **in-place** to the driver's 4-level encoding (0=white, 1=light grey, 2=dark grey, 3=black).
-
-```cpp
-// Adafruit binding — dithers the internal framebuffer
-display.dither();
-
-// Raw — dither your own buffer
-EPD_Painter::dither(my_buffer, width, height);
-```
-
-Useful when rendering photographic content or smooth gradients into the 4-shade palette.
 
 ---
 
@@ -863,7 +848,6 @@ void loop() {
 | `fxClear()` | yes | Animated sweep-bar clear effect |
 | `clearBuffers()` | no | Zero all packed buffers — reset DC-balance baseline |
 | `packBuffer()` | no | Pack 8bpp framebuffer to 2bpp — for use with custom shutdown images |
-| `dither()` | no | Floyd-Steinberg dither 8bpp greyscale buffer in-place to 4 levels |
 | `setQuality(q)` | — | Set waveform timing for next paint |
 | `setAutoShutdown(bool)` | — | If `false`, `EPD_BootCtl` must be managed manually |
 

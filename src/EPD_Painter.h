@@ -308,17 +308,6 @@ struct PowerCtlConfig {
   void releaseTemplate();
   bool hasTemplate() const { return _has_template; }
 
-  // Panel temperature in °C from the power PMIC's sensor (TPS65185 boards).
-  // Returns EPD_PowerDriver::TEMP_UNAVAILABLE (-1000) if the board has no
-  // sensor or begin() has not run yet.
-  int readPanelTemperatureC();
-
-  // Dither an 8bpp framebuffer (0=black … 255=white) in-place to the driver's
-  // 4-level encoding: 0=white, 1=lt grey, 2=dk grey, 3=black.
-  // Uses Floyd-Steinberg error diffusion. Allocates one row of int16 scratch
-  // (~2 KB for a 960-wide panel) internally.
-  static void dither(uint8_t* fb, uint16_t width, uint16_t height);
-
   // Pack an 8bpp framebuffer to the driver's 2bpp packed format, respecting
   // the current rotation setting. Returns a PSRAM-allocated buffer the caller
   // must free with heap_caps_free(). Returns nullptr on allocation failure.
