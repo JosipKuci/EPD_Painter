@@ -77,6 +77,18 @@ If none is defined, `EPD_PAINTER_PRESET_AUTO` is enabled automatically and `begi
 - **Devices**: 0x51 (PCF8563 RTC), 0x55 (BQ27220 PMU), 0x5D (GT911 touch), 0x6B (BQ25896 charger)
 
 
+## Calibration and the tuning rig
+
+`CALIBRATION.md` covers the self-tuning system, the scanner rig, and the
+hardware gotchas that will otherwise cost hours. **Read it before touching the
+tuner or the scanner.** In particular:
+
+- Flash with `USBMode=hwcdc,CDCOnBoot=cdc` in the FQBN, or the sketch's
+  `Serial` goes to UART pins and you silently get no telemetry
+- Opening the serial port resets the board — attach before a run, never during
+- Go through the eSCL bridge for scans, never `scanimage` directly
+- `converged=1` does not mean a good table; it tests the applies only
+
 ## Technical Reference
 
 `How_It_Works.md` contains deep technical documentation covering e-paper physics, the full pixel pipeline, DMA architecture, sendRow() timing, assembly internals, and memory layout. Read this before modifying core driver code.
