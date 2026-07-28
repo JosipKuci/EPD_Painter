@@ -26,32 +26,7 @@
         .data_pins = { 8, 1, 2, 3, 4, 5, 6, 7 },  // D0–D7
         .i2c = { .sda = 18, .scl = 17, .freq = 100000 },
         .power = { .pca_addr = -1, .tps_addr = -1 },
-        .waveforms = {
-            // FAST pairs dither-match calibrated 22 Jul 2026 (dithertune
-            // --tier F: dark -0.4, light -2.6 in 2 iterations; FAST ghost
-            // residual 13.6 — tier-typical, apps hard-clear).
-            .fast_lighter   = { { 3, 3, 2, 3, 2, 2, 3 },
-                                { 2, 2, 3, 2, 2, 3, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2 } },
-            .fast_darker    = { { 3, 1, 3, 3, 1, 1, 3 },
-                                { 1, 3, 1, 3, 1, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1 } },
-            // Dark-grey pair (row 1) dither-match calibrated 22 Jul 2026
-            // (dithertune h716_normal: dark -1.5, light +0.9, 2 iterations;
-            // ghost residual 7.5 vs the 5-6 floor of the other boards).
-            .normal_lighter = { { 1, 1, 1, 1, 2, 3, 3, 2, 2, 2, 2, 2, 2 },
-                                { 3, 3, 2, 2, 1, 2, 2, 2, 0, 0, 2, 2, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .normal_darker  = { { 1, 2, 1, 3, 1, 3, 1, 2, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 2, 3, 3, 1, 1, 3, 3, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-            .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
-                                { 1, 1, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .high_darker    = { { 1, 3, 1, 1, 1, 2, 2, 2, 1, 2, 2, 1, 1 },
-                                { 1, 1, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-        },
+        .waveforms = EPD_WF_H716,        // LilyGo_H716_Trains.h
         .shift = { .data = 13, .clk = 12, .strobe = 0, .le_time = 0,
                    .driver = EPD_Painter::Shift::H716 },
         // Row-loop cost here is conversion-bound like every board (the
@@ -60,14 +35,38 @@
         // pathological full-screen-inversion case overruns and clamps to
         // the settle floor, same as the M5PaperS3 at its 15 ms period.
         // Trains are calibrated at THESE periods.
+        //
+        // HIGH 24000 -> 20000, measured 28 July 2026 (dose ladder, `D`).
+        // The longer period was inherited from an assumption that a
+        // shift-register board must have slow rows. It does not - the
+        // shifting is bit-banged from assembly and completes in under a
+        // microsecond, and the measured row loops on this board (8.4-13.1 ms)
+        // sit in the same band as the LilyGo GPS's direct-GPIO ones.
+        //
+        // The ladder settles it: 24 / 20 / 18 ms all bottom out at the same
+        // depth (103 of 109 units) with the knee at pass 7, while the first
+        // pass - the finest increment the panel can be asked for - goes
+        // 2.70 / 2.26 / 1.89 level steps. So the longer period bought no
+        // depth and cost 20% in quantisation and 80 ms a frame. 18 ms is
+        // finer still, but its allowance (16.5 ms) is under the worst row
+        // loop photo content has been seen to take here (19.2 ms), where
+        // 20 ms leaves 18.5 ms. Matching NORMAL also lets a HIGH train
+        // inherit a NORMAL one slot-for-slot, since a slot then means the
+        // same dose in both.
         .g16_pass_us_normal = 20000,
-        .g16_pass_us_high   = 24000,
+        .g16_pass_us_high   = 20000,
         .trains = {
-            .g16_apply  = TUNED16_H716_NORMAL,
-            .g16_remove = TUNED16_H716_NORMAL_REMOVE,
-            .dir_normal = DIRECT_H716_NORMAL,
-            .dir_fast   = DIRECT_H716_FAST,
+            .g16_apply       = TUNED16_H716_NORMAL,
+            .g16_remove      = TUNED16_H716_NORMAL_REMOVE,
+            .g16_apply_high  = TUNED16_H716_HIGH,
+            .g16_remove_high = TUNED16_H716_HIGH_REMOVE,
+            .dir_normal      = DIRECT_H716_NORMAL,
+            // No dir_fast: the July FAST directs died with the old FAST
+            // waveform pair — see LilyGo_H716_Trains.h.
         },
+        .level_lum      = LEVEL_LUM_H716_NORMAL,
+        .level_lum_high = LEVEL_LUM_H716_HIGH,
+        .level_lum4     = LEVEL_LUM4_H716_FAST,
     };
 #endif
 
@@ -90,32 +89,7 @@
             .scl = 42,
             .freq = 100000
         },
-        .waveforms = {
-            .fast_lighter   = { { 1, 2, 2, 2, 2, 2, 3 },
-                                { 3, 2, 2, 2, 2, 2, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2 } },
-            .fast_darker    = { { 1, 1, 3, 3, 1, 3, 1 },
-                                { 3, 1, 1, 1, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1 } },
-            // NORMAL tables calibrated optically against in-frame dithered
-            // references (extras/calibration match chart, 2026-07-18): each
-            // driven grey matches a 66%/33% black-dot dither of the panel's
-            // own black+white to within ~3 scanner grey levels, i.e. the
-            // levels are linear-reflectance spaced. Each
-            // darker+lighter row pair is DC balanced (#1s == #2s).
-            .normal_lighter = { { 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3 },
-                                { 3, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .normal_darker  = { { 1, 1, 1, 3, 1, 1, 1, 1, 2, 1, 2, 2, 2 },
-                                { 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-            .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
-                                { 1, 3, 3, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .high_darker    = { { 1, 3, 1, 1, 2, 2, 2, 1, 2, 1, 1, 2, 1 },
-                                { 3, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-        },
+        .waveforms = EPD_WF_M5PAPERS3,   // M5PaperS3_Trains.h
         .trains = {
             .g16_apply  = TUNED16_M5PAPERS3_NORMAL,
             .g16_remove = TUNED16_M5PAPERS3_NORMAL_REMOVE,
@@ -146,32 +120,7 @@
             .pca_addr = 0x20,
             .tps_addr = 0x68,
         },
-        .waveforms = {
-            .fast_lighter   = { { 1, 2, 2, 2, 2, 2, 3 },
-                                { 3, 2, 2, 2, 2, 2, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2 } },
-            .fast_darker    = { { 1, 1, 3, 3, 1, 3, 1 },
-                                { 1, 3, 1, 1, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1 } },
-            // NORMAL tables dither-match calibrated (extras/calibration,
-            // 2026-07-18): each driven grey matches a 66%/33% black-dot
-            // dither of the panel's own black+white to within ~1 scanner
-            // grey level — linear-reflectance spacing. The
-            // original hand-tuned rows were already near-perfect; dark grey
-            // needed one darkening step (plus the row-1 DC balance fix).
-            .normal_lighter = { { 1, 1, 1, 1, 2, 2, 3, 2, 2, 2, 2, 2, 2 },
-                                { 3, 2, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .normal_darker  = { { 1, 2, 1, 1, 1, 3, 1, 2, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 2, 3, 3, 1, 1, 3, 1, 3, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-            .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
-                                { 1, 1, 3, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .high_darker    = { { 1, 3, 1, 1, 1, 2, 2, 2, 1, 2, 2, 1, 1 },
-                                { 1, 1, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-        },
+        .waveforms = EPD_WF_LILYGO_T5S3_GPS,  // LilyGo_T5S3_GPS_Trains.h
         // MEASURED 24 Jul 2026: this panel's re-darkens are weaker than
         // the M5PaperS3's — at the default 15 ms period its 16-grey
         // black floors at ~67 while the glass reaches ~51 at 20 ms (the
@@ -211,26 +160,7 @@
         .data_pins = { 11, 12, 13, 14, 21, 47, 45, 38 },
         .i2c = { .sda = 6, .scl = 5, .freq = 100000 },   // I2C bus exposed for peripherals on H752
         .power = { .pca_addr = -1, .tps_addr = -1 },
-        .waveforms = {
-            .fast_lighter   = { { 1, 3, 2, 3, 2, 2, 3 },
-                                { 3, 2, 3, 2, 2, 3, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2 } },
-            .fast_darker    = { { 3, 1, 3, 2, 1, 1, 3 },
-                                { 1, 3, 1, 3, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1 } },
-            .normal_lighter = { { 1, 1, 1, 1, 2, 3, 3, 2, 2, 2, 2, 2, 2 },
-                                { 2, 1, 2, 2, 1, 2, 2, 2, 0, 0, 2, 2, 3 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .normal_darker  = { { 1, 2, 1, 3, 1, 3, 1, 2, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 2, 2, 3, 1, 1, 3, 2, 1, 1, 3 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-            .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
-                                { 1, 1, 2, 2, 1, 2, 2, 2, 2, 1, 2, 2, 2 },
-                                { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-            .high_darker    = { { 1, 3, 1, 1, 1, 2, 2, 2, 1, 2, 2, 1, 1 },
-                                { 1, 1, 1, 1, 2, 2, 1, 1, 2, 1, 2, 1, 1 },
-                                { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
-        },
+        .waveforms = EPD_WF_H752,        // LilyGo_H752_Trains.h (hand-built)
         .shift = { .data = 2, .clk = 42, .strobe = 1, .le_time = 0 },
         // No .trains: this variant has not had a scanner-tuning session.
         // 16-grey runs on the formula library and direct transitions stay
@@ -268,6 +198,12 @@ inline EPD_Painter::ProbeSettings Probe[] = {
     // Boards with unique I2C addresses go first to minimise failed-probe noise.
     { &EPD_LILYGO_T5_S3_GPS_PRESET,      39, 40, 0x20, false }, // PCA9555  — unique addr
     { &EPD_LILYGO_EPD47_H716_PRESET,     18, 17, 0x5D, false }, // GT911    — unique addr
+    // The GT911's address depends on its INT/RST strapping at power-up and
+    // genuinely moves between 0x5D and 0x14 across warm resets — a board
+    // that probed fine all day can vanish after a reflash. Probe both, and
+    // the BQ25896 charger as a strap-independent backstop.
+    { &EPD_LILYGO_EPD47_H716_PRESET,     18, 17, 0x14, false }, // GT911 alt addr
+    { &EPD_LILYGO_EPD47_H716_PRESET,     18, 17, 0x6B, false }, // BQ25896 charger
     // Boards sharing 0x51 (BM8563 RTC) are distinguished by their SCL/SDA pins.
     { &EPD_LILYGO_T5_S3_H752_PRESET,      6,  5, 0x51, false }, // BM8563 on bus 6/5
     { &EPD_M5PAPER_S3_PRESET,            41, 42, 0x51, false }, // BM8563 on bus 41/42

@@ -30,7 +30,9 @@ There is no Makefile, CMake, or CLI build system — Arduino IDE is the primary 
 - `src/EPD_Painter.S` — **Xtensa assembly**: all pixel packing, waveform conversion, `ink_on`/`ink_off` delta detection, 64-pixel SIMD chunks
 - `src/EPD_Painter_Adafruit.h` — Wrapper exposing Adafruit GFX API; owns 8bpp framebuffer in PSRAM
 - `src/EPD_Painter_LVGL.h` — LVGL v9 integration: flush callback + paint timer
-- `src/EPD_Painter_presets.h` — Board pin/I2C presets (`EPD_PAINTER_PRESET_M5PAPER_S3`, `EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS`, `EPD_PAINTER_PRESET_LILYGO_T5_S3_H752`)
+- `src/EPD_Painter_presets.h` — Board pin/I2C/timing presets (`EPD_PAINTER_PRESET_M5PAPER_S3`, `EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS`, `EPD_PAINTER_PRESET_LILYGO_T5_S3_H752`, `EPD_PAINTER_PRESET_LILYGO_EPD47_H716`)
+- `src/*_Trains.h` — Per-board waveform data, one file per board (`M5PaperS3_Trains.h`, `LilyGo_T5S3_GPS_Trains.h`, `LilyGo_H716_Trains.h`, `LilyGo_H752_Trains.h`): 4-level waveform pairs, 16-grey tables, direct trains. Gathered by `EPD_Painter_trains.h`; the preset points its `Config` at them, so board selection (explicit or auto-probe) selects the trains. Runtime precedence: NVS tuned blob → board train file → formula/two-step fallback
+- `src/EPD_Painter_tuned.h` — Tuned-blob format (build/validate/install; board-keyed, CRC-guarded). `begin()` auto-installs blobs from NVS namespace `epd_painter` (keys `fast`/`normal`/`high`), written by `examples/other/tuneup`
 - `src/epd_painter_powerctl.h/.cpp` — TPS65185 PMIC + PCA9555 IO expander control over I2C or shift register 74HCT4094D
 - `src/build_opt.h` — HAL macros for Arduino vs ESP-IDF compatibility
 

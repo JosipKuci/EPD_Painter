@@ -15,9 +15,14 @@
 #include <soc/lcd_cam_struct.h>
 #include <soc/gdma_struct.h>
 #include "EPD_Painter.h"
+#include "EPD_Painter_tuned.h"
 #include <epd_painter_powerctl.h>
 #include "epd_painter_bootctl.h"
 #include "epd_pin_driver.h"
+
+#ifndef EPD_PAINTER_NO_NVS
+#include <nvs.h>
+#endif
 
 #ifdef ARDUINO
   #include "Wire.h"
@@ -317,15 +322,61 @@ bool EPD_Painter::setGreyLevels(int levels) {
 // setDirectTransitions() — 4-level direct grey-to-grey engine
 // (see DECISION_ENGINE.md "direct grey-to-grey transitions")
 // =============================================================================
+void EPD_Painter::releaseUnusedBuffers() {
+  // 4-level mode: the 16-grey planes and its sweep list are unreachable.
+  // setGreyLevels(16) reallocates them, guarded on packed4_screenbuffer, so
+  // dropping them here is a cost-on-next-enable rather than a one-way door.
+  if (!_grey16 && packed4_screenbuffer) {
+    if (packed4_paintbuffer)  heap_caps_free(packed4_paintbuffer);
+    if (packed4_screenbuffer) heap_caps_free(packed4_screenbuffer);
+    if (dec_spill)            heap_caps_free(dec_spill);
+    if (dec_sweeps16)         heap_caps_free(dec_sweeps16);
+    packed4_paintbuffer  = nullptr;
+    packed4_screenbuffer = nullptr;
+    dec_spill            = nullptr;
+    dec_sweeps16         = nullptr;
+  }
+  // Direct engine off: same argument, and this is the 25.9 KB of internal
+  // RAM the 16-grey sweep list was denying it.
+  if (!_decision_direct && dec_spill_dir) {
+    heap_caps_free(dec_spill_dir);
+    if (dec_sweeps_dir) heap_caps_free(dec_sweeps_dir);
+    dec_spill_dir  = nullptr;
+    dec_sweeps_dir = nullptr;
+  }
+}
+
 bool EPD_Painter::setDirectTransitions(bool on) {
   if (!on) { _decision_direct = false; return true; }
   if (!dec_spill_dir) {
     const size_t plane_bytes = (size_t)_config.width * _config.height / 4;
     dec_spill_dir = (uint8_t *)heap_caps_aligned_alloc(
         16, plane_bytes * (DEC_MAX_SWEEPS_DIR - 2), MALLOC_CAP_SPIRAM);
+    const size_t sweep_bytes =
+        sizeof(LineSweep) * _config.height * DEC_MAX_SWEEPS_DIR;
     dec_sweeps_dir = (LineSweep *)heap_caps_aligned_alloc(
-        4, sizeof(LineSweep) * _config.height * DEC_MAX_SWEEPS_DIR,
-        MALLOC_CAP_INTERNAL);
+        4, sweep_bytes, MALLOC_CAP_INTERNAL);
+    // Internal RAM is preferred — this list is walked per row, per pass — but
+    // it is not worth refusing the whole engine over. A sketch can legitimately
+    // have no internal heap left and still want direct transitions: the tuner
+    // is the case in point, with ~125 KB of its own statics, the 130 KB
+    // fastbuffer and a WiFi stack it cannot drop because it needs the network
+    // to reach the scanner. It measured 18 KB free, fragmented into blocks no
+    // larger than 10 KB, against the 26 KB contiguous wanted here — so the
+    // grey-to-grey phase could not run at all on a board with megabytes of
+    // PSRAM idle.
+    //
+    // PSRAM costs read latency on a sequential walk of 12-byte structs, which
+    // the cache absorbs reasonably well. Slower directs beat no directs.
+    if (!dec_sweeps_dir) {
+      dec_sweeps_dir = (LineSweep *)heap_caps_aligned_alloc(
+          4, sweep_bytes, MALLOC_CAP_SPIRAM);
+      if (dec_sweeps_dir)
+        printf("[EPD_Painter] direct sweeps in PSRAM (internal heap full: "
+               "%u free, %u largest)\n",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
     if (!(dec_spill_dir && dec_sweeps_dir)) {
       printf("[EPD_Painter] direct-transition allocation failed\n");
       if (dec_spill_dir)  heap_caps_free(dec_spill_dir);
@@ -780,12 +831,56 @@ bool EPD_Painter::begin() {
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
 
+  // A board that has tuned itself carries its own measurements; they beat
+  // the per-board train files, which beat the formula fallback. Board
+  // detection has run by now, so the blobs' board keys check against the
+  // real hardware.
+  loadTunedFromNVS();
+
   if (_autoShutdown) {
     EPD_BootCtl boot(*this);
     if (boot.shutdownPending()) boot.shutdown();  // [[noreturn]] on shutdown path
   }
 
   return true;
+}
+
+// =============================================================================
+// loadTunedFromNVS()
+// =============================================================================
+// One blob per quality under the "epd_painter" namespace, written by the
+// tuneup example. install() validates magic, CRC and the board key, so a
+// missing namespace, a corrupt entry or another board's blob all fall
+// through to the compiled-in tables without complaint — an untuned board
+// must pay nothing for this beyond one failed nvs_open().
+int EPD_Painter::loadTunedFromNVS() {
+#ifndef EPD_PAINTER_NO_NVS
+  nvs_handle_t h;
+  // READONLY open fails cleanly both when the namespace has never been
+  // written and when NVS itself is not initialised (plain ESP-IDF apps
+  // that never called nvs_flash_init) — either way there is nothing here.
+  if (nvs_open("epd_painter", NVS_READONLY, &h) != ESP_OK) return 0;
+  static const char *keys[] = { "fast", "normal", "high" };
+  // Static: BLOB_SIZE is ~1.5 KB, and begin() runs on task stacks we do
+  // not size.
+  static uint8_t buf[EPD_PainterTuned::BLOB_SIZE];
+  int n = 0;
+  for (int i = 0; i < 3; i++) {
+    size_t len = sizeof(buf);
+    if (nvs_get_blob(h, keys[i], buf, &len) != ESP_OK) continue;
+    if (EPD_PainterTuned::install(*this, buf, len)) {
+      printf("[EPD_Painter] NVS tuned tables installed: %s\n", keys[i]);
+      n++;
+    } else {
+      printf("[EPD_Painter] NVS blob '%s' rejected (wrong board or corrupt)\n",
+             keys[i]);
+    }
+  }
+  nvs_close(h);
+  return n;
+#else
+  return 0;
+#endif
 }
 
 // =============================================================================

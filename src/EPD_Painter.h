@@ -365,6 +365,17 @@ struct PowerCtlConfig {
   bool begin();
   bool end();
 
+  // Install any scanner-tuned table blobs stored in NVS (namespace
+  // "epd_painter", one blob per quality under keys "fast" / "normal" /
+  // "high" — written by examples/other/tuneup). Called automatically at
+  // the end of begin(), AFTER board detection, so a board tuned once runs
+  // its own measured tables in every sketch; the per-board train files
+  // (see EPD_Painter_trains.h) are the fallback for anything not stored.
+  // Blobs are board-keyed and CRC-guarded, so a flash image copied to a
+  // different board is refused rather than painted. Returns how many sets
+  // installed. Define EPD_PAINTER_NO_NVS to compile the lookup out.
+  int loadTunedFromNVS();
+
   struct Rect {
     int16_t x, y, w, h;
   };
@@ -474,6 +485,50 @@ struct PowerCtlConfig {
     // Tail beyond the quality's length must read as float, or a train
     // left behind by a longer HIGH upload keeps driving under NORMAL.
     for (int p = len; p < DEC_WF_LEN16_MAX; p++) dec_trains16[id][p] = 0;
+  }
+
+  // Give back the buffers the CURRENT configuration does not need.
+  //
+  // setGreyLevels() and setDirectTransitions() allocate and never free, so a
+  // mode toggle costs nothing the second time — which is the right default
+  // when an app is switching per frame, and the wrong one when the next
+  // allocation is the one that matters. 16-grey holds 64.8 KB of sweep list
+  // in INTERNAL RAM (12 bytes x height x 10) and keeps holding it in 4-level
+  // mode where it is dead weight; the direct engine then asks for 25.9 KB of
+  // the same scarce pool and is refused. That is not hypothetical — it is why
+  // the tuner's grey-to-grey phase reported "direct engine would not enable"
+  // on a board with megabytes of PSRAM free.
+  //
+  // Call this when about to need memory more than speed. Everything freed
+  // here is reallocated on demand by the call that needs it.
+  //
+  // NOT SAFE WHILE PAINTING: the paint task reads these. Wait for
+  // paintIdle() first.
+  void releaseUnusedBuffers();
+
+  // How many grey levels are live: 16 after setGreyLevels(16), else 4.
+  //
+  // Anything that RENDERS needs this, because the canvas is level-indexed and
+  // the 4-level packer masks each byte with 0x03 rather than rescaling it. So
+  // a level code authored for 16 greys does not degrade in 4-level mode, it
+  // WRAPS — 4 and 8 and 12 all land on white — which turns a smooth ramp into
+  // a sawtooth and a photograph into a relief carving. Quantise against this
+  // count and Config::levelLum(count), never against a fixed 16.
+  int greyLevels() const { return _grey16 ? 16 : 4; }
+
+  // Read back an installed 16-grey train (same id encoding). The counterpart
+  // to setDecisionTrain, and the reason it exists: a tuner that starts from
+  // scratch throws away everything the board already knows. What is loaded
+  // here is the best current answer — a flash blob if one installed, else the
+  // preset's tuned tables, else the formula — so a search that begins from it
+  // begins at the incumbent rather than at a guess.
+  //
+  // Valid for g16TrainLen() entries; the tail to DEC_WF_LEN16_MAX reads as
+  // float. Null for an out-of-range id, or before setGreyLevels(16) has built
+  // the library at all.
+  const uint8_t *decisionTrain(uint8_t id) const {
+    if (id < 2 || id >= DEC_IDS || !_grey16) return nullptr;
+    return dec_trains16[id];
   }
 
   // Rebuild the 16-grey train library to its defaults: the formula trains
