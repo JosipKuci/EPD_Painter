@@ -207,6 +207,47 @@ per-call, so per-line tables cost nothing).
   trains per board (HIGH first). Gate: optical match of all 16 levels
   against dither references.
 
+  **HIGH given its own trains, 26 July 2026.** Until now HIGH was not a
+  separate calibration at all: `_grey16_build_trains()` had no notion of
+  quality, so HIGH ran NORMAL's 13-pass tables at its own 19 ms period —
+  a 27% longer dose per pass than they were calibrated for — and
+  `setQuality()` did not rebuild the library, so a quality change could
+  not have corrected it even in principle.
+
+  HIGH is now 20 passes (`DEC_WF_LEN16_HIGH`), with its own tables
+  (`TrainTables::g16_apply_high`/`g16_remove_high`), its own measured
+  level curve (`Config::level_lum_high`), and a rebuild on every
+  `setQuality()` while 16-grey is on. Frame cost 20 x 19 ms = 380 ms
+  against NORMAL's 195 ms, which is the trade the mode exists to make.
+
+  Why 20 and not 13-plus-a-bit: the deep end of a pure-darken run
+  saturates around pass 8-10, so passes beyond that buy almost nothing
+  in a straight line — what the extra length actually buys is ROOM for
+  the fine knob, re-darkening after a whiten, which is how every level
+  below the knee gets placed. The claim that black itself goes deeper is
+  left as a measurement rather than an assumption: the tuner's dose
+  ladder now runs to 20 and prints what passes 14..20 bought.
+
+  The ladder needed splitting to get there. A match card has 16 columns
+  and two are gradient anchors, so one card measures at most 14 doses;
+  the 20-pass ladder runs a second card starting at pass 7 and splices on
+  the eight-dose overlap, which also measures the between-frame drift
+  that would otherwise put a step in the curve at the join.
+
+  **Per-quality storage.** One blob per quality rather than one blob, so
+  tuning HIGH cannot cost a working NORMAL set. Also fixed on the way
+  past: `drawGray8()` in 4-level mode was quantising against the first
+  four entries of the 16-grey curve — four near-white values standing in
+  for a full ramp — because 4-level had no curve of its own
+  (`Config::level_lum4` now).
+
+  **FAST tune added** (`tuner_fast.h`): four levels plus the six direct
+  pairs. FAST has no 16-grey mode, and in 4-level mode only three trains
+  are on the glass at once, so it converges by iteration rather than by
+  spending a card on one level's candidates. Its direct phase imposes the
+  DC constraint (net = Q(to) - Q(from)) and searches only the depth of
+  the balancing run. Written, compiles, not yet run on glass.
+
 Erase-then-draw note: a grey-to-grey pixel today needs two paint calls
 (erase, then draw). Under the decision engine its remove-bit and add-bit
 coexist in the todo word; a batcher that places remove-decisions in

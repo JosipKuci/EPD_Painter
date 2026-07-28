@@ -53,7 +53,16 @@ struct Btn { int x, y, w, h; };
 static EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
 static const char *PHOTO_DIR = "/photos";
-static const char *TUNED_PATH = "/epd_g16_tuned.bin";
+// The tuneup example keeps one blob per quality, plus the single-blob
+// path older versions of it wrote. Install whatever this board has: the
+// sets are independent, and install() refuses anything that is not a
+// valid blob for this board, so trying all four is safe.
+static const char *TUNED_PATHS[] = {
+  "/epd_g16_tuned.bin",      // legacy single blob = the NORMAL set
+  "/epd_tuned_fast.bin",
+  "/epd_tuned_normal.bin",
+  "/epd_tuned_high.bin",
+};
 
 // Decode no larger than this before scaling down — keeps the intermediate
 // image inside PSRAM whatever the camera produced.
@@ -496,12 +505,13 @@ void setup() {
   // through the tuneup example. Safe to call on an untuned board.
   bool tuned = false;
   if (LittleFS.begin(true)) {
-    File f = LittleFS.open(TUNED_PATH, "r");
-    if (f) {
+    for (const char *path : TUNED_PATHS) {
+      File f = LittleFS.open(path, "r");
+      if (!f) continue;
       uint8_t buf[EPD_PainterTuned::BLOB_SIZE];
       const size_t n = f.read(buf, sizeof(buf));
       f.close();
-      tuned = EPD_PainterTuned::install(epd.driver(), buf, n);
+      if (EPD_PainterTuned::install(epd.driver(), buf, n)) tuned = true;
     }
   }
   const uint8_t *curve = EPD_PainterTuned::levelLuminance();
