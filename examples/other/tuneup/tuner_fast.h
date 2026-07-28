@@ -35,9 +35,45 @@
 
 #if TUNEUP_HAVE_JPEGDEC
 
-// FAST's pass count is fixed by the engine — Waveforms::fast_* are [3][7]
-// and the pass loop runs exactly 7 for this quality.
-static const int F_LEN = 7;
+// The pass count is fixed by the ENGINE, and differs per quality: FAST runs
+// exactly 7 undelayed passes (Waveforms::fast_* are [3][7]), NORMAL and HIGH
+// run 13 (Waveforms::normal_* / high_*). Everything below is written against
+// fastLen so the same search tunes any of them; declarations use F_LEN_MAX.
+//
+// This is why 4-level NORMAL is a genuinely different tune and not a setting:
+// 13 slots hold shapes 7 cannot, and a train is only valid at the length it
+// was measured at — the same rule that keeps the 16-grey NORMAL and HIGH
+// tables apart.
+static const int F_LEN_MAX = 13;
+static int fastLen = 7;
+static EPD_Painter::Quality fastQuality = EPD_Painter::Quality::QUALITY_FAST;
+
+// Which waveform pair this quality drives. The three are different widths and
+// different arrays, so every read and write of a candidate goes through here
+// rather than naming fast_darker directly.
+static uint8_t *fastDarkerRow(int lv) {
+  auto &wf = epd.driver()._config.waveforms;
+  switch (fastQuality) {
+    case EPD_Painter::Quality::QUALITY_FAST: return wf.fast_darker[lv];
+    case EPD_Painter::Quality::QUALITY_HIGH: return wf.high_darker[lv];
+    default:                                 return wf.normal_darker[lv];
+  }
+}
+static uint8_t *fastLighterRow(int lv) {
+  auto &wf = epd.driver()._config.waveforms;
+  switch (fastQuality) {
+    case EPD_Painter::Quality::QUALITY_FAST: return wf.fast_lighter[lv];
+    case EPD_Painter::Quality::QUALITY_HIGH: return wf.high_lighter[lv];
+    default:                                 return wf.normal_lighter[lv];
+  }
+}
+static const char *fastQualityName() {
+  switch (fastQuality) {
+    case EPD_Painter::Quality::QUALITY_FAST: return "FAST";
+    case EPD_Painter::Quality::QUALITY_HIGH: return "HIGH";
+    default:                                 return "NORMAL";
+  }
+}
 
 // Placement tolerance, as a fraction of a level step. Four levels over the
 // same full scale means a step is five times a 16-grey step, so the same
@@ -56,7 +92,7 @@ struct FastLv {
   int8_t bd, bw, bg, br;
 };
 static FastLv fl[4];
-static float fastDose[F_LEN + 1];   // landing of {1 x n}, n = 1..7
+static float fastDose[F_LEN_MAX + 1];   // landing of {1 x n}, n = 1..7
 static float fastRef[4];            // the four dither references
 static float fastGw = 20.0f, fastGr = 10.0f, fastGg = 0.0f;
 
@@ -133,38 +169,43 @@ static void fastErrors(const float ref[4], const float nat[4], float err[4]) {
 // ---------------------------------------------------------------------------
 // Trains
 // ---------------------------------------------------------------------------
-static void fastTrainOfShape(int d, int w, int gap, int r, uint8_t out[F_LEN]) {
-  memset(out, 0, F_LEN);
+static void fastTrainOfShape(int d, int w, int gap, int r, uint8_t out[F_LEN_MAX]) {
+  memset(out, 0, fastLen);
   int p = 0;
-  for (int i = 0; i < d && p < F_LEN; i++) out[p++] = 1;
-  for (int i = 0; i < w && p < F_LEN; i++) out[p++] = 2;
+  for (int i = 0; i < d && p < fastLen; i++) out[p++] = 1;
+  for (int i = 0; i < w && p < fastLen; i++) out[p++] = 2;
   p += gap;
-  if (p > F_LEN) p = F_LEN;
-  for (int i = 0; i < r && p < F_LEN; i++) out[p++] = 1;
+  if (p > fastLen) p = fastLen;
+  for (int i = 0; i < r && p < fastLen; i++) out[p++] = 1;
 }
 
 // Write straight into the live waveform table: paint() re-reads
 // Config::waveforms every frame, so an upload takes effect on the next one.
-static void fastUploadApply(int lv, const uint8_t t[F_LEN]) {
-  memcpy(epd.driver()._config.waveforms.fast_darker[lv - 1], t, F_LEN);
+static void fastUploadApply(int lv, const uint8_t t[F_LEN_MAX]) {
+  memcpy(fastDarkerRow(lv - 1), t, fastLen);
 }
-static void fastUploadRemove(int lv, const uint8_t t[F_LEN]) {
-  memcpy(epd.driver()._config.waveforms.fast_lighter[lv - 1], t, F_LEN);
+static void fastUploadRemove(int lv, const uint8_t t[F_LEN_MAX]) {
+  memcpy(fastLighterRow(lv - 1), t, fastLen);
 }
 
 static void fastUploadApplies() {
-  uint8_t t[F_LEN];
+  uint8_t t[F_LEN_MAX];
   for (int lv = 1; lv <= 3; lv++) {
     fastTrainOfShape(fl[lv].d, fl[lv].w, fl[lv].g, fl[lv].r, t);
     fastUploadApply(lv, t);
   }
 }
 
+// Net charge of the train a level is ACTUALLY running: darkens minus
+// whitens, counted from the live waveform table rather than from the
+// converger's (d,w,g,r) state. The distinction matters in a directs-only
+// run, where the converger never fills fl[] — counting from fl[] there
+// read every level's charge as zero, so every direct train was built with
+// net = 0 and none of them was DC-matched to the levels on the glass.
 static int fastNetOf(int lv) {
-  uint8_t t[F_LEN];
-  fastTrainOfShape(fl[lv].d, fl[lv].w, fl[lv].g, fl[lv].r, t);
+  const uint8_t *t = fastDarkerRow(lv - 1);
   int net = 0;
-  for (int i = 0; i < F_LEN; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
+  for (int i = 0; i < fastLen; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
   return net;
 }
 
@@ -174,28 +215,28 @@ static int fastNetOf(int lv) {
 // appended (darken, whiten) scrub pair erases nothing, because the darken
 // undoes its whiten's gain almost exactly, whereas deepening first means
 // every whiten then fires from a dark state where it is strong.
-static void fastRemoveOf(int lv, uint8_t out[F_LEN]) {
-  memset(out, 0, F_LEN);
+static void fastRemoveOf(int lv, uint8_t out[F_LEN_MAX]) {
+  memset(out, 0, fastLen);
   const int net = fastNetOf(lv);
   if (net <= 0) { out[0] = 1; out[1] = 2; out[2] = 1; out[3] = 2; return; }
   int wr = max(net, 3);
-  if (wr > F_LEN) wr = F_LEN;
+  if (wr > fastLen) wr = fastLen;
   int k = wr - net;
   if (k < 0) k = 0;
-  while (k + wr > F_LEN && k > 0) { k--; wr--; }
-  if (k + wr > F_LEN) { wr = min(F_LEN, net); k = 0; }
+  while (k + wr > fastLen && k > 0) { k--; wr--; }
+  if (k + wr > fastLen) { wr = min(fastLen, net); k = 0; }
   int p = 0;
   for (int i = 0; i < k; i++) out[p++] = 1;
-  for (int i = 0; i < wr && p < F_LEN; i++) out[p++] = 2;
+  for (int i = 0; i < wr && p < fastLen; i++) out[p++] = 2;
 }
 
 static void fastUploadRemoves() {
-  uint8_t t[F_LEN];
+  uint8_t t[F_LEN_MAX];
   for (int lv = 1; lv <= 3; lv++) { fastRemoveOf(lv, t); fastUploadRemove(lv, t); }
 }
 
 static float fastPredict(int d, int w, int gap, int r) {
-  const int dd = constrain(d, 1, F_LEN);
+  const int dd = constrain(d, 1, fastLen);
   return fastDose[dd] + w * fastGw - r * fastGr + gap * fastGg;
 }
 
@@ -208,19 +249,32 @@ static float fastPredict(int d, int w, int gap, int r) {
 // paints in well under a second.
 // ---------------------------------------------------------------------------
 static bool fastProbe() {
-  Serial.println("[fast] pure-darken ladder (1..7 passes)...");
-  uint8_t anchor[F_LEN];
-  for (int i = 0; i < F_LEN; i++) anchor[i] = 1;
+  // Two doses per card — levels 1 and 2 — with level 3 held at the full-length
+  // darken run as the deep anchor. So the number of cards follows the pass
+  // count: doses 1..fastLen-1 have to be measured, and the last one comes free
+  // from the anchor.
+  //
+  // This was a hardcoded 3, which is exactly right at FAST's 7 passes and
+  // silently wrong at 13: doses 7..12 were never measured, stayed zero, and
+  // zero reads DARKER than any real reading, so the monotone clamp preserved
+  // it and the solver believed a 7-darken run landed at maximum black. It only
+  // escaped notice because the two free levels happen to want light doses.
+  const int ncards = (fastLen - 1 + 1) / 2;   // ceil((fastLen-1)/2)
+  Serial.printf("[fast] pure-darken ladder (1..%d passes, %d cards)...\n",
+                fastLen, ncards);
+  uint8_t anchor[F_LEN_MAX];
+  for (int i = 0; i < fastLen; i++) anchor[i] = 1;
   fastUploadApply(3, anchor);
 
   float ref[4], nat[4];
-  for (int card = 0; card < 3; card++) {
+  for (int card = 0; card < ncards; card++) {
     const int n1 = card * 2 + 1, n2 = card * 2 + 2;
-    uint8_t t[F_LEN];
-    memset(t, 0, F_LEN);
+    if (n1 >= fastLen) break;                 // the anchor covers fastLen
+    uint8_t t[F_LEN_MAX];
+    memset(t, 0, fastLen);
     for (int i = 0; i < n1; i++) t[i] = 1;
     fastUploadApply(1, t);
-    memset(t, 0, F_LEN);
+    memset(t, 0, fastLen);
     for (int i = 0; i < n2; i++) t[i] = 1;
     fastUploadApply(2, t);
 
@@ -233,16 +287,17 @@ static bool fastProbe() {
     // cards land on one scale.
     const float g0 = nat[0] - ref[0], g3 = nat[3] - ref[3];
     fastDose[n1] = nat[1] - (g0 + (g3 - g0) * (1 / 3.0f));
-    fastDose[n2] = nat[2] - (g0 + (g3 - g0) * (2 / 3.0f));
+    if (n2 < fastLen)                          // n2 can overrun on an odd length
+      fastDose[n2] = nat[2] - (g0 + (g3 - g0) * (2 / 3.0f));
     if (card == 0) for (int g = 0; g < 4; g++) fastRef[g] = ref[g];
-    fastDose[F_LEN] = nat[3] - g3;
+    fastDose[fastLen] = nat[3] - g3;
   }
 
-  for (int n = 2; n <= F_LEN; n++)                 // saturation is monotone
+  for (int n = 2; n <= fastLen; n++)                 // saturation is monotone
     if (fastDose[n] > fastDose[n - 1]) fastDose[n] = fastDose[n - 1];
 
   Serial.print("[fast] dose curve: ");
-  for (int n = 1; n <= F_LEN; n++) Serial.printf("%.0f ", fastDose[n]);
+  for (int n = 1; n <= fastLen; n++) Serial.printf("%.0f ", fastDose[n]);
   Serial.printf(" (step %.1f units)\n", fastStep());
   return true;
 }
@@ -259,13 +314,13 @@ static bool fastProbe() {
 // ---------------------------------------------------------------------------
 static bool fastProbeGap() {
   Serial.println("[fast] float-gap ladder...");
-  uint8_t anchor[F_LEN];
-  for (int i = 0; i < F_LEN; i++) anchor[i] = 1;
+  uint8_t anchor[F_LEN_MAX];
+  for (int i = 0; i < fastLen; i++) anchor[i] = 1;
   fastUploadApply(3, anchor);
 
   float land[4] = { 0, 0, 0, 0 };   // landing at gap = 0..3
   float ref[4], nat[4];
-  uint8_t t[F_LEN];
+  uint8_t t[F_LEN_MAX];
   for (int card = 0; card < 2; card++) {
     for (int slot = 0; slot < 2; slot++) {
       const int gap = card * 2 + slot;
@@ -315,13 +370,13 @@ static void fastSolveShape(int lv) {
   const FastLv &L = fl[lv];
   int bd = 1, bw = 0, bg = 0, br = 0;
   float best = 1e9f;
-  for (int d = 1; d <= F_LEN; d++)
+  for (int d = 1; d <= fastLen; d++)
     for (int w = 0; w <= 3; w++)
       for (int gap = 0; gap <= 2; gap++)
         for (int r = 0; r <= 3; r++) {
           if (w == 0 && (r || gap)) continue;      // re-darkens need a whiten first
           if (r == 0 && gap) continue;             // a gap only weakens re-darkens
-          if (d + w + gap + r > F_LEN) continue;
+          if (d + w + gap + r > fastLen) continue;
           const float land = fastPredict(d, w, gap, r) + L.bias;
           const float score = fabsf(land - fastRef[lv]) + 0.10f * (d + w + gap + r);
           if (score < best) { best = score; bd = d; bw = w; bg = gap; br = r; }
@@ -332,7 +387,7 @@ static void fastSolveShape(int lv) {
 static bool fastConverge(float *worstOut) {
   // Level 3 is the anchor: every pass a darken, which is the darkest FAST
   // can render. Nothing to search.
-  fl[3] = {}; fl[3].d = F_LEN; fl[3].bestAbs = 1e9f;
+  fl[3] = {}; fl[3].d = fastLen; fl[3].bestAbs = 1e9f;
   for (int lv = 1; lv <= 2; lv++) {
     fl[lv] = {};
     fl[lv].bestAbs = 1e9f;
@@ -479,8 +534,6 @@ static void tuneDriveDirCard() {
   tunePaintDirCard(DIR_FROM);
   epd.paint();
   tuneWaitIdle();
-  epd.paint();
-  tuneWaitIdle();
   delay(300);
   tunePaintDirCard(DIR_TO);
   epd.paint();
@@ -516,27 +569,47 @@ static int fastQ(int lv) { return lv == 0 ? 0 : fastNetOf(lv); }
 
 // Build a direct train for `net` charge with a balancing run of `depth`.
 // Returns its length.
+//
+// Both directions use the overshoot-and-return shape the July hand-tuned
+// tables all share: drive PAST the target toward the far rail, then pull
+// back onto it, with `depth` sizing the return leg.
+//
+//   darkening  depth whitens, then depth + net darkens
+//   lightening depth + |net| whitens, then depth re-darkens
+//
+// The lightening branch was originally the darkening branch mirrored —
+// darkens first, then whitens — and that family cannot land at all on
+// this glass: its shallowest member is |net| pure whitens, which for
+// 3->2 (net -9) already overshoots the target by ~60 scan units, and
+// every deeper member lands lighter still. Whitens-first puts the
+// landing leg on the re-darkens instead, which fire from a light state
+// at full fresh-response strength and walk the pixel DOWN to the target.
 static int fastDirTrain(int net, int depth, uint8_t *out, int cap) {
   memset(out, 0, cap);
   int p = 0;
   if (net >= 0) {
-    // Darkening: whitens first, then depth + net darkens.
     for (int i = 0; i < depth && p < cap; i++) out[p++] = 2;
     for (int i = 0; i < depth + net && p < cap; i++) out[p++] = 1;
   } else {
-    // Lightening: darkens first, then depth + |net| whitens. Deepening
-    // toward saturation is optically cheap, and every whiten then fires
-    // from a dark state where it is strong — at zero extra net charge.
+    for (int i = 0; i < depth - net && p < cap; i++) out[p++] = 2;   // depth + |net|
     for (int i = 0; i < depth && p < cap; i++) out[p++] = 1;
-    for (int i = 0; i < depth - net && p < cap; i++) out[p++] = 2;
   }
   return p;
 }
 
 static bool fastTuneDirect(uint8_t dirtbl[4][4][EPD_Painter::DEC_WF_LEN_DIR],
                            uint16_t *loadedOut, float *worstOut) {
+  // The direct engine wants 25.9 KB of INTERNAL RAM for its sweep list, and
+  // 16-grey is still holding 64.8 KB of the same pool for a mode we are not
+  // in — enough, with the fastbuffer and the WiFi stack, to make this fail on
+  // a board with megabytes of PSRAM spare. Hand it back first.
+  while (!epd.driver().paintIdle()) delay(10);
+  epd.driver().releaseUnusedBuffers();
   if (!epd.driver().setDirectTransitions(true)) {
-    Serial.println("[fast] direct engine would not enable");
+    Serial.printf("[fast] direct engine would not enable (internal heap free: "
+                  "%u bytes, largest block %u)\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return false;
   }
   // Start every pair from the two-step so an un-converged pair is left
@@ -567,32 +640,41 @@ static bool fastTuneDirect(uint8_t dirtbl[4][4][EPD_Painter::DEC_WF_LEN_DIR],
     tuneDriveDirCard();
     if (!tuneMeasureDirCard(land)) return false;
 
-    // Horizontal trend from the three reference columns (0, 3, 6), which
-    // all hold the same thing their group's transitions are aiming at.
-    // Fit a line through them and judge every column against the fit.
-    float sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (int k = 0; k < 3; k++) {
-      const float x = (float)(k * 3), y = land[k * 3];
-      sx += x; sy += y; sxx += x * x; sxy += x * y;
-    }
-    const float den = 3 * sxx - sx * sx;
-    const float slope = fabsf(den) < 1e-3f ? 0.0f : (3 * sxy - sx * sy) / den;
-
+    // NO horizontal-trend correction. There used to be one: a line fitted
+    // through the three reference columns (0, 3, 6) and subtracted as if the
+    // difference between them were a gradient across the glass.
+    //
+    // They are not the same thing measured three times — they are levels 1, 2
+    // and 3, which is the whole point of the card (DIR_TO is 1,1,1 2,2,2
+    // 3,3,3). Measured, they read 132 / 85 / 53, so the "gradient" fitted the
+    // LEVEL RAMP and came out at -13.2 units per column. Subtracting that
+    // inside each group moved every target by up to 26 units and invented most
+    // of the error the search was chasing: column 5 read 155 against a real
+    // target of 85, a +70 miss, but was scored -26 further out at +96.
+    //
+    // A real gradient exists here (~2.4 units left-to-right after row_extra was
+    // tuned) but it is a third of the tolerance and cannot be recovered from
+    // three points that differ by design. Judge each column against its own
+    // group's reference.
     worst = 0;
     for (int i = 0; i < 9; i++) {
       const int f = DIR_FROM[i];
       if (!f) continue;
-      // The group's reference, carried to this column by the fitted trend.
-      const float target = land[(i / 3) * 3] + slope * (i - (i / 3) * 3);
+      // This group's own reference column: the level every transition in the
+      // group is trying to land on.
+      const float target = land[(i / 3) * 3];
       const float err = land[i] - target;
       if (fabsf(err) < bestErr[i]) { bestErr[i] = fabsf(err); bestDepth[i] = depth[i]; }
       if (fabsf(err) > worst) worst = fabsf(err);
-      // One step of a damped 1-D search. A deeper balancing run drives the
-      // pixel further toward its rail before the payload, so it lands
-      // darker for a darkening pair and lighter for a lightening one.
+      // One step of a damped 1-D search. With the overshoot-and-return
+      // shape, depth sizes the returning drive for BOTH directions: a
+      // darkening pair's extra darkens and a lightening pair's re-darkens
+      // both push the landing darker. A HIGHER scan value is LIGHTER, so
+      // err > 0 means this column landed too light and wants more depth —
+      // one sign, no branches.
       const int net = fastQ(DIR_TO[i]) - fastQ(f);
       const float step = err / max(2.0f, 0.35f * fastStep());
-      int d = depth[i] + (int)lroundf((net >= 0 ? -step : step));
+      const int d = depth[i] + (int)lroundf(step);
       depth[i] = constrain(d, 0, (cap - abs(net)) / 2);
     }
     Serial.printf("[fast] dir cycle %2d  worst %.1f / tol %.1f  depths", cyc, worst, fastTol());
@@ -718,12 +800,33 @@ static bool fastResultsScreen(float worst, float erase, int npairs, float worstD
 // ---------------------------------------------------------------------------
 // The whole FAST run.
 // ---------------------------------------------------------------------------
-static bool runSelfTuneFast() {
+// The 4-level tune, at any quality that has a 4-level mode.
+//
+//   q         FAST (7 passes) or NORMAL (13). HIGH works and is untested.
+//   doLevels  tune the four levels themselves.
+//   doDirect  tune the six grey-to-grey trains for THIS quality (dir_fast at
+//             FAST, dir_normal at NORMAL) — separable because the directs are
+//             the half that goes stale on their own, and re-measuring six
+//             transitions is a fraction of the cost of a full level tune.
+//
+// Levels-only leaves the existing directs alone; directs-only measures against
+// whatever levels are currently loaded, which is what you want when the levels
+// are already good.
+static bool runSelfTuneFast(EPD_Painter::Quality q = EPD_Painter::Quality::QUALITY_FAST,
+                            bool doLevels = true, bool doDirect = true) {
   if (!scPort) {
     Serial.println("[fast] no scanner selected");
     return false;
   }
-  Serial.println("[fast] ===== SELF-TUNE START (FAST) =====");
+  if (!doLevels && !doDirect) return false;
+
+  fastQuality = q;
+  fastLen = (q == EPD_Painter::Quality::QUALITY_FAST) ? 7 : 13;
+
+  Serial.printf("[fast] ===== SELF-TUNE START (4-grey %s, %d passes: %s%s%s) =====\n",
+                fastQualityName(), fastLen,
+                doLevels ? "levels" : "", (doLevels && doDirect) ? " + " : "",
+                doDirect ? "directs" : "");
   Serial.println("[fast] send q to abort between cycles");
 
   // 16-grey must go before the quality can: the driver refuses FAST while
@@ -732,7 +835,7 @@ static bool runSelfTuneFast() {
     Serial.println("[fast] setGreyLevels(4) refused");
     return false;
   }
-  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+  epd.setQuality(q);
 
   // The registration patterns (tuneFill(15), the quadrant, the ring) are
   // written for 16-grey and paint level 15. That is not a bug here: the
@@ -745,15 +848,46 @@ static bool runSelfTuneFast() {
   // restore what the board had.
   EPD_Painter::Waveforms saved = epd.driver()._config.waveforms;
 
-  if (!tuneRegister())  { tuneResultScreen(false, 0, 0); return false; }
-  if (!fastProbe())     { tuneResultScreen(false, 0, 0); return false; }
-  if (!fastProbeGap())  Serial.println("[fast] gap probe failed - assuming neutral");
+  // Any failure from here out must put the board back the way it runs:
+  // the probes overwrite live trains, and everything after this function
+  // (the menu, the demo scan, the 16-grey tunes) expects 16 greys at
+  // NORMAL. Early returns used to leave the board in 4-level FAST with
+  // half-clobbered waveforms.
+  auto bail = [&]() -> bool {
+    epd.driver()._config.waveforms = saved;
+    epd.driver().reloadDirectTrains();
+    epd.driver().setDirectTransitions(false);
+    epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+    epd.driver().setGreyLevels(16);
+    tuneResultScreen(false, 0, 0);
+    return false;
+  };
 
-  float worst4 = 999;
-  if (!fastConverge(&worst4)) { tuneResultScreen(false, 0, 0); return false; }
+  if (!tuneRegister()) return bail();
 
-  Serial.println("[fast] deriving charge-matched removes...");
-  float erase = fastVerifyRemoves();
+  float worst4 = 999, erase = 0;
+  if (doLevels) {
+    if (!fastProbe())     return bail();
+    if (!fastProbeGap())  Serial.println("[fast] gap probe failed - assuming neutral");
+
+    if (!fastConverge(&worst4)) return bail();
+
+    Serial.println("[fast] deriving charge-matched removes...");
+    erase = fastVerifyRemoves();
+  } else {
+    // Directs-only: the trains already on the board are the reference, and
+    // fastNetOf() reads them from the live table. The probe is still needed
+    // for fastRef (the dither references every tolerance scales from) —
+    // but it overwrites the loaded level trains with its ladder, so put
+    // them back the moment it is done. Without this the direct search
+    // measured against ladder leftovers, and the export below printed
+    // those leftovers as if they were the tuned levels.
+    Serial.printf("[fast] levels not tuned this run - measuring directs "
+                  "against the %s trains already loaded\n", fastQualityName());
+    if (!fastProbe()) return bail();
+    epd.driver()._config.waveforms = saved;
+    worst4 = 0;      // levels untouched this run; nothing to report on them
+  }
 
   // The measured landing of the four levels, normalised so 0 is paper and
   // 3 is the deepest FAST black. drawGray8() quantises against this — and
@@ -761,33 +895,40 @@ static bool runSelfTuneFast() {
   // against the first four entries of the 16-grey curve, which describe
   // four near-white levels rather than a full ramp.
   uint8_t lum4[4];
-  {
+  if (doLevels) {
     float meas[4];
     for (int g = 0; g < 4; g++) meas[g] = fastRef[g] + (g >= 1 && g <= 2 ? fl[g].err : 0.0f);
-    const float white = meas[0], black = meas[3];
-    const float span = (white - black) > 1.0f ? (white - black) : 1.0f;
-    Serial.print("[fast] measured level curve (255=white): ");
-    for (int g = 0; g < 4; g++) {
-      lum4[g] = (uint8_t)constrain((int)lroundf(255.0f * (meas[g] - black) / span), 0, 255);
-      Serial.printf("%d ", lum4[g]);
-    }
-    Serial.println();
+    tuneCurveFrom(meas, 4, lum4, "fast");
+  } else {
+    // Levels were not measured this run, so keep the curve the board
+    // already has — rebuilding one from the converger's stale state would
+    // overwrite a measured curve with garbage on save.
+    const uint8_t *cur = epd.driver()._config.levelLum(4);
+    if (cur) memcpy(lum4, cur, 4);
+    else for (int g = 0; g < 4; g++) lum4[g] = (uint8_t)(255 - g * 85);
   }
 
-  Serial.println("[fast] tuning grey-to-grey direct trains...");
   static uint8_t dirtbl[4][4][EPD_Painter::DEC_WF_LEN_DIR];
   memset(dirtbl, 0, sizeof(dirtbl));
   uint16_t loaded = 0;
   float worstDir = 999;
-  if (!fastTuneDirect(dirtbl, &loaded, &worstDir))
-    Serial.println("[fast] direct phase failed - keeping the two-step for every pair");
+  if (doDirect) {
+    Serial.printf("[fast] tuning grey-to-grey direct trains (%s)...\n",
+                  fastQualityName());
+    if (!fastTuneDirect(dirtbl, &loaded, &worstDir))
+      Serial.println("[fast] direct phase failed - keeping the two-step for every pair");
+  }
 
   int npairs = 0;
   for (int b = 0; b < 16; b++) if (loaded & (1u << b)) npairs++;
 
-  uint8_t dark[3][7], light[3][7];
-  memcpy(dark,  epd.driver()._config.waveforms.fast_darker,  sizeof(dark));
-  memcpy(light, epd.driver()._config.waveforms.fast_lighter, sizeof(light));
+  uint8_t dark[3][F_LEN_MAX], light[3][F_LEN_MAX];
+  memset(dark, 0, sizeof(dark));
+  memset(light, 0, sizeof(light));
+  for (int lv = 0; lv < 3; lv++) {
+    memcpy(dark[lv],  fastDarkerRow(lv),  fastLen);
+    memcpy(light[lv], fastLighterRow(lv), fastLen);
+  }
 
   Serial.printf("[fast] levels worst %.1f, erase %.1f, %d of 6 direct pairs tuned\n",
                 worst4, erase < 0 ? 0.0f : erase, npairs);
@@ -795,8 +936,16 @@ static bool runSelfTuneFast() {
   const bool keep = fastResultsScreen(worst4, erase < 0 ? 0.0f : erase,
                                      npairs, worstDir);
   bool saved_ok = false, loaded_ok = false;
-  if (keep) {
-    saved_ok = tunedSaveFast(epd.driver(), dark, light, dirtbl, loaded, lum4);
+  if (keep && fastQuality == EPD_Painter::Quality::QUALITY_FAST) {
+    // The blob's waveform slots are FAST-width. Narrowing here rather than
+    // widening the record is deliberate: at FAST there is nothing past pass 7
+    // to lose, and bumping the format would oblige every reader to migrate.
+    uint8_t dark7[3][7], light7[3][7];
+    for (int lv = 0; lv < 3; lv++) {
+      memcpy(dark7[lv],  dark[lv],  7);
+      memcpy(light7[lv], light[lv], 7);
+    }
+    saved_ok = tunedSaveFast(epd.driver(), dark7, light7, dirtbl, loaded, lum4);
     loaded_ok = saved_ok && tunedLoad(epd.driver(), SET_FAST);
     Serial.printf("[fast] flash save %s, reload %s\n",
                   saved_ok ? "OK" : "FAILED", loaded_ok ? "OK" : "FAILED");
@@ -807,6 +956,59 @@ static bool runSelfTuneFast() {
                       loaded_ok ? "Your panel now uses these FAST trains"
                                 : "Nothing was stored",
                       loaded_ok ? sub : "Could not write to storage.");
+  } else if (keep) {
+    // 4-grey NORMAL/HIGH have nowhere to go in flash yet: the blob's waveform
+    // slots are 7 wide and these are 13. Rather than bump the format on the
+    // way past — and risk the read-modify-write clobbering the 16-grey tables
+    // that share this quality's blob — the tables are printed as source. They
+    // stay live in RAM for this session so the result can be looked at, and
+    // become permanent by being pasted into the preset.
+    Serial.printf("\n// ---- 4-grey %s, measured on this panel ----\n",
+                  fastQualityName());
+    Serial.printf("// levels worst %.1f units, erase %.1f, %d of 6 direct pairs.\n",
+                  worst4, erase < 0 ? 0.0f : erase, npairs);
+    Serial.printf("// %d passes. Valid only at this quality's pass timing.\n", fastLen);
+    const char *dn = fastQuality == EPD_Painter::Quality::QUALITY_HIGH ? "high" : "normal";
+    Serial.printf(".%s_darker = {\n", dn);
+    for (int lv = 0; lv < 3; lv++) {
+      Serial.print("    {");
+      for (int p = 0; p < fastLen; p++)
+        Serial.printf("%d%s", dark[lv][p], p < fastLen - 1 ? "," : "");
+      Serial.println("},");
+    }
+    Serial.println("},");
+    Serial.printf(".%s_lighter = {\n", dn);
+    for (int lv = 0; lv < 3; lv++) {
+      Serial.print("    {");
+      for (int p = 0; p < fastLen; p++)
+        Serial.printf("%d%s", light[lv][p], p < fastLen - 1 ? "," : "");
+      Serial.println("},");
+    }
+    Serial.println("},");
+    if (doDirect) {
+      Serial.printf("inline const uint8_t DIRECT_%s_%s[4][4][%d] = {\n",
+                    TUNED_EXPORT_PREFIX, fastQuality == EPD_Painter::Quality::QUALITY_HIGH
+                                             ? "HIGH" : "NORMAL",
+                    EPD_Painter::DEC_WF_LEN_DIR);
+      for (int f = 0; f < 4; f++) {
+        Serial.println("  {");
+        for (int t = 0; t < 4; t++) {
+          const bool got = (loaded >> ((f << 2) | t)) & 1;
+          Serial.print("    {");
+          for (int q2 = 0; q2 < EPD_Painter::DEC_WF_LEN_DIR; q2++)
+            Serial.printf("%d%s", got ? dirtbl[f][t][q2] : 0,
+                          q2 < EPD_Painter::DEC_WF_LEN_DIR - 1 ? "," : "");
+          Serial.printf("},%s\n", got ? "" : "   // not converged - absent");
+        }
+        Serial.println("  },");
+      }
+      Serial.println("};");
+    }
+    Serial.println("// ---- end ----\n");
+    saved_ok = loaded_ok = true;   // nothing to write; the tables are live
+    tuneConfirmScreen("MEASURED",
+                      "Tables printed to the serial log",
+                      "4-grey NORMAL has no flash slot yet - paste into the preset.");
   } else {
     epd.driver()._config.waveforms = saved;
     epd.driver().reloadDirectTrains();

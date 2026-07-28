@@ -58,3 +58,5 @@ dkms.conf
 
 build/
 .venv/
+# Local WiFi credentials for the tuneup rig — never commit these.
+wifi_secrets.h

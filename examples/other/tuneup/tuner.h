@@ -23,30 +23,15 @@
 // the panel can disturb, and every later measurement uses the anchors —
 // including scans of an all-white panel, which no threshold could find.
 //
-// Train parameterisation: (d, w, g, r) — d darkens, w whitens, g float
-// gaps, r re-darkens. This grammar spans the shipped hand-tuned tables:
-// coarse steps from d (saturating), big lifts from w (15-30 units), fine
-// steps from r (re-darkens fire in small fresh-response steps), and the
-// float gap as the fine-trim knob (a gap before the re-darkens weakens
-// them — the hand-tuner's trick). How much it weakens them is measured,
-// not assumed: see tuneProbeGap(). A float pass buys a whole pass period
-// of field-free settle, so the old guess of "a few units" was never safe.
-//
-// Convergence policy (lessons from two failed shapes before this one):
-// - The panel DRIFTS under heavy exercise (the deep end wanders tens of
-//   units over a session) and edits couple globally through the frame
-//   composition. So: at most TWO levels are edited per cycle, and the
-//   UNEDITED levels' error changes form a drift baseline (median) that is
-//   subtracted before an edit's observed effect updates its gain estimate.
-// - Damped proportional edits: every candidate has an expected move in
-//   scanner units (seeded from a measured pure-dose ladder, updated
-//   online); an edit is only taken when its expected move ≤ 1.7x the
-//   error, and overshoots that flip the sign revert and shrink the gain.
-// - Two warm-up cycles run before any editing so the first attributions
-//   aren't polluted by the panel settling into exercise equilibrium.
-// - Deep levels are seeded by INVERTING the dose ladder against the
-//   measured dither references — at a new pass period the old shapes can
-//   be tens of units off, far outside the damped edits' reach.
+// WHAT LIVES HERE is the shared rig, not a search: registration and
+// geometry, the match card, scanning and measurement, charge-matched
+// removes and their optical verification, the results/confirm screens,
+// and the dose-ladder sweep. The 16-grey search itself is the
+// evolutionary tuner in tuner_evo.h; the 4-level and direct-train search
+// is tuner_fast.h. (A damped (d,w,g,r) grammar converger used to live
+// here too — gain learning, rescues, the lot. The evolutionary tuner beat
+// it by an order of magnitude on every panel tried and it was removed;
+// it is in git history if ever wanted again.)
 //
 // Charge-matched removes are derived analytically from the tuned applies
 // (k darkens then k + net whitens; wr − k = net keeps the DC ledger
@@ -74,96 +59,14 @@
 // than a saturating 13-pass run can reach.
 //
 // Everything in this file that emits, parses, uploads, mutates or stores
-// a train reads tuneLen. It is set once, by runSelfTune16(), from the
-// quality being tuned, and must agree with the driver's g16TrainLen() —
+// a train reads tuneLen. Each entry point sets it from the quality being
+// tuned, and it must agree with the driver's g16TrainLen() —
 // a train tuned at one length is meaningless at the other.
 // ============================================================================
 static const int TUNE_LEN_MAX = EPD_Painter::DEC_WF_LEN16_MAX;   // 20
 static int tuneLen = EPD_Painter::DEC_WF_LEN16;                  // 13 until set
 
 // ---- knobs -----------------------------------------------------------------
-// ---- tolerances are fractions of a LEVEL STEP, not scanner units ---------
-//
-// Every threshold below used to be an absolute number of scanner units,
-// which silently hard-coded one panel and one scanner. Full scale here is
-// ~97 units across 15 intervals, so a level step is ~6.5 - but a different
-// panel, a different scan resolution or a different lamp changes that
-// number, and every absolute tolerance then means something different.
-// A tolerance of "4.5 units" is meaningless; "0.7 of a level step" is not.
-//
-// tuneStep() below measures the step from the panel's own dither reference
-// ladder, so these fractions carry to any device. The values are the ratios
-// the absolute constants happened to have on the LilyGo H716, so behaviour
-// on that board is unchanged.
-static const float TUNE_TOL_STEPS       = 0.70f;  // was 4.5 units
-// Looser than the placement tolerance, and that is not a concession - it is
-// arithmetic. A gap is the DIFFERENCE of two neighbouring errors, so it runs
-// larger than either and can reach twice the worst placement error. Gating
-// gaps tighter than placement therefore makes convergence unreachable by
-// construction, which is exactly what happened: every run on 0.54 ended
-// converged=0, stalling on gap while maxerr was already inside tolerance
-// (attempt 1 finished at maxerr 5.6, gap 6.9 - a ratio of 1.2, which is
-// typical). 1.1 still catches the cases that actually band, like the 39/2
-// step pair one run produced, without demanding the impossible.
-static const float TUNE_GAP_TOL_STEPS   = 1.10f;  // was 0.54, unreachable
-static const float TUNE_AVG_BELOW_STEPS = 1.23f;  // was 8.0
-static const float TUNE_AVG_BELOW3_STEPS= 0.77f;  // was 5.0
-static const float TUNE_PROBE_COST_STEPS= 0.92f;  // was 6.0
-static const float TUNE_MAX_RISK_STEPS  = 1.85f;  // was 12.0
-static const float TUNE_GAP_NOISE_STEPS = 0.23f;  // was 1.5 units/pass
-static const int   TUNE_MAX_CYCLES = 34;
-// Whole-run retries when an attempt stalls instead of converging. Restarting
-// from a fresh probe escapes a bad basin; three attempts at ~5 min is a
-// better use of the time than a fourth parameter tweak.
-static const int   TUNE_MAX_ATTEMPTS = 1;
-// How many stuck levels one run may hand to the rescue. Each costs one extra
-// scan and targets a different level, so this is "how many stubborn levels do
-// we expect", not a retry count.
-static const int   TUNE_MAX_RESCUES  = 6;
-// Quiet time between attempts, for the SCANNER's benefit rather than the
-// panel's. Flatbeds wedge on sustained scan RATE, not scan length, and
-// back-to-back attempts turn a 6-minute run into 20 minutes of continuous
-// scanning - which is exactly what stopped the Canon answering mid-run and
-// cost a power cycle. A minute of silence is cheap against a five-minute
-// wedge plus hands on the hardware.
-static const uint32_t TUNE_ATTEMPT_COOLDOWN_MS = 60000;
-static const int   TUNE_WARMUP     = 2;
-// Levels the seeder reserves as whiten-only shapes (whitens, no re-darkens)
-// so tuneCalibrateGains() always has something to solve the whiten gain
-// from. Two, not one, so the figure is an average rather than a single read.
-static const int   TUNE_WHITEN_PROBES = 2;
-// Ceiling on what reserving a probe may cost that level's seed fit (see
-// TUNE_PROBE_COST_STEPS). Beyond ~one level step the trade is bad: an
-// inaccurate gw is recoverable by the online learner, a level seeded a whole
-// step off target is a visible band.
-//
-// How wrong the measured gains are assumed to be. Three runs put this
-// panel's whiten gain at 15.1 / 20.2 / 24.4, so +/-25% is if anything
-// generous. This one is genuinely dimensionless and needs no scaling.
-static const float TUNE_GAIN_ERR   = 0.25f;
-// Banding is a function of the SPACING between adjacent levels, not of any
-// one level's absolute placement, and until these the converger only ever
-// looked at the latter. On a ~97-unit full scale a level step is ~6.5
-// units, so a level could sit 4.5 out — 69% of a step — and still pass:
-// two neighbours in tolerance with opposite signs halve or double a gap.
-// TUNE_GAP_TOL bounds |err[i] - err[i+1]| directly; TUNE_SPACING_W is how
-// hard the planner weighs it against absolute placement when choosing a
-// shape.
-//
-// The tolerance is set from what it does to the ramp, not by feel. One
-// scanner unit is ~2.62 lum units here and a level step is 6.49 units
-// (17 lum), so a gap error G leaves steps of 17 +/- 2.62G:
-//     G = 5.0 -> steps 4..30 lum   (run 2 measured G = 4.0 and banded)
-//     G = 2.5 -> steps 10..24      usable
-//     G = 1.5 -> steps 13..21      good
-// 5.0 would have passed run 2 unchanged, which is the false pass that
-// started this. 2.5 was then tried and proved unreachable - three runs sat
-// at gapMax 4 against 1-2 units of scan noise, so convergence never fired
-// and every result came from the best-shape fallback. A gate that cannot
-// pass is not a gate, and the planner spends its edits chasing it. 0.54 of
-// a step (3.5 units here) is the compromise: measurably tighter than the 4
-// the panel keeps landing on, still above the noise floor.
-static const float TUNE_SPACING_W  = 0.5f;   // per neighbour, in the plan score
 // Must be a resolution the scanner natively offers — eSCL servers snap an
 // unsupported value to the nearest supported one, silently returning a
 // much smaller image than asked for (100 dpi became 75 on the Canon,
@@ -196,27 +99,16 @@ static const int RING_T = 40;  // ring thickness in panel px
 // ---- per-level tuner state -------------------------------------------------
 struct TuneLv {
   int8_t d, w, g, r;           // train = d darkens, w whitens, g gaps, r re-darkens
-  int8_t pd, pw, pg, pr;       // the shape before the last edit (for revert)
-  float  err, lastErr;
+  float  err;
   float  gd, gw, gr, gg;       // expected gain per step (scanner units)
-  int8_t lastOp;               // 1=d 2=w 3=r 4=gap, 0 = not edited / multi-param
-  int8_t lastSteps;
-  float  predMove;             // the move the planner expected from that edit
-  uint8_t nvalid;              // gain observations made (0 = model still a guess)
-  bool   edited;               // an edit was applied last cycle
-  bool   skip;                 // cool-down after a bad edit
   float  bestAbs;              // smallest |err| ever measured for this level …
   int8_t bd, bw, bg, br;       // … and the shape that achieved it
-  // A level the rescue has taken over. Its train is stored literally rather
-  // than as (d,w,g,r), because the rescue mutates the DRIVE SEQUENCE - it can
-  // insert and delete passes, producing shapes the grammar cannot express
-  // (leading floats, alternating d,w,d,w tails - exactly the shapes the
-  // hand-tuned direct trains needed). Once a level goes raw the planner
-  // leaves it alone; only a later rescue may change it again.
+  // A train stored literally rather than as (d,w,g,r) — the evolutionary
+  // tuner's shapes are raw drive sequences the grammar cannot express
+  // (leading floats, alternating d,w,d,w tails). When hasRaw is set the
+  // grammar fields are ignored by tuneTrainOf().
   bool    hasRaw;
   uint8_t raw[TUNE_LEN_MAX];
-  uint8_t bad;                 // edits that made this level worse
-  bool   frozen;               // give up editing: keep the best-known shape
 };
 static TuneLv tl[16];
 // Landing of {1 x n} (monotone-enforced), n = 1..tuneLen. Indexed by pass
@@ -230,20 +122,14 @@ static float probeRef[16];     // dither reference means from the probe frame
 // tuner portable - a different panel, scan resolution or lamp changes the
 // absolute numbers, and every threshold scales with it automatically.
 //
-// probeRef[] is filled by tuneProbe(), so these are only valid after it has
-// run; every caller is downstream of that. The floor stops a failed or
-// nonsense probe turning into absurdly tight tolerances.
+// probeRef[] is filled by whatever measured the card last (the dose sweep,
+// or the evolutionary tuner every generation), so this is only valid once a
+// card has been read. The floor stops a failed or nonsense read turning
+// into absurdly tight tolerances.
 static float tuneStep() {
   const float span = probeRef[0] - probeRef[15];
   return (span > 20.0f ? span : 20.0f) / 15.0f;
 }
-static float tuneTol()        { return TUNE_TOL_STEPS        * tuneStep(); }
-static float tuneGapTol()     { return TUNE_GAP_TOL_STEPS    * tuneStep(); }
-static float tuneAvgBelow()   { return TUNE_AVG_BELOW_STEPS  * tuneStep(); }
-static float tuneAvgBelow3()  { return TUNE_AVG_BELOW3_STEPS * tuneStep(); }
-static float tuneProbeMaxCost(){ return TUNE_PROBE_COST_STEPS * tuneStep(); }
-static float tuneMaxRisk()    { return TUNE_MAX_RISK_STEPS   * tuneStep(); }
-static float tuneGapNoise()   { return TUNE_GAP_NOISE_STEPS  * tuneStep(); }
 static int   removeExtra[16];
 
 // ============================================================================
@@ -409,15 +295,21 @@ static void tuneConfirmScreen(const char *title, const char *l2, const char *l3)
     // levels can be compared directly against a white surround. Judging
     // level separation through a photograph confuses the panel's level
     // spacing with the dither; this shows the levels themselves.
+    // However many levels are actually live. Drawing sixteen patches while
+    // the panel is in 4-level mode does not show sixteen greys — the packer
+    // masks each value with 0x03, so it shows the same four greys four times
+    // over, which reads as a fault in the tune rather than in the card.
+    const int nlv = epd.driver().greyLevels();
+    const int perRow = nlv > 8 ? 8 : nlv;
     const int pw = 30, ph = 30, gap = 3, gx = cardX + 12, gy = cardY + 66;
     epd.setTextSize(1);
     epd.setCursor(gx, gy - 12);
-    epd.print("16 LEVELS");
-    for (int i = 0; i < 16; i++) {
-      const int cx = gx + (i % 8) * (pw + gap);
-      const int cy = gy + (i / 8) * (ph + gap);
+    epd.printf("%d LEVELS", nlv);
+    for (int i = 0; i < nlv; i++) {
+      const int cx = gx + (i % perRow) * (pw + gap);
+      const int cy = gy + (i / perRow) * (ph + gap);
       epd.fillRect(cx, cy, pw, ph, (uint8_t)i);
-      epd.drawRect(cx, cy, pw, ph, 15);
+      epd.drawRect(cx, cy, pw, ph, (uint8_t)(nlv - 1));
     }
 
     epd.fillRect(ok.x, ok.y, ok.w, ok.h, 0);
@@ -510,9 +402,16 @@ static bool tuneScan(float x0, float y0, float w, float h) {
     // They may have picked the board up to read that, so the panel's
     // position on the glass is no longer trustworthy: re-register, then
     // repaint whatever we were measuring and start the scan over.
+    //
+    // tuneRegister() reassigns tuneRepaint to its own patterns as it works
+    // (black, quadrant, ring), so the caller's repaint must be saved around
+    // it — without this, recovery repainted the RING and the retried scan
+    // measured ring data as card data.
+    void (*measuring)() = tuneRepaint;
     tuneRecovering = true;
     const bool ok = tuneRegister();
     tuneRecovering = false;
+    tuneRepaint = measuring;
     if (!ok) { Serial.println("[tune] could not re-register after recovery"); return false; }
     if (tuneRepaint) tuneRepaint();
     attempt = -1;                          // fresh retry budget
@@ -654,8 +553,12 @@ static void tuneColSpan(int i, int *px0, int *px1) {
 
 // Measure the match card via the anchors: per-column means of the ref and
 // native bands. No thresholding — geometry is fixed.
+//
+// Does NOT set tuneRepaint: the caller knows which card is on the glass
+// (this same geometry reads the 16-grey card AND the 4-level one), so the
+// caller sets the recovery repaint. Setting it here once repainted a
+// 16-grey card into a 4-level measurement after a scanner wedge.
 static bool tuneMeasureCardOnce(float ref[16], float nat[16]) {
-  tuneRepaint = tuneRepaintCard;
   if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
   const int H = epd.height();
   for (int i = 0; i < 16; i++) {
@@ -694,18 +597,27 @@ static bool tuneMeasureCard(float ref[16], float nat[16]) {
   return true;
 }
 
-static void tuneErrors(const float ref[16], const float nat[16], float err[16]) {
-  const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
-  for (int i = 0; i < 16; i++)
-    err[i] = (nat[i] - ref[i]) - (g0 + (g15 - g0) * (i / 15.0f));
-}
-
 static void tunePrintBands(const char *tag, const float ref[16], const float nat[16]) {
   Serial.printf("[tune] %s ref:", tag);
   for (int i = 0; i < 16; i++) Serial.printf(" %3.0f", ref[i]);
   Serial.println();
   Serial.printf("[tune] %s nat:", tag);
   for (int i = 0; i < 16; i++) Serial.printf(" %3.0f", nat[i]);
+  Serial.println();
+}
+
+// Normalise measured landings into the stored level curve: 255 = the
+// measured white (meas[0]), 0 = the deepest measured black (meas[n-1]).
+// This is the curve image dithering quantises against, so it is derived
+// the same way everywhere it is built.
+static void tuneCurveFrom(const float *meas, int n, uint8_t *lum, const char *tag) {
+  const float white = meas[0], black = meas[n - 1];
+  const float span = (white - black) > 1.0f ? (white - black) : 1.0f;
+  Serial.printf("[%s] measured level curve (255=white): ", tag);
+  for (int i = 0; i < n; i++) {
+    lum[i] = (uint8_t)constrain((int)lroundf(255.0f * (meas[i] - black) / span), 0, 255);
+    Serial.printf("%d ", lum[i]);
+  }
   Serial.println();
 }
 
@@ -893,176 +805,21 @@ static void tuneSeedShapes() {
     tl[lv].bd = tl[lv].d; tl[lv].bw = tl[lv].w;
     tl[lv].bg = tl[lv].g; tl[lv].br = tl[lv].r;
   }
-  // Black anchor: a provisional full-length darken run. tuneProbe()
-  // replaces it with the measured saturation knee as soon as the ladder
-  // has run — driving black for twenty passes when it stops responding at
-  // ten wastes ten passes AND forces a twenty-whiten remove to balance
-  // them, doubling the charge cycled through every black paint/erase for
-  // no extra depth at all.
+  // Black anchor: a full-length darken run — the deep anchor the dose
+  // sweep's gradient correction needs.
   tl[15].d = tuneLen; tl[15].w = 0; tl[15].g = 0; tl[15].r = 0;
   memset(removeExtra, 0, sizeof(removeExtra));
 }
 
-// Predicted landing of a shape, in scanner units: the measured pure-dose
-// curve for its darken run, plus each whiten's lift, minus each
-// re-darken's bite, plus the float gap's weakening of those re-darkens.
-// Gains start as rough constants and are learned per level as the
-// converger observes what its edits actually do.
-static float tunePredict(const TuneLv &L, int d, int w, int g, int r) {
-  const int dd = constrain(d, 1, tuneLen);
-  return tuneDose[dd] + w * L.gw - r * L.gr + g * L.gg;
-}
-
-static void tuneSeedModel(bool reserveProbes);  // defined below, used by the probe
 
 // ============================================================================
-// Float-gap gain probe.
-//
-// The gap was the one knob whose gain was never measured. tuneCalibrateGains()
-// solves the whiten and re-darken gains from the first card, but gg kept its
-// seeded guess of 5, and the online learner can only correct it AFTER a gap
-// edit has been taken — which the planner will not do while it believes the
-// move is worth a handful of units. Chicken-and-egg: the knob has to be
-// selected once before its gain can be learned, and its gain is what decides
-// whether it gets selected.
-//
-// That guess was never safe. A float pass is not a brief pause: at the
-// 16-grey pass period it hands the pixel a WHOLE period of field-free settle
-// on top of the inter-pass floor (4 ms of a 15-20 ms period), so the true
-// effect can be several times the assumed 5. And the error runs in the
-// direction that keeps the knob from ever being tried — the same failure
-// tuneCalibrateGains() warns about for the whiten ("being 40% wrong about a
-// 30-unit move is what produced the overshoot cascades").
-//
-// Method mirrors the dose ladder: hold (d, w, r) fixed per base, sweep g
-// across the columns, read every column from one scan — so all cells share
-// one panel state and drift is common-mode. Three bases, because one base is
-// one panel region's opinion. The gap needs w > 0 and r > 0 to be legal, and
-// every cell here fits d+w+g+r <= 13 at g = 3, so the bases stay legal at
-// either train length and the measured gain is comparable between them.
-// ============================================================================
-static bool tuneProbeGap() {
-  Serial.println("[tune] float-gap ladder...");
-  struct Base { uint8_t d, w, r; };
-  static const Base bases[] = { { 4, 1, 1 }, { 6, 1, 2 }, { 3, 2, 1 } };
-  const int NB = (int)(sizeof(bases) / sizeof(bases[0]));
-  const int NG = 4;                       // g = 0..3, the planner's own range
-
-  uint8_t t[TUNE_LEN_MAX];
-  int col[NB][NG];
-  int c = 1;
-  for (int b = 0; b < NB; b++)
-    for (int g = 0; g < NG; g++, c++) {
-      col[b][g] = (c <= 14) ? c : 0;
-      if (!col[b][g]) continue;
-      // The emitter itself, so the cells cannot drift out of step with
-      // the shapes the planner will actually build.
-      tuneTrainOfShape(bases[b].d, bases[b].w, g, bases[b].r, t);
-      epd.driver().setDecisionTrain((uint8_t)(col[b][g] << 1), t);
-    }
-
-  // Column 15 is the deep anchor the gradient correction needs; any columns
-  // the bases did not claim get the same drive so they cannot mislead a scan.
-  memset(t, 0, sizeof(t));
-  for (int i = 0; i < tuneLen; i++) t[i] = 1;
-  epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
-  for (int lv = c; lv <= 14; lv++)
-    epd.driver().setDecisionTrain((uint8_t)(lv << 1), t);
-
-  tunePaintMatchCard();
-  tuneClear();
-  tunePaint();
-  // A slope over four columns is more noise-sensitive than an absolute
-  // landing, and this one number seeds every shape the converger starts
-  // from — so take the averaged read here regardless of how far out the
-  // run currently is. Costs one extra scan, no repaint, no extra drive.
-  const int savedScans = tuneScansPerMeasure;
-  tuneScansPerMeasure = max(savedScans, 2);
-  float ref[16], nat[16];
-  const bool measured = tuneMeasureCard(ref, nat);
-  tuneScansPerMeasure = savedScans;
-  if (!measured) return false;
-  tunePrintBands("gap", ref, nat);
-
-  const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
-  float land[16];
-  for (int i = 0; i < 16; i++)
-    land[i] = nat[i] - (g0 + (g15 - g0) * (i / 15.0f));
-
-  // Least-squares slope of landing vs gap length, per base.
-  float slope[NB];
-  float sum = 0;
-  int n = 0;
-  for (int b = 0; b < NB; b++) {
-    float sx = 0, sy = 0, sxx = 0, sxy = 0;
-    int m = 0;
-    for (int g = 0; g < NG; g++) {
-      if (!col[b][g]) continue;
-      const float y = land[col[b][g]];
-      sx += g; sy += y; sxx += (float)g * g; sxy += g * y; m++;
-    }
-    if (m < 2) continue;
-    const float den = m * sxx - sx * sx;
-    if (fabsf(den) < 1e-3f) continue;
-    slope[n] = (m * sxy - sx * sy) / den;
-    Serial.printf("[tune] gap base (%d,%d,%d): %+.1f units/pass\n",
-                  bases[b].d, bases[b].w, bases[b].r, slope[n]);
-    sum += slope[n]; n++;
-  }
-  if (!n) return false;
-
-  // A null result must set the gain to ZERO, not to some floor. Clamping a
-  // measured nothing up to a minimum makes the gap the FINEST knob in the
-  // set, and the seeder then reaches for it to mop up every last unit of
-  // quantisation residual — buying predicted units the panel never delivers,
-  // at one pass of train length each.
-  //
-  // Two tests, because a mean on its own hides disagreement. The effect must
-  // clear scan noise AND the bases must agree on its sign. (First LilyGo run
-  // at the 20 ms NORMAL period: -2.1, +0.2, +0.3 — mean -0.5 with the sign
-  // split three ways, and the old floor turned that into a confident 1.0.)
-  //
-  // Zero is final for the run: tunePredict() then values a gap at nothing,
-  // the length penalty makes it strictly negative-scoring, so tunePlanOne()
-  // never takes one and the online learner never gets a lastOp==4 to revise.
-  // That is the intent — the probe decides, not a guess that outlived it.
-  const float mean = sum / n;
-  bool agree = true;
-  for (int i = 1; i < n; i++)
-    if ((slope[i] < 0) != (slope[0] < 0)) agree = false;
-
-  float gg = 0.0f;
-  if (fabsf(mean) >= tuneGapNoise() && agree)
-    gg = constrain(fabsf(mean), tuneGapNoise(), 40.0f);
-
-  for (int lv = 1; lv <= 15; lv++) tl[lv].gg = gg;
-
-  if (gg == 0.0f) {
-    Serial.printf("[tune] gap gain: none detected (mean %+.1f, bases %s) — "
-                  "treating float gaps as neutral\n",
-                  mean, agree ? "agree" : "disagree on sign");
-  } else {
-    // tunePredict() carries the gap as +g*gg and the online learner stores
-    // magnitudes, so a genuine DARKENING gap cannot be represented — say so
-    // rather than bury the sign in the fabsf() below.
-    if (mean < 0)
-      Serial.println("[tune] WARNING: gap darkened the landing consistently — "
-                     "tunePredict's +g*gg sign is wrong for this panel");
-    Serial.printf("[tune] measured gap gain: %.1f units/pass (%d bases, "
-                  "5.0 was assumed)\n", gg, n);
-  }
-  return true;
-}
-
-// ============================================================================
-// Pure-dose ladder probe. Column c runs {1 x n}; measured against the same
-// frame's dither refs. Yields the dose curve (monotone-enforced), the
-// per-level d-gains, and dose-inversion seeds for the deep levels.
+// Pure-dose ladder. Column c runs {1 x n}; measured against the same
+// frame's dither refs. Yields the dose curve (monotone-enforced).
 //
 // The card has 16 columns and two of them (0 and 15) are the gradient
 // anchors, so ONE card can measure at most 14 doses. That was never a
 // constraint at 13 passes. At HIGH's 20 it is, so the ladder runs a second
-// card and splices — see tuneProbe().
+// card and splices — see runDoseSweep().
 // ============================================================================
 
 // One card of the ladder: column c (1..14) drives {1 x (base + c - 1)},
@@ -1084,6 +841,7 @@ static bool tuneDoseCard(int base, float *land, float *refOut) {
   tunePaintMatchCard();
   tuneClear();
   tunePaint();
+  tuneRepaint = tuneRepaintCard;
   float ref[16], nat[16];
   if (!tuneMeasureCard(ref, nat)) return false;
   tunePrintBands(base == 1 ? "probe" : "probe2", ref, nat);
@@ -1094,662 +852,6 @@ static bool tuneDoseCard(int base, float *land, float *refOut) {
   return true;
 }
 
-static bool tuneProbe() {
-  Serial.printf("[tune] pure-dose ladder (1..%d passes)...\n", tuneLen);
-  float landA[16], landB[16], ref[16];
-  if (!tuneDoseCard(1, landA, ref)) return false;
-  for (int i = 0; i < 16; i++) probeRef[i] = ref[i];
-  for (int n = 1; n <= min(14, tuneLen); n++) tuneDose[n] = landA[n];
-
-  // Second card for the deep end. It starts at whatever pass count makes
-  // its 14 columns finish at tuneLen, so the two cards overlap by eight
-  // doses. The overlap is not redundancy — the panel drifts between
-  // frames, and the mean difference across those eight is exactly that
-  // drift, which puts card B on card A's scale before the splice. Without
-  // it the curve would step at the join and the seeder would read the
-  // step as a response.
-  if (tuneLen > 14) {
-    const int base = tuneLen - 13;              // covers base .. tuneLen
-    if (!tuneDoseCard(base, landB, nullptr)) return false;
-    float sum = 0;
-    int nov = 0;
-    for (int c = 1; c <= 14; c++) {
-      const int pass = base + c - 1;
-      if (pass <= 14) { sum += tuneDose[pass] - landB[c]; nov++; }
-    }
-    const float shift = nov ? sum / nov : 0.0f;
-    Serial.printf("[tune] deep card %d..%d passes, overlap shift %+.1f (n=%d)\n",
-                  base, tuneLen, shift, nov);
-    for (int c = 1; c <= 14; c++) {
-      const int pass = base + c - 1;
-      if (pass > 14 && pass <= tuneLen) tuneDose[pass] = landB[c] + shift;
-    }
-  }
-
-  for (int n = 2; n <= tuneLen; n++)                // saturation is monotone;
-    if (tuneDose[n] > tuneDose[n - 1]) tuneDose[n] = tuneDose[n - 1];  // clamp noise
-
-  Serial.print("[tune] dose curve: ");
-  for (int n = 1; n <= tuneLen; n++) Serial.printf("%.0f ", tuneDose[n]);
-  Serial.println();
-  // What the extra passes actually bought, stated plainly. If this is
-  // near zero the panel has saturated and HIGH's depth is coming from
-  // the grammar, not from the longer darken run - worth knowing before
-  // reading anything else into the run.
-  if (tuneLen > 13)
-    Serial.printf("[tune] passes 14..%d bought %.1f units of extra depth\n",
-                  tuneLen, tuneDose[13] - tuneDose[tuneLen]);
-
-  // ---- saturation knee: where darkening stops paying ----------------------
-  //
-  // Read from the FIRST card only (passes 1..14). That card is one frame
-  // with one gradient correction, so its deltas are trustworthy; the deep
-  // card's values are spliced across a join and every sweep taken so far
-  // shows a 3-4 unit step landing exactly ON that join, which is the
-  // signature of residual horizontal bias rather than of depth. Past the
-  // knee the curve is therefore held flat, so the planner cannot spend
-  // train length buying depth the splice only appeared to offer.
-  {
-    const float thr = 0.15f * tuneStep();
-    const int last = min(14, tuneLen);
-    int knee = last;
-    for (int n = 1; n < last; n++)
-      if (tuneDose[n] - tuneDose[n + 1] < thr) { knee = n; break; }
-    // One pass of margin: the panel drifts over a session and the anchor
-    // must stay saturated at the end of the run, not just at the start.
-    const int anchor = min(tuneLen, knee + 1);
-    Serial.printf("[tune] saturation knee at pass %d -> black anchored at %d "
-                  "darkens (was %d); %d slots freed\n",
-                  knee, anchor, tuneLen, tuneLen - anchor);
-    if (anchor < tuneLen) {
-      Serial.printf("[tune] holding the dose curve flat past pass %d "
-                    "(was reading %.0f at %d)\n",
-                    anchor, tuneDose[tuneLen], tuneLen);
-      for (int n = anchor; n <= tuneLen; n++) tuneDose[n] = tuneDose[anchor];
-    }
-    tl[15].d = (int8_t)anchor; tl[15].w = 0; tl[15].g = 0; tl[15].r = 0;
-  }
-
-  // d-gain per level from the local slope at its seed depth
-  for (int lv = 1; lv <= 14; lv++) {
-    const int d = constrain((int)tl[lv].d, 1, tuneLen - 1);
-    tl[lv].gd = constrain(fabsf(tuneDose[d + 1] - tuneDose[d]), 2.0f, 30.0f);
-  }
-
-  // Model seeding for the mid/deep levels: at a new pass period the
-  // shipped shapes can be tens of units off, so build each level from the
-  // measured curve instead. Pure darkens alone cannot do it — the curve
-  // saturates, and several levels fall inside one darken step — so the
-  // search runs over the whole (d,w,g,r) grammar. Levels 1-5 keep their
-  // shipped shapes: they encode ghost behaviour, and the converger can
-  // now refine them with the same grammar.
-  //
-  // The gap gain must be real BEFORE seeding: tuneSeedModel() scores shapes
-  // through tunePredict(), so a wrong gg biases which shapes it picks, not
-  // just how the converger edits them later.
-  if (!tuneProbeGap())
-    Serial.println("[tune] gap probe failed - keeping the assumed gap gain");
-  tuneSeedModel(true);   // pre-calibration: guarantee the whiten probes
-  return true;
-}
-
-// Best shape for one level under the model. whitenOnly restricts the search
-// to shapes carrying whitens and NO re-darkens — the structure
-// tuneCalibrateGains() needs in order to solve the whiten gain at all.
-// Returns the score of the shape it chose, so callers can compare what a
-// restriction costs against the free choice.
-static float tuneSolveShape(const TuneLv &L, float target, bool whitenOnly,
-                            int *od, int *ow, int *og, int *orr) {
-  const int w0 = whitenOnly ? 1 : 0;
-  const int rmax = whitenOnly ? 0 : 5;
-  int bd = 1, bw = w0, bg = 0, br = 0;
-  float best = 1e9f;
-  for (int d = 1; d <= tuneLen; d++)
-    for (int w = w0; w <= 4; w++)
-      for (int g = 0; g <= 3; g++)
-        for (int r = 0; r <= rmax; r++) {
-          if (w == 0 && (r || g)) continue;   // re-darkens need a whiten first
-          if (r == 0 && g) continue;          // a gap only weakens re-darkens
-          if (d + w + g + r > tuneLen) continue;
-          const float score = fabsf(tunePredict(L, d, w, g, r) - target)
-                            + 0.10f * (d + w + g + r);
-          if (score < best) { best = score; bd = d; bw = w; bg = g; br = r; }
-        }
-  *od = bd; *ow = bw; *og = bg; *orr = br;
-  return best;
-}
-
-// Build each level's shape from the model. Deliberately varies the
-// structure across levels (some with re-darkens, some without) — that
-// spread is what lets tuneCalibrateGains() solve for the real gains from
-// the first measurement. reserveProbes ENFORCES that spread; pass it only
-// for the seeding that precedes calibration, since afterwards the gains are
-// already solved and the constraint would cost seed fit for nothing.
-static void tuneSeedModel(bool reserveProbes) {
-  int sd[15], sw[15], sg[15], sr[15];   // the shape each level will take
-  int qd[15], qw[15];                   // its best whiten-only alternative
-  float cost[15];                       // what taking that alternative costs
-
-  for (int lv = 6; lv <= 14; lv++) {
-    int d, w, g, r;
-    const float free_score =
-        tuneSolveShape(tl[lv], probeRef[lv], false, &d, &w, &g, &r);
-    sd[lv] = d; sw[lv] = w; sg[lv] = g; sr[lv] = r;
-
-    int ad, aw, ag, ar;
-    const float probe_score =
-        tuneSolveShape(tl[lv], probeRef[lv], true, &ad, &aw, &ag, &ar);
-    qd[lv] = ad; qw[lv] = aw;
-    cost[lv] = probe_score - free_score;
-  }
-
-  // tuneCalibrateGains() can solve the whiten gain ONLY from levels carrying
-  // whitens and no re-darkens. The comment above always claimed that spread
-  // was deliberate, but nothing enforced it — and on the first LilyGo run
-  // with the gap knob switched off, every level 6-14 seeded with re-darkens.
-  // n came out 0 and gw fell back to a constant measured on a DIFFERENT
-  // board, roughly twice this panel's own figure, on the largest knob the
-  // planner owns. Convert wherever the constraint costs least, and report
-  // both the level and the price so a bad trade is visible rather than silent.
-  if (reserveProbes) {
-    int have = 0;
-    for (int lv = 6; lv <= 14; lv++)
-      if (sw[lv] > 0 && sr[lv] == 0) have++;
-
-    while (have < TUNE_WHITEN_PROBES) {
-      int pick = -1;
-      for (int lv = 6; lv <= 14; lv++) {
-        if (sw[lv] > 0 && sr[lv] == 0) continue;   // already serves as a probe
-        if (qw[lv] <= 0) continue;                 // no legal whiten-only shape
-        if (pick < 0 || cost[lv] < cost[pick]) pick = lv;
-      }
-      if (pick < 0) break;
-      // A probe is only worth having if the constraint is CHEAP. Without this
-      // ceiling the loop took the least-bad candidate no matter how bad it
-      // was: tuneSolveShape(whitenOnly) always returns something, so a level
-      // whose best whiten-only shape lands a whole level-step off target got
-      // reserved anyway. That is how one run put L6 twenty-two units light and
-      // came out coarser than the built-in tables - one wrecked level ruining
-      // an otherwise tight set. Falling back to the constant gw costs accuracy
-      // in one gain estimate; wrecking a level costs a visible band.
-      if (cost[pick] > tuneProbeMaxCost()) {
-        Serial.printf("[tune] no cheap whiten probe left (best L%d would cost "
-                      "%.1f > %.1f) - not reserving\n",
-                      pick, cost[pick], tuneProbeMaxCost());
-        break;
-      }
-      sd[pick] = qd[pick]; sw[pick] = qw[pick]; sg[pick] = 0; sr[pick] = 0;
-      Serial.printf("[tune] L%d reserved as a whiten probe (+%.1f seed error)\n",
-                    pick, cost[pick]);
-      have++;
-    }
-    if (have < TUNE_WHITEN_PROBES)
-      Serial.printf("[tune] WARNING: only %d whiten probe(s) — gw may fall back "
-                    "to the built-in constant\n", have);
-  }
-
-  for (int lv = 6; lv <= 14; lv++) {
-    TuneLv &L = tl[lv];
-    L.d = sd[lv]; L.w = sw[lv]; L.g = sg[lv]; L.r = sr[lv];
-    L.hasRaw = false;                    // re-seeding returns it to the grammar
-    L.bestAbs = 1e9f;                    // shapes changed: old bests are void
-    L.bd = L.d; L.bw = L.w; L.bg = L.g; L.br = L.r;
-    L.gd = constrain(fabsf(tuneDose[min((int)L.d + 1, tuneLen)] - tuneDose[(int)L.d]),
-                     2.0f, 30.0f);
-    Serial.printf("[tune] seed L%-2d (%d,%d,%d,%d) -> %.0f  (ref %.0f)\n",
-                  lv, L.d, L.w, L.g, L.r,
-                  tunePredict(L, L.d, L.w, L.g, L.r), probeRef[lv]);
-  }
-}
-
-// Solve for the whiten and re-darken gains from the first measurement of
-// the seeded shapes. Every level's landing is known (ref + err) and its
-// pure-darken base is known (the dose curve), so the structure terms fall
-// out: levels carrying whitens but no re-darkens give the whiten's lift
-// directly, and that in turn unlocks the re-darken's bite on the rest.
-// Guessed constants are never good enough here — this panel's whiten runs
-// ~31 units against an assumed 22, and being 40% wrong about a 30-unit
-// move is what produced the overshoot cascades.
-static void tuneCalibrateGains() {
-  float sw = 0;
-  int nw = 0;
-  for (int lv = 6; lv <= 14; lv++) {
-    const TuneLv &L = tl[lv];
-    if (L.w > 0 && L.r == 0) {
-      const float landing = probeRef[lv] + L.err;
-      sw += (landing - tuneDose[constrain((int)L.d, 1, tuneLen)]) / L.w;
-      nw++;
-    }
-  }
-  const float gw = nw ? constrain(sw / nw, 8.0f, 70.0f) : 31.0f;
-
-  float sr = 0;
-  int nr = 0;
-  for (int lv = 6; lv <= 14; lv++) {
-    const TuneLv &L = tl[lv];
-    if (L.r > 0) {
-      const float landing = probeRef[lv] + L.err;
-      // L.gg is measured by tuneProbeGap() before this runs; using the old
-      // hardcoded 5.0 here would contradict it and corrupt the re-darken solve.
-      const float without_r = tuneDose[constrain((int)L.d, 1, tuneLen)] + L.w * gw + L.g * L.gg;
-      sr += (without_r - landing) / L.r;
-      nr++;
-    }
-  }
-  const float gr = nr ? constrain(sr / nr, 4.0f, 60.0f) : 22.0f;
-
-  for (int lv = 1; lv <= 14; lv++) { tl[lv].gw = gw; tl[lv].gr = gr; }
-  Serial.printf("[tune] measured gains: whiten %.1f (n=%d)  re-darken %.1f (n=%d)\n",
-                gw, nw, gr, nr);
-}
-
-// ============================================================================
-// The damped converger.
-//
-// The edit search is a NEIGHBOURHOOD ENUMERATION over the whole (d,w,g,r)
-// grammar rather than a list of single-parameter nudges. That matters
-// because the dose curve saturates: between 2 and 3 darkens this panel
-// jumps ~28 units, and several target levels live inside that one step.
-// No single-parameter move can land there — the reachable set only gets
-// finer when a whiten is added and re-darkens climb back in ~12-unit
-// steps (the '1,1,2,1,1' shape the hand-tuned tables use). Enumerating
-// lets the planner propose that whole restructure as ONE damped move
-// whose predicted effect is small, instead of refusing every available
-// nudge as too coarse.
-//
-// Predicted landing of a shape, in scanner units: the measured pure-dose
-// curve for its darken run, plus each whiten's lift, minus each
-// re-darken's bite, plus the float gap's weakening of those re-darkens.
-// ============================================================================
-// ---- spacing ----------------------------------------------------------
-// The reference ladder already defines the intended spacing, so the gap
-// the eye sees between levels i and i+1 is
-//     (ref[i] - ref[i+1]) + (err[i] - err[i+1]).
-// Only the second term is ours. A uniform bias shifts the whole ramp and
-// the image dither absorbs it; opposite-signed neighbours halve or double
-// a step, and THAT is what reads as a band. So banding is governed by the
-// DIFFERENCE of adjacent errors, which is what these measure.
-//
-// Levels 0 and 15 anchor the ends: tuneErrors() pins both to exactly zero
-// by construction, so they are honest neighbours for L1 and L14.
-static float tuneGapErr(int lv) {
-  const float a = fabsf(tl[lv].err - tl[lv - 1].err);
-  const float b = fabsf(tl[lv].err - tl[lv + 1].err);
-  return max(a, b);
-}
-
-static float tuneGapMax() {
-  float g = 0;
-  for (int i = 0; i <= 14; i++) g = max(g, fabsf(tl[i].err - tl[i + 1].err));
-  return g;
-}
-
-// How bad a level is overall: its own placement plus what it does to the
-// two gaps it sits between.
-static float tuneBadness(int lv) {
-  return fabsf(tl[lv].err) + TUNE_SPACING_W * tuneGapErr(lv);
-}
-
-// Enumerate legal shapes near the current one and take the best damped
-// move. Returns false when nothing helps (level is quantisation-limited).
-static bool tunePlanOne(int lv) {
-  TuneLv &L = tl[lv];
-  const float e = L.err;
-  const float here = tunePredict(L, L.d, L.w, L.g, L.r);
-
-  int bd = L.d, bw = L.w, bg = L.g, br = L.r;
-  float bestScore = 1e9f;
-  bool found = false;
-
-  const int d0 = max(1, L.d - 3), d1 = min(tuneLen, L.d + 3);
-  for (int d = d0; d <= d1; d++)
-    for (int w = 0; w <= 4; w++)
-      for (int g = 0; g <= 3; g++)
-        for (int r = 0; r <= 5; r++) {
-          if (w == 0 && (r || g)) continue;   // re-darkens need a whiten first
-          if (r == 0 && g) continue;          // a gap only weakens re-darkens
-          // Gap measured inert (tuneProbeGap gated gg to zero): such an edit
-          // predicts NO move, and on a quantisation-limited level where every
-          // real move overshoots, |e| + costs beats |e + move| + costs — so the
-          // planner takes the no-op, reports success, and burns a cycle while
-          // padding the train. Run 2 left L7 as (1,1,3,2), three dead floats.
-          // Candidates with g == 0 stay enumerated, so a level carrying a gap
-          // from a loaded blob can still shed it.
-          if (g && L.gg <= 0.0f) continue;
-          if (d + w + g + r > tuneLen) continue;
-          if (d == L.d && w == L.w && g == L.g && r == L.r) continue;
-
-          // predicted change in this level's error
-          const float move = tunePredict(L, d, w, g, r) - here;
-          // Damping, widened while the gains are still guesses: an
-          // unvalidated model is routinely off by 2x, and an overshoot
-          // costs two cycles (the bad measurement plus the revert).
-          const float uncert = (L.nvalid == 0) ? 2.0f : (L.nvalid == 1 ? 1.4f : 1.0f);
-          if (fabsf(move) * uncert > 1.7f * fabsf(e)) continue;
-
-          // The line above bounds the move's EXPECTED size, which is not the
-          // same as bounding its risk. A restructure that trades whitens for
-          // re-darkens predicts ~0 because the terms cancel in the model - but
-          // their ERRORS do not cancel. (w=1,r=1) -> (w=4,r=5) predicts about
-          // -1 unit; at gains known to +/-25% it can land 18 out. That is how
-          // a level sitting at err 0 got thrown to -52 in one cycle, with the
-          // proportional damping raising no objection because 1.7*|e| was ~0.
-          //
-          // So bound the total DRIVE CHANGE an edit makes, scaled by how well
-          // the gains are known. Single-parameter nudges pass; wholesale
-          // restructures do not. TUNE_MAX_RISK is a judgement call, not a
-          // measurement - it is set to admit a modest two-parameter edit and
-          // reject the 147-unit restructures that were wrecking levels.
-          const float risk =
-                fabsf((float)(w - L.w)) * L.gw
-              + fabsf((float)(r - L.r)) * L.gr
-              + fabsf((float)(g - L.g)) * L.gg
-              + fabsf(tuneDose[constrain(d, 1, tuneLen)]
-                    - tuneDose[constrain((int)L.d, 1, tuneLen)]);
-          if (risk * TUNE_GAIN_ERR > tuneMaxRisk()) continue;
-          const int changed = (d != L.d) + (w != L.w) + (g != L.g) + (r != L.r);
-          // primary: residual error, PLUS what this landing does to the two
-          // gaps the level sits between — a move that fixes its own error
-          // while opening a hole against a neighbour trades a band for a
-          // number. Then prefer simpler edits and shorter trains (a shorter
-          // train paints faster).
-          const float eNew = e + move;
-          const float gapPen = fabsf(eNew - tl[lv - 1].err)
-                             + fabsf(eNew - tl[lv + 1].err);
-          const float score = fabsf(eNew) + TUNE_SPACING_W * gapPen
-                            + 0.35f * changed
-                            + 0.10f * (d + w + g + r);
-          if (score < bestScore) {
-            bestScore = score;
-            bd = d; bw = w; bg = g; br = r;
-            found = true;
-          }
-        }
-  if (!found) return false;
-
-  L.pd = L.d; L.pw = L.w; L.pg = L.g; L.pr = L.r;
-  L.predMove = tunePredict(L, bd, bw, bg, br) - here;
-  const int changed = (bd != L.d) + (bw != L.w) + (bg != L.g) + (br != L.r);
-  // Gains are only learnable from an unambiguous single-parameter move.
-  L.lastOp = 0;
-  L.lastSteps = 1;
-  if (changed == 1) {
-    if (bd != L.d) { L.lastOp = 1; L.lastSteps = bd - L.d; }
-    if (bw != L.w) { L.lastOp = 2; L.lastSteps = bw - L.w; }
-    if (br != L.r) { L.lastOp = 3; L.lastSteps = br - L.r; }
-    if (bg != L.g) { L.lastOp = 4; L.lastSteps = bg - L.g; }
-  }
-  L.d = bd; L.w = bw; L.g = bg; L.r = br;
-  L.edited = true;
-  return true;
-}
-
-// ============================================================================
-// Rescue a stuck level by spending the WHOLE card on it.
-//
-// The converger edits one level per cycle and measures one outcome, which is
-// a poor deal for a level that will not settle: L10 spent eight cycles
-// limit-cycling -10 -> +8 -> -10 -> +11 -> -11, one scan each.
-//
-// But the card's 16 columns take their train from their OWN level index, so
-// columns can be borrowed as experiment slots - the same trick the gap ladder
-// already uses. Paint fourteen DIFFERENT candidate trains for one level, read
-// all fourteen landings from a single scan, keep the best. Fourteen
-// candidates per ~4 s instead of one per cycle.
-//
-// Columns 0 and 15 stay as the gradient anchors, so slots are 1..14. The
-// reference half of each column is a dither of ITS density and is therefore
-// meaningless here - candidates are judged on absolute gradient-corrected
-// landing against the target level's own reference, exactly as the dose
-// ladder judges doses.
-//
-// Returns true if it improved on the incumbent.
-static bool tuneRescueLevel(int lv) {
-  const float before = fabsf(tl[lv].err);   // incumbent, as the card measures it
-
-  // Candidates are RAW DRIVE SEQUENCES, not (d,w,g,r) tuples.
-  //
-  // The grammar can only stretch runs: more darkens, more whitens, a gap of a
-  // given width. It cannot insert a float mid-train, cannot delete a pass, and
-  // cannot produce the alternating d,w,d,w tails the hand-tuned direct trains
-  // needed. A level the planner has failed to move is exactly where those
-  // shapes are worth trying, so the rescue edits the sequence itself:
-  // substitute a pass, INSERT one (shifting the rest right, dropping the
-  // last), or DELETE one (shifting left, padding with a float).
-  uint8_t cand[15][TUNE_LEN_MAX];
-  uint8_t cur[TUNE_LEN_MAX];
-  tuneTrainOf(lv, cur);
-
-  // Slot 1 is the incumbent, so the scan re-measures it under the SAME
-  // conditions as its challengers - that is what lets column bias cancel.
-  //
-  // Seed the RNG from something that varies: Arduino's random() is a
-  // deterministic PRNG, and unseeded it replays one sequence every boot, so
-  // every rescue would test identical candidates.
-  randomSeed(micros() ^ (uint32_t)(lv * 2654435761u));
-
-  memcpy(cand[1], cur, TUNE_LEN_MAX);
-  int n = 1;
-  const int last = tuneLen - 1;
-  for (int s = 2; s <= 14; s++) {
-    for (int tries = 0; tries < 60; tries++) {
-      uint8_t c[TUNE_LEN_MAX];
-      memcpy(c, cur, TUNE_LEN_MAX);
-      // A longer train is a bigger space to search with the same 13
-      // candidate slots, so scale the mutation count with it rather than
-      // nudging a 20-pass sequence one pass at a time.
-      const int edits = 1 + (int)random(0, tuneLen > 13 ? 3 : 2);
-      for (int e = 0; e < edits; e++) {
-        const int pos = (int)random(0, tuneLen);
-        switch ((int)random(0, 3)) {
-          case 0:                                    // substitute
-            c[pos] = (uint8_t)random(0, 3);
-            break;
-          case 1:                                    // insert, shift right
-            for (int i = last; i > pos; i--) c[i] = c[i - 1];
-            c[pos] = (uint8_t)random(0, 3);
-            break;
-          default:                                   // delete, shift left
-            for (int i = pos; i < last; i++) c[i] = c[i + 1];
-            c[last] = 0;
-            break;
-        }
-      }
-      // A train of nothing but floats drives no ink; skip it rather than
-      // waste a slot measuring paper.
-      bool any = false;
-      for (int i = 0; i < tuneLen; i++) if (c[i]) { any = true; break; }
-      if (!any) continue;
-      bool dup = false;
-      for (int j = 1; j <= n && !dup; j++)
-        if (!memcmp(cand[j], c, tuneLen)) dup = true;
-      if (dup) continue;
-      memcpy(cand[++n], c, TUNE_LEN_MAX);
-      break;
-    }
-  }
-  Serial.printf("[tune] rescue L%d: %d distinct candidates (raw edits)\n", lv, n);
-
-  uint8_t t[TUNE_LEN_MAX];
-  for (int s = 1; s <= n; s++)
-    epd.driver().setDecisionTrain((uint8_t)(s << 1), cand[s]);
-  memset(t, 0, sizeof(t));                 // column 15: deep anchor
-  for (int i = 0; i < tuneLen; i++) t[i] = 1;
-  epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
-
-  tunePaintMatchCard();
-  tuneClear();
-  tunePaint();
-  float ref[16], nat[16];
-  if (!tuneMeasureCard(ref, nat)) { tuneUploadApplies(); return false; }
-
-  // Judge candidates RELATIVE TO THE INCUMBENT measured in the same frame,
-  // not against an absolute target.
-  //
-  // The first version compared each candidate's landing in column s against
-  // probeRef[lv], a reference measured in column lv. That carries whatever
-  // horizontal variation exists across the card, and on this panel it was
-  // worth ~13 units: the incumbent shape read -12.7 on the normal card and
-  // +0.5 here, so the rescue "improved" a level by adopting its own shape
-  // unchanged. Slot 1 holds the incumbent precisely so that bias can be
-  // cancelled - measure how far each candidate sits FROM the incumbent, and
-  // apply that delta to the incumbent's known error. Column bias affects
-  // both terms and drops out.
-  const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
-  const float incumbent = nat[1] - (g0 + (g15 - g0) * (1 / 15.0f));
-  const float curErr = tl[lv].err;          // incumbent's error, normal card
-
-  int best = -1;
-  float bestErr = fabsf(curErr);
-  for (int s = 2; s <= n; s++) {
-    const float landing = nat[s] - (g0 + (g15 - g0) * (s / 15.0f));
-    const float e = fabsf(curErr + (landing - incumbent));
-    if (e < bestErr) { bestErr = e; best = s; }
-  }
-
-  bool improved = false;
-  if (best > 1 && bestErr < before - 0.5f) {
-    // The level is now rescue-owned: store the sequence literally, because
-    // it may be off-grammar and (d,w,g,r) could not represent it.
-    tl[lv].hasRaw = true;
-    memcpy(tl[lv].raw, cand[best], TUNE_LEN_MAX);
-    // Record the new shape as this level's best-known ONLY if it really is
-    // better than what was already banked. Blindly resetting bestAbs threw
-    // away a good shape the converger had found earlier, and the best-shape
-    // assembly at the end then had nothing better to fall back on - which
-    // cost a run more than the failed rescue itself did.
-    // bestAbs/bd..br describe a GRAMMAR shape and cannot hold a raw train, so
-    // invalidate the banked best rather than let the end-of-run assembly
-    // reinstate a shape this level no longer uses.
-    tl[lv].bestAbs = 1e9f;
-    tl[lv].frozen = false;
-    improved = true;
-    Serial.print("[tune] rescue L");
-    Serial.print(lv);
-    Serial.print(": err ");
-    Serial.print(before, 1);
-    Serial.print(" -> ");
-    Serial.print(bestErr, 1);
-    Serial.print("  {");
-    for (int i = 0; i < tuneLen; i++) { Serial.print(cand[best][i]); if (i < tuneLen - 1) Serial.print(","); }
-    Serial.println("}");
-  } else {
-    Serial.printf("[tune] rescue L%d: nothing beat %.1f (best challenger %.1f)\n",
-                  lv, before, bestErr);
-  }
-  tuneUploadApplies();                     // put every level's real train back
-  return improved;
-}
-
-// Pick the worst 1-2 out-of-tolerance levels and edit them.
-static void tunePlanEdits() {
-  int order[14];
-  int n = 0;
-  for (int lv = 1; lv <= 14; lv++) {
-    tl[lv].lastOp = 0;
-    tl[lv].edited = false;
-    if (tl[lv].skip) { tl[lv].skip = false; continue; }
-    if (tl[lv].frozen) continue;
-    // Rescue-owned levels carry a raw sequence the (d,w,g,r) planner cannot
-    // represent; editing them would silently overwrite it with a grammar
-    // shape. They are the rescue's to change from here.
-    if (tl[lv].hasRaw) continue;
-    // Eligible on EITHER count. A level can sit well inside TUNE_TOL and
-    // still be the reason the ramp bands, if its neighbour leans the other
-    // way — that case was previously invisible to the planner and simply
-    // never got edited.
-    if (fabsf(tl[lv].err) > tuneTol() || tuneGapErr(lv) > tuneGapTol())
-      order[n++] = lv;
-  }
-  for (int i = 0; i < n; i++)          // worst first, placement + spacing
-    for (int j = i + 1; j < n; j++)
-      if (tuneBadness(order[j]) > tuneBadness(order[i])) {
-        int t = order[i]; order[i] = order[j]; order[j] = t;
-      }
-  int edited = 0;
-  for (int i = 0; i < n && edited < 2; i++)
-    if (tunePlanOne(order[i])) edited++;
-}
-
-static float tuneMedian(float *v, int n) {
-  for (int i = 0; i < n; i++)
-    for (int j = i + 1; j < n; j++)
-      if (v[j] < v[i]) { float t = v[i]; v[i] = v[j]; v[j] = t; }
-  return n ? (n & 1 ? v[n / 2] : 0.5f * (v[n / 2 - 1] + v[n / 2])) : 0.0f;
-}
-
-static void tuneAbsorb(const float err[16]) {
-  // drift baseline: median error change of the UNEDITED levels
-  float deltas[14];
-  int nd = 0;
-  for (int lv = 1; lv <= 14; lv++)
-    if (!tl[lv].edited) deltas[nd++] = err[lv] - tl[lv].err;
-  const float drift = tuneMedian(deltas, nd);
-
-  for (int lv = 1; lv <= 14; lv++) {
-    TuneLv &L = tl[lv];
-    L.lastErr = L.err;
-    L.err = err[lv];
-
-    // Remember the best shape ever measured for this level. Levels take
-    // turns misbehaving, so where the loop happens to stop is not where
-    // each level was at its best — without this, a good state reached at
-    // cycle 7 is simply lost.
-    if (fabsf(L.err) < L.bestAbs) {
-      L.bestAbs = fabsf(L.err);
-      L.bd = L.d; L.bw = L.w; L.bg = L.g; L.br = L.r;
-    }
-    if (!L.edited) continue;
-
-    const float moved = (L.err - L.lastErr) - drift;   // what the edit itself did
-
-    // Learn from what happened. A single-parameter edit names its own
-    // gain; a restructure only tells us the model's overall scale, so
-    // rescale the shape gains by the (damped) ratio it was wrong by.
-    // NOTE: an overshoot means the move was BIGGER than predicted, so
-    // the gain must grow. Shrinking it here — an earlier bug — made the
-    // planner re-propose the same too-large move next cycle.
-    if (L.lastOp && L.lastSteps) {
-      const float obs = fabsf(moved / (float)L.lastSteps);
-      float *gp = (L.lastOp == 1) ? &L.gd : (L.lastOp == 2) ? &L.gw
-                : (L.lastOp == 3) ? &L.gr : &L.gg;
-      if (obs > 1.0f) {
-        *gp = constrain(0.55f * *gp + 0.45f * obs, 1.5f, 80.0f);
-        if (L.nvalid < 250) L.nvalid++;
-      }
-    } else if (fabsf(L.predMove) > 1.0f && fabsf(moved) > 1.0f) {
-      const float k = sqrtf(constrain(fabsf(moved / L.predMove), 0.4f, 3.0f));
-      L.gd = constrain(L.gd * k, 1.5f, 60.0f);
-      L.gw = constrain(L.gw * k, 1.5f, 80.0f);
-      L.gr = constrain(L.gr * k, 1.5f, 80.0f);
-      L.gg = constrain(L.gg * k, 1.0f, 40.0f);
-      if (L.nvalid < 250) L.nvalid++;
-    }
-
-    // Undo any edit that left the level worse off — whether it shot past
-    // zero (sign flipped) or simply moved the wrong way, which happens
-    // when the model has a structural term's SIGN wrong and no amount of
-    // rescaling will save it. A level that keeps doing this is frozen at
-    // its best shape rather than allowed to thrash for the whole run.
-    const bool flipped = (L.lastErr * L.err < 0 && fabsf(L.err) > 0.75f * fabsf(L.lastErr));
-    const bool worse   = fabsf(L.err) > fabsf(L.lastErr) + 2.0f;
-    if (flipped || worse) {
-      L.d = L.pd; L.w = L.pw; L.g = L.pg; L.r = L.pr;
-      L.skip = true;
-      if (++L.bad >= 3) {
-        // Freeze means STOP EDITING — leave the shape exactly as it is.
-        // Snapping to the best-ever shape here was a mistake: that shape
-        // was measured in a different frame, so installing it moved one
-        // level 56 units in a single cycle, with no way back because the
-        // level was now frozen. Picking bests is the end-of-run job.
-        L.frozen = true;
-        Serial.printf("[tune] L%d frozen (best so far |err| %.1f)\n", lv, L.bestAbs);
-      }
-    }
-  }
-  tl[15].err = err[15];
-  if (nd) Serial.printf("[tune] drift %+.1f (n=%d)\n", drift, nd);
-}
 
 // ============================================================================
 // Charge-matched removes: k darkens then k + net whitens (wr − k = net).
@@ -2131,338 +1233,6 @@ static bool tuneAbortRequested() {
   return false;
 }
 
-// Tune one quality's 16-grey tables. NORMAL and HIGH only — FAST has no
-// 16-grey mode at all (see runSelfTuneFast()).
-//
-// The two differ in exactly three things, and all three must move
-// together or the result is nonsense: the pass period the panel is driven
-// at, the number of passes a train has, and the blob the tables land in.
-static bool runSelfTune16(EPD_Painter::Quality quality) {
-  const bool high = (quality == EPD_Painter::Quality::QUALITY_HIGH);
-  const Set set = high ? SET_HIGH : SET_NORMAL;
-  if (!scPort) {
-    Serial.println("[tune] no scanner selected");
-    return false;
-  }
-  Serial.printf("[tune] ===== SELF-TUNE START (%s) =====\n", tunedSetName(set));
-  Serial.println("[tune] send q to abort between cycles");
-
-  epd.setQuality(quality);
-  tuneLen = epd.driver().g16TrainLen();
-  int &periodCfg = high ? epd.driver()._config.g16_pass_us_high
-                        : epd.driver()._config.g16_pass_us_normal;
-  if (tunePeriodUs) {
-    periodCfg = (int)tunePeriodUs;
-    Serial.printf("[tune] pass period overridden to %lu us\n",
-                  (unsigned long)tunePeriodUs);
-  }
-  const uint32_t period = (uint32_t)periodCfg;
-  Serial.printf("[tune] tuning at %lu us %s period, %d passes per train "
-                "(%.2f s per full-screen paint)\n",
-                (unsigned long)period, tunedSetName(set), tuneLen,
-                period * tuneLen / 1e6f);
-  if (!epd.driver().setGreyLevels(16)) {
-    Serial.println("[tune] setGreyLevels(16) refused");
-    return false;
-  }
-
-  tuneSeedShapes();
-  if (!tuneRegister()) { tuneResultScreen(false, 0, 0); return false; }
-  if (!tuneProbe())    { tuneResultScreen(false, 0, 0); return false; }
-
-  // ---- attempts -----------------------------------------------------------
-  // A run that stalls is not a run that has found the best tables - it is one
-  // that fell into a bad basin. Measured evidence: two runs of the IDENTICAL
-  // binary produced +3.3% and a result bad enough to discard, so the spread
-  // between attempts is as large as the differences between code versions.
-  // With scanning down to ~4 s a whole attempt costs about five minutes, so
-  // the cheapest way to a good table is to take the best of several rather
-  // than to keep tuning the converger.
-  //
-  // Geometry is NOT repeated - the anchor ring is a property of where the
-  // panel sits on the glass, not of the attempt. Everything downstream of it
-  // starts fresh, including the probe, so each attempt gets its own
-  // measurement noise and its own seeds.
-  float ref[16], nat[16], err[16];
-  int8_t keepD[16], keepW[16], keepG[16], keepR[16];
-  float  keepScore = 1e9f;
-  bool   haveKeep = false;
-  bool   converged = false;
-  float  mx = 999;
-
-  for (int attempt = 1; attempt <= TUNE_MAX_ATTEMPTS; attempt++) {
-  if (attempt > 1) {
-    // Let the scanner settle before hammering it again - see the constant.
-    // Polled rather than one long delay so 'q' still aborts promptly.
-    Serial.printf("[tune] cooling down %lus before the next attempt "
-                  "(scanner rate limit)\n",
-                  (unsigned long)(TUNE_ATTEMPT_COOLDOWN_MS / 1000));
-    const uint32_t t0 = millis();
-    while (millis() - t0 < TUNE_ATTEMPT_COOLDOWN_MS) {
-      if (tuneAbortRequested()) { Serial.println("[tune] aborted"); break; }
-      delay(100);
-    }
-    if (tuneAbortRequested()) break;
-
-    Serial.printf("[tune] ---- attempt %d of %d (previous did not converge) ----\n",
-                  attempt, TUNE_MAX_ATTEMPTS);
-    tuneSeedShapes();
-    tuneScansPerMeasure = 1;
-    if (!tuneProbe()) break;
-  }
-
-  float bestMax = 1e9f;
-  int   stall = 0, cyc = 0;
-  int   rescues = 0;
-  converged = false;
-  mx = 999;
-
-  for (cyc = 0; cyc < TUNE_MAX_CYCLES; cyc++) {
-    if (tuneAbortRequested()) { Serial.println("[tune] aborted"); break; }
-    tuneUploadApplies();
-    tunePaintMatchCard();
-    tuneClear();
-    tunePaint();
-    if (!tuneMeasureCard(ref, nat)) break;
-    tuneErrors(ref, nat, err);
-    tuneAbsorb(err);
-
-    mx = 0;
-    for (int lv = 1; lv <= 14; lv++) mx = max(mx, fabsf(tl[lv].err));
-    const float gmx = tuneGapMax();   // worst neighbour spacing error
-    // Close to home: average more scans per measurement so the remaining
-    // edits are made against the panel rather than scan noise. Precision has
-    // to keep pace with the tolerance — TUNE_GAP_TOL is 2.5 units and one
-    // scan reads to a unit or two, so the spacing figure only becomes
-    // meaningful once it is averaged. Gated on the WORSE of placement and
-    // spacing, matching what convergence now asks for. Root-N: the third
-    // read buys less than the second, so it is only worth its extra scan
-    // right at the end.
-    const float close = max(mx, gmx);
-    const int wantScans = (close <= tuneAvgBelow3()) ? 3
-                        : (close <= tuneAvgBelow())  ? 2 : 1;
-    if (wantScans > tuneScansPerMeasure) {
-      tuneScansPerMeasure = wantScans;
-      Serial.printf("[tune] within %.0f - averaging %d scans per measurement now\n",
-                    (wantScans == 3) ? tuneAvgBelow3() : tuneAvgBelow(),
-                    tuneScansPerMeasure);
-    }
-    Serial.printf("[tune] cycle %2d  maxerr %5.1f  gap %4.1f  |", cyc, mx, gmx);
-    for (int lv = 1; lv <= 15; lv++) Serial.printf("%+3.0f", tl[lv].err);
-    Serial.println();
-
-    // The first measurement is what the gain solve needs: re-derive the
-    // shapes from the now-measured physics before any editing starts.
-    if (cyc == 0) {
-      tuneCalibrateGains();
-      tuneSeedModel(false);  // gains are solved now; take the best-fitting shapes
-      for (int lv = 1; lv <= 14; lv++) tl[lv].nvalid = 1;   // gains measured now
-      continue;
-    }
-    if (cyc < TUNE_WARMUP) { Serial.println("[tune] (warm-up, no edits)"); continue; }
-    // Both conditions: a ramp whose levels are each in tolerance but whose
-    // steps vary 5x is exactly the "converged, still bands" case that
-    // started this. Stall tracking follows the same combined figure, so the
-    // loop does not give up while spacing is still improving.
-    if (mx <= tuneTol() && gmx <= tuneGapTol()) { converged = true; break; }
-    const float progress = max(mx, gmx);
-    if (progress < bestMax - 0.7f) { bestMax = progress; stall = 0; } else stall++;
-    if (stall >= 8) {
-      // Stalled means the one-edit-per-cycle search has run out of ideas, not
-      // that the level is unimprovable. Before giving up, spend a whole card
-      // on the worst offender - fourteen candidates in one scan beats another
-      // eight cycles of the same nudges. Only once per attempt: if a rescue
-      // does not help, the retry loop's fresh probe is the better lever.
-      // Stalling is the trigger for the SECOND strategy, not the end of the
-      // run: the one-edit-per-cycle planner has run out of ideas, so hand the
-      // worst level to the rescue and carry on. Repeatedly - a run that needs
-      // three levels unstuck should get three rescues, not one and then a
-      // shrug. Bounded so a level that cannot be helped cannot loop forever.
-      if (rescues < TUNE_MAX_RESCUES) {
-        rescues++;
-        int worst = 0;
-        for (int lv = 1; lv <= 14; lv++)
-          if (!worst || tuneBadness(lv) > tuneBadness(worst)) worst = lv;
-        Serial.printf("[tune] stalled - rescue %d/%d on worst level L%d\n",
-                      rescues, TUNE_MAX_RESCUES, worst);
-        stall = 0;
-        bestMax = 1e9f;              // give the planner a clean slate after it
-        if (tuneRescueLevel(worst)) continue;
-        // Nothing beat the incumbent: freeze that level so the next stall
-        // picks a different one rather than retrying the same dead end.
-        tl[worst].frozen = true;
-        continue;
-      }
-      Serial.println("[tune] stalled");
-      break;
-    }
-    tunePlanEdits();
-  }
-
-  // Assemble every level's best-known shape and MEASURE that combination.
-  // Each level's best was seen in a different frame, so the assembled set
-  // has to be verified rather than assumed — but it is still a far better
-  // starting point than wherever the loop happened to stop.
-  if (!converged) {
-    tuneScansPerMeasure = 2;        // the set we keep is worth measuring well
-    for (int lv = 1; lv <= 14; lv++)
-      if (tl[lv].bestAbs < 1e8f) {
-        tl[lv].d = tl[lv].bd; tl[lv].w = tl[lv].bw;
-        tl[lv].g = tl[lv].bg; tl[lv].r = tl[lv].br;
-      }
-    tuneUploadApplies();
-    tunePaintMatchCard();
-    tuneClear();
-    tunePaint();
-    if (tuneMeasureCard(ref, nat)) {
-      tuneErrors(ref, nat, err);
-      float bmx = 0;
-      for (int lv = 1; lv <= 14; lv++) {
-        tl[lv].err = err[lv];
-        bmx = max(bmx, fabsf(err[lv]));
-      }
-      Serial.printf("[tune] best-shape set measures %5.1f  |", bmx);
-      for (int lv = 1; lv <= 15; lv++) Serial.printf("%+3.0f", tl[lv].err);
-      Serial.println();
-      mx = bmx;                       // this is the set we are keeping
-    }
-  }
-
-  // Score this attempt on the WORSE of placement and spacing - the same
-  // figure convergence is gated on, so "best attempt" means the same thing
-  // as "closest to converged" rather than being a second opinion.
-  {
-    const float score = max(mx, tuneGapMax());
-    Serial.printf("[tune] attempt %d scores %.1f (maxerr %.1f, gap %.1f)%s\n",
-                  attempt, score, mx, tuneGapMax(),
-                  (score < keepScore) ? " - best so far" : "");
-    if (score < keepScore) {
-      keepScore = score;
-      haveKeep = true;
-      for (int lv = 1; lv <= 15; lv++) {
-        keepD[lv] = tl[lv].d; keepW[lv] = tl[lv].w;
-        keepG[lv] = tl[lv].g; keepR[lv] = tl[lv].r;
-      }
-    }
-  }
-  if (converged) break;
-  if (tuneAbortRequested()) break;
-  }  // ---- end attempts ----
-
-  // Reinstate the best attempt's shapes. Without this the tables kept would
-  // be whichever attempt happened to run last, which is not the same thing.
-  if (haveKeep) {
-    for (int lv = 1; lv <= 15; lv++) {
-      tl[lv].d = keepD[lv]; tl[lv].w = keepW[lv];
-      tl[lv].g = keepG[lv]; tl[lv].r = keepR[lv];
-    }
-    mx = keepScore;
-    // ref[] and tl[].err are currently whatever the LAST attempt left behind,
-    // which is not necessarily the attempt whose shapes we just reinstated.
-    // That matters: lum[] is built from ref[i] + tl[i].err and is the curve
-    // the image dither quantises against - the one thing that demonstrably
-    // fixed banding. Re-measure so the curve describes the set being kept.
-    tuneUploadApplies();
-    tunePaintMatchCard();
-    tuneClear();
-    tunePaint();
-    if (tuneMeasureCard(ref, nat)) {
-      tuneErrors(ref, nat, err);
-      for (int lv = 1; lv <= 14; lv++) tl[lv].err = err[lv];
-      mx = 0;
-      for (int lv = 1; lv <= 14; lv++) mx = max(mx, fabsf(tl[lv].err));
-      Serial.printf("[tune] kept set re-measured: maxerr %.1f gap %.1f\n",
-                    mx, tuneGapMax());
-    }
-  }
-
-  Serial.printf("[tune] converged=%d  final maxerr %.1f\n", converged, mx);
-  tuneUploadApplies();
-
-  Serial.println("[tune] deriving charge-matched removes...");
-  float worst = -1;
-  for (int round = 0; round < 3; round++) {
-    tuneUploadRemoves();
-    worst = tuneVerifyRemoves();
-    if (worst < 0) { Serial.println("[tune] remove verify scan failed"); break; }
-    if (worst <= 6.0f) break;
-    Serial.println("[tune] widening ghosting removes and re-checking...");
-  }
-
-  uint8_t ap[16][TUNE_LEN_MAX], rm[16][TUNE_LEN_MAX];
-  memset(ap, 0, sizeof(ap));
-  memset(rm, 0, sizeof(rm));
-  for (int lv = 1; lv <= 15; lv++) {
-    tuneTrainOf(lv, ap[lv]);
-    tuneRemoveOf(lv, rm[lv]);
-  }
-
-  // What each level ACTUALLY renders as, from the final measurement:
-  // reference plus the residual error, normalised so level 0 is paper
-  // white and level 15 the deepest black this panel reached. The levels
-  // are NOT evenly spaced, so image conversion must quantise against this
-  // curve rather than assume even steps.
-  //
-  // ref[] here is the FINAL card's reference, not probeRef[] from the
-  // ladder at the start of the run. probeRef was read minutes and dozens
-  // of paints earlier, and the panel drifts over a session — mixing a
-  // start-of-run reference with an end-of-run error put that drift
-  // straight into the curve the image dither quantises against. Since
-  // tuneErrors() defines err = (nat - ref) - gradient, ref[i] + err[i] is
-  // exactly the gradient-corrected native landing, with no reconstruction.
-  uint8_t lum[16];
-  {
-    float meas[16];
-    for (int i = 0; i < 16; i++) meas[i] = ref[i] + tl[i].err;
-    const float white = meas[0], black = meas[15];
-    const float span = (white - black) > 1.0f ? (white - black) : 1.0f;
-    Serial.print("[tune] measured level curve (255=white): ");
-    for (int i = 0; i < 16; i++) {
-      int v = (int)lroundf(255.0f * (meas[i] - black) / span);
-      lum[i] = (uint8_t)constrain(v, 0, 255);
-      Serial.printf("%d ", lum[i]);
-    }
-    Serial.println();
-  }
-  tuneDumpTables();
-
-  // Show what was achieved and let the user decide. Nothing is written to
-  // flash unless they ask for it — these tables drive every future paint,
-  // so the choice belongs to them, not to a threshold of mine.
-  const bool keep = tuneResultsScreen(mx, worst < 0 ? 0.0f : worst);
-  bool saved = false, loaded = false;
-  if (keep) {
-    saved = tunedSave16(epd.driver(), set, period, tuneLen, ap, rm, lum);
-    // Read it straight back rather than trusting the write: this is the
-    // same path every future boot will take, so if it can't be reloaded
-    // now it was never really saved.
-    loaded = saved && tunedLoad(epd.driver(), set);
-    Serial.printf("[tune] flash save %s, reload %s\n",
-                  saved ? "OK" : "FAILED", loaded ? "OK" : "FAILED");
-    if (loaded) {
-      char sub[96];
-      snprintf(sub, sizeof(sub),
-               "Verified in flash - %s, %d passes at %lu us, loaded every boot",
-               tunedSetName(set), tuneLen, (unsigned long)period);
-      tuneConfirmScreen("SAVED", "Your panel now uses these greys", sub);
-    } else {
-      tuneConfirmScreen("SAVE FAILED", "Nothing was stored",
-                        saved ? "Written, but it would not read back - flash may be full."
-                              : "Could not write to storage. The old tables still apply.");
-    }
-  } else {
-    // Put the preset tables back: the tuned trains are still live in the
-    // engine from the run itself.
-    epd.driver().rebuildDecisionTrains();
-    Serial.println("[tune] discarded - built-in tables restored");
-    tuneConfirmScreen("SKIPPED", "Nothing was changed",
-                      "The built-in tables are still in charge.");
-  }
-
-  Serial.printf("[tune] ===== SELF-TUNE DONE (%s: maxerr %.1f, removes worst %.1f, %s) =====\n",
-                tunedSetName(set), mx, worst, keep ? "saved" : "discarded");
-  return keep && saved && loaded;
-}
 
 #else  // !TUNEUP_HAVE_JPEGDEC
 

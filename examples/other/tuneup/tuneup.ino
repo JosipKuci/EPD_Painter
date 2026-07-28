@@ -28,9 +28,19 @@
 // touchscreen is against the glass, so tuning is driven over serial or by
 // the TUNE button's countdown.
 //
-// Serial commands (115200): s demo scan · T self-tune · q abort tune ·
-// P <us> tune-period override · L tuned-blob status · X erase tuned blob ·
-// n re-pick scanner · r reboot
+// Serial commands (115200):
+//   Tuning     T self-tune (pick quality) · 4 4-grey tune (then f/n/N) ·
+//              d directs-only at NORMAL · E [gens] evo tune HIGH · q abort
+//   Results    e export all tables as source · L blob status · X erase blobs ·
+//              V results-screen preview · C paint match card · f/g/G splash
+//              at FAST/NORMAL/HIGH
+//   Probes     D dose ladder · S staircase check · c store staircase curve ·
+//              p store photo-context curve · B stability sweep ·
+//              U uniformity probe · K/k/l compensation sweep (period/row/LE) ·
+//              J timing benches · Q paint quadrant mark
+//   Knobs      P <us> tune-period override · W <us> row charge ·
+//              A/R/F evo toggles (settle mask / shuffle / ref ladder)
+//   Rig        s demo scan · n re-pick scanner · m menu · r reboot
 //
 // Libraries: Adafruit GFX (required), gt911-arduino (required),
 // JPEGDEC (required for tuning and the scan preview).
@@ -38,9 +48,32 @@
 
 // ---------------------------------------------------------------------------
 // >>> YOUR NETWORK GOES HERE <<<
+//
+// Either fill these in, or — better, and what stops a password reaching a
+// public repository — drop a wifi_secrets.h next to this sketch:
+//
+//     #define WIFI_SSID "your network"
+//     #define WIFI_PASS "your password"
+//
+// It is gitignored, so it cannot be committed by accident. This file has
+// carried a real password to GitHub once already; the header exists so it
+// cannot happen twice.
 // ---------------------------------------------------------------------------
-#define WIFI_SSID ""
-#define WIFI_PASS ""
+#if __has_include("wifi_secrets.h")
+  #include "wifi_secrets.h"
+#endif
+#ifndef WIFI_SSID
+  #define WIFI_SSID ""
+#endif
+#ifndef WIFI_PASS
+  #define WIFI_PASS ""
+#endif
+
+// Name this board gets in exported tables (`e` at the menu): "H716" prints
+// TUNED16_H716_HIGH and so on, ready to paste into src/EPD_Painter_trains.h.
+#ifndef TUNED_EXPORT_PREFIX
+  #define TUNED_EXPORT_PREFIX "BOARD"
+#endif
 
 // Choose your board (or leave all commented for auto-probe).
 //#define EPD_PAINTER_PRESET_M5PAPER_S3
@@ -384,9 +417,12 @@ static size_t esclScan(float x0mm, float y0mm, float wmm, float hmm, int dpi) {
     Serial.printf("[escl] no document (HTTP %d)\n", status);
     return 0;
   }
-  { // tell the scanner we're done with the job (best effort)
+  { // tell the scanner we're done with the job (best effort). Its own
+    // buffer: parking the reply in the tail of scanBuf would corrupt the
+    // end of a JPEG that filled the buffer, before it was ever decoded.
+    static uint8_t dbuf[512];
     size_t dl; int ds;
-    httpTxn("DELETE", location, "", scanBuf + SCAN_BUF_MAX - 512, 512, &dl, &ds, nullptr, 5000);
+    httpTxn("DELETE", location, "", dbuf, sizeof(dbuf), &dl, &ds, nullptr, 5000);
   }
   const bool isJpeg = len > 2 && scanBuf[0] == 0xFF && scanBuf[1] == 0xD8;
   Serial.printf("[escl] %u bytes in %lu s (%s)\n", (unsigned)len,
@@ -482,12 +518,24 @@ static int splashDrawCb(JPEGDRAW *d) {
   return 1;
 }
 
-// Floyd-Steinberg to the panel's 16 levels.
+// Floyd-Steinberg to however many levels the panel is actually in.
 //
 // A photograph needs error diffusion, not an ordered matrix: at 16 levels
 // a Bayer dither leaves its own cross-hatch in smooth areas and still
 // contours across skin, whereas diffusion pushes each pixel's rounding
 // error into its neighbours and the banding disappears into fine grain.
+//
+// THE LEVEL COUNT IS NOT A CONSTANT. This diffused to 16 levels whatever the
+// panel was in, and in 4-level mode the packer masks each byte with 0x03 —
+// so levels 4, 8 and 12 all came out white and a face rendered as a relief
+// carving with the eyes and lips as isolated blobs. Four greys are faint but
+// perfectly good for a photograph; four greys with the mid-tones wrapped
+// around to white are not a photograph at all.
+// Dither from every splashStride'th level. 1 = all of them. 2 = eight of
+// sixteen: the steps double, so any context drift of a level is half the
+// fraction of a step — the banding-vs-grain trade, pushed toward grain.
+static int splashStride = 1;
+
 static void splashDiffuse(uint8_t *fb, int W, int H) {
   // What each level really renders as, measured on the glass by the tuner
   // and kept with the tables. The levels are NOT evenly spaced — on this
@@ -495,10 +543,17 @@ static void splashDiffuse(uint8_t *fb, int W, int H) {
   // assumed even ramp diffuses error into levels that cannot express it,
   // which is precisely what banding looks like. Falls back to even steps
   // on a board that has never been measured.
-  const uint8_t *lum = EPD_PainterTuned::levelLuminance();
+  //
+  // The curve has to match the level COUNT as well: Config::levelLum(4)
+  // returns the 4-level curve the FAST tune measured, where the first four
+  // entries of the 16-grey curve are four near-white levels standing in for
+  // a whole ramp.
+  const int nlv = epd.driver().greyLevels();
+  const uint8_t *lum = epd.driver()._config.levelLum(nlv);
   uint8_t even[16];
   if (!lum) {
-    for (int i = 0; i < 16; i++) even[i] = (uint8_t)(255 - i * 255 / 15);
+    for (int i = 0; i < nlv; i++)
+      even[i] = (uint8_t)(255 - i * 255 / (nlv - 1));
     lum = even;
   }
 
@@ -512,9 +567,9 @@ static void splashDiffuse(uint8_t *fb, int W, int H) {
     for (int x = 0; x < W; x++) {
       int v = (int)srow[x] + errCur[x];
       if (v < 0) v = 0; else if (v > 255) v = 255;
-      // nearest level by MEASURED luminance
+      // nearest level by MEASURED luminance, over the live levels only
       int lv = 0, bestd = 1000;
-      for (int i = 0; i < 16; i++) {
+      for (int i = 0; i < nlv; i += splashStride) {
         const int d = abs((int)lum[i] - v);
         if (d < bestd) { bestd = d; lv = i; }
       }
@@ -799,10 +854,18 @@ static Set tunePickQuality(bool *cancelled) {
   drawBtn(bHigh,   "HIGH",   "16 greys, 20 passes");
 
   epd.setTextSize(1);
+  // Periods from the live config, not literals — they differ per board
+  // (15/15 ms on the LilyGo GPS, 20/20 on the H716), and a hardcoded
+  // number here once described a different board than the one showing it.
+  char nNorm[40], nHigh[40];
+  snprintf(nNorm, sizeof(nNorm), "%d passes at %d ms.", EPD_Painter::DEC_WF_LEN16,
+           epd.driver()._config.g16_pass_us_normal / 1000);
+  snprintf(nHigh, sizeof(nHigh), "%d passes at %d ms.", EPD_Painter::DEC_WF_LEN16_HIGH,
+           epd.driver()._config.g16_pass_us_high / 1000);
   struct { Btn b; const char *l1, *l2, *l3; } notes[3] = {
     { bFast,   "7 passes, no settle delay.",  "Four levels and the six",     "grey-to-grey transitions." },
-    { bNormal, "13 passes at 15 ms.",         "Evolutionary search over",    "raw waveforms. ~15 min." },
-    { bHigh,   "20 passes at 15 ms.",         "Same, with 20 slots to",      "shape. ~15 min." },
+    { bNormal, nNorm,                         "Evolutionary search over",    "raw waveforms. ~15 min." },
+    { bHigh,   nHigh,                         "Same, with 20 slots to",      "shape. ~15 min." },
   };
   for (int i = 0; i < 3; i++) {
     epd.setCursor(notes[i].b.x + 10, by + bh - 52);
@@ -894,7 +957,11 @@ static void tuneCountdownAndRun() {
     epd.paint();
     Serial.printf("[tune] %s\n", b);
     delay(1000);
-    if (Serial.available() && Serial.peek() == 'q') { Serial.read(); return; }
+    // Drain everything, not peek: a stray byte at the head of the buffer (a
+    // leftover newline from the command that got us here) otherwise blocks
+    // 'q' for the whole countdown.
+    while (Serial.available())
+      if (Serial.read() == 'q') return;
   }
   runSelfTune(which);
 }
@@ -974,11 +1041,11 @@ static void showMenuCard() {
   drawBtn(btnScanner, "CHANGE SCANNER");
 
   epd.setCursor(12, H - 130);
-  epd.print("Serial: s scan  T tune (pick quality)  P <us> period  L blobs");
+  epd.print("Serial: s scan  T tune  4 4-grey  d directs  e export  D ladder");
   epd.setCursor(12, H - 110);
-  epd.print("        X erase all tuned blobs  n scanner  r reboot");
+  epd.print("        S staircase  L blobs  X erase  n scanner  r reboot");
   epd.paint();
-  Serial.println("[tuneup] menu: s/T/P/L/X/n/r (or tap)");
+  Serial.println("[tuneup] menu: s/T/4/d/e/D/S/L/X/n/r (full list in the sketch header)");
 }
 
 // ============================================================================
@@ -1103,6 +1170,43 @@ void loop() {
                     epd.driver()._config.g16_pass_us_normal, EPD_Painter::DEC_WF_LEN16,
                     epd.driver()._config.g16_pass_us_high, EPD_Painter::DEC_WF_LEN16_HIGH);
     } break;
+    case '4': {
+      // 4-grey tune. FAST is 7 passes and stores to flash; NORMAL is 13 and
+      // prints its tables as source (no flash slot for 13-wide waveforms yet).
+      // N = levels only. SAVE/SKIP is per RUN, not per phase, so a direct
+      // phase that fails takes the levels down with it however good they
+      // were — which is exactly what happened to the first set measured
+      // against the corrected dose ladder. Separating them means a good
+      // half can be kept while the other half is still being worked on.
+      Serial.println("[tuneup] 4-grey tune: f = FAST, n = NORMAL (levels+directs), "
+                     "N = NORMAL levels only, q = cancel");
+      uint32_t t0 = millis();
+      while (millis() - t0 < 30000) {
+        if (!Serial.available()) { delay(20); continue; }
+        const int k = Serial.read();
+        if (k == 'q') break;
+        if (k == 'f') { runSelfTuneFast(EPD_Painter::Quality::QUALITY_FAST); break; }
+        if (k == 'n') { runSelfTuneFast(EPD_Painter::Quality::QUALITY_NORMAL); break; }
+        if (k == 'N') { runSelfTuneFast(EPD_Painter::Quality::QUALITY_NORMAL,
+                                        true, false); break; }
+      }
+      showMenuCard();
+    } break;
+    case 'd': {
+      // Directs only, at NORMAL: re-measure the six grey-to-grey trains
+      // against the levels already loaded, without disturbing them.
+      runSelfTuneFast(EPD_Painter::Quality::QUALITY_NORMAL, false, true);
+      showMenuCard();
+    } break;
+    case 'e': {
+      // Print every stored set as source for src/EPD_Painter_trains.h. The
+      // board that was measured becomes the board every untuned one inherits
+      // from, so this is the last step of a tune rather than a debug aid.
+      Serial.println("// ===== paste into src/EPD_Painter_trains.h =====");
+      for (int s = 0; s <= (int)SET_HIGH; s++)
+        tunedExport(epd.driver(), (Set)s, TUNED_EXPORT_PREFIX);
+      Serial.println("// ===== end =====");
+    } break;
     case 'X':
       tunedEraseAll();
       Serial.println("[tuneup] all tuned blobs erased - reboot ('r') for preset tables");
@@ -1144,6 +1248,25 @@ void loop() {
       tunePaint();
       Serial.println("[tuneup] quadrant mark painted and held");
     } break;
+    case 'f': {
+      // The splash at FAST, 4 greys. Four levels are FAINT - that is the
+      // mode, not a fault - but faint is not the same as wrong, and this is
+      // the check that tells the two apart: the photograph should read as a
+      // low-contrast photograph, not as a relief carving with the mid-tones
+      // wrapped around to white.
+      epd.driver().setGreyLevels(4);          // levels first: FAST is refused at 16
+      epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      const uint8_t *l4 = epd.driver()._config.levelLum(4);
+      Serial.printf("[tuneup] splash painted at FAST, %d levels, curve %s",
+                    epd.driver().greyLevels(), l4 ? "" : "MISSING (even ramp assumed)");
+      if (l4) for (int i = 0; i < 4; i++) Serial.printf("%d ", l4[i]);
+      Serial.println();
+    } break;
     case 'g': {
       // Same, at NORMAL - for comparing the two qualities on identical
       // content. 13 slots against HIGH's 20.
@@ -1159,6 +1282,22 @@ void loop() {
                     epd.driver().g16TrainLen(),
                     epd.driver()._config.g16_pass_us_normal,
                     epd.driver()._config.rowExtraUs());
+    } break;
+    case 'h': {
+      // The splash at NORMAL, dithered from every OTHER grey — 8 of 16.
+      // Wider steps mean a level's context drift is half the fraction of
+      // a step, so this trades residual banding for extra grain. A test
+      // of where the banding/grain optimum sits, not a mode.
+      splashStride = 2;
+      epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      splashStride = 1;
+      Serial.println("[tuneup] splash painted at NORMAL from 8 of 16 greys");
     } break;
     case 'G': {
       // Paint the splash artwork at HIGH, 16 greys. A visual check of the
@@ -1205,8 +1344,26 @@ void loop() {
     } break;
     case 'D': {
       // Dose-ladder sweep: pick the pass period from measurement.
-      static const int PERIODS[] = { 19000, 15000, 13000 };
-      runDoseSweep(PERIODS, (int)(sizeof(PERIODS) / sizeof(PERIODS[0])));
+      //
+      // Swept around THIS board's own periods, not a fixed list. The list was
+      // 19/15/13 ms, which are the LilyGo's numbers: on a board whose preset
+      // asks for 20 and 24 they are all below the honest floor, so every pass
+      // would overrun and the ladder would measure the clamp rather than the
+      // panel. HIGH's period, NORMAL's period, and one step under NORMAL —
+      // the first two are the candidates actually in play (matching them lets
+      // a HIGH train inherit a NORMAL one slot-for-slot), the third asks
+      // whether there is headroom below.
+      const int pn = epd.driver()._config.g16_pass_us_normal;
+      const int ph = epd.driver()._config.g16_pass_us_high;
+      int periods[3], n = 0;
+      periods[n++] = ph;
+      if (pn != ph) periods[n++] = pn;
+      const int lower = pn - 2000;
+      if (lower >= 10000 && lower != ph) periods[n++] = lower;
+      Serial.printf("[tuneup] dose ladder over %d periods:", n);
+      for (int i = 0; i < n; i++) Serial.printf(" %d", periods[i]);
+      Serial.println(" us");
+      runDoseSweep(periods, n);
       showMenuCard();
     } break;
     case 'K': {
@@ -1245,6 +1402,20 @@ void loop() {
       while (!epd.driver().paintIdle()) delay(10);
       Serial.println("[tuneup] match card painted (top = dither refs, "
                      "bottom = native levels)");
+    } break;
+    case 'c': {
+      // Re-measure the level curve on the staircase and store it into the
+      // NVS blob, for each 16-grey quality that has one. Trains untouched.
+      runStaircaseCurveStore(EPD_Painter::Quality::QUALITY_NORMAL);
+      runStaircaseCurveStore(EPD_Painter::Quality::QUALITY_HIGH);
+      showMenuCard();
+    } break;
+    case 'p': {
+      // Photo-context curve: patches overlaid on the splash artwork at
+      // randomised positions, 4 rounds, averaged — stored into the blob.
+      runPhotoCurveStore(EPD_Painter::Quality::QUALITY_NORMAL);
+      runPhotoCurveStore(EPD_Painter::Quality::QUALITY_HIGH);
+      showMenuCard();
     } break;
     case 'n': pickScanner(); showMenuCard(); break;
     case 'm': showMenuCard(); break;

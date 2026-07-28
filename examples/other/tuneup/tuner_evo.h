@@ -119,7 +119,20 @@ static const int EVO_LE_HOLD_NS = 1000;
 // measured with only 7 of 20 live against 15 ms's 10). That is why
 // row_extra stays at 4 rather than 6 - 6 would need ~19 ms, and this
 // board's dark end is already crushed. `P <us>` still overrides.
-static const int EVO_PERIOD_US_HIGH = 15000;
+//
+// 0 = INHERIT THE BOARD'S PRESET, which is the setting to leave it on. Every
+// number argued out above was measured on a LilyGo T5 S3 GPS, and pinning it
+// here as a constant quietly applied one board's answer to every other one.
+// It is wrong on the H716 by more than a preference: that board's preset asks
+// for 24 ms because its rows are slower, and forcing 15 ms puts the period
+// UNDER the row loop, so every pass overruns, clamps to the settle floor, and
+// dose goes content-dependent — the precise fault the constant period exists
+// to remove. A tune run that way calibrates against a moving target.
+//
+// Inheriting costs the LilyGo nothing: no preset but the H716's sets these
+// fields, so it takes Config's default, which is the same 15000 this constant
+// held. `P <us>` still overrides for a deliberate experiment.
+static const int EVO_PERIOD_US_HIGH = 0;
 
 // The seed genome every level starts from: 11 darkens then 6 whitens.
 // Deliberately identical for all levels — the point of the exercise is that
@@ -694,6 +707,27 @@ static void evoUnpaintAll() {
   tunePaint();
 }
 
+// Fill tl[] from the apply trains actually installed in the engine.
+//
+// The standalone checks (staircase 'S', uniformity 'U') run without a tune,
+// so tl[] holds nothing — and evoUnpaintAll() derives its erase trains from
+// tl[]. Deriving them from an empty state read every net charge as zero and
+// uploaded charge-neutral scrubs OVER the installed removes: the check's
+// own erases ghosted, and the engine kept the junk removes until the next
+// setGreyLevels(). Adopting the installed applies keeps the removes matched
+// to what is really driving the glass.
+static bool tuneAdoptInstalled() {
+  for (int g = 1; g <= 15; g++) {
+    const uint8_t *t = epd.driver().decisionTrain((uint8_t)(g << 1));
+    if (!t) return false;
+    tl[g] = {};
+    tl[g].hasRaw = true;
+    memcpy(tl[g].raw, t, tuneLen);
+  }
+  memset(removeExtra, 0, sizeof(removeExtra));
+  return true;
+}
+
 static bool evoMeasureBars(bool dithered, float out[16]) {
   evoPaintBars(dithered);
   tuneClear();
@@ -712,7 +746,10 @@ static bool evoMeasureBars(bool dithered, float out[16]) {
 }
 
 // Returns the worst placement error in scan units, or -1 if a scan failed.
-static float evoVerifyStaircase(const uint8_t lum[16]) {
+// scOut, if given, receives the staircase-measured level curve — the curve
+// of the levels as FULL-HEIGHT SOLID content renders them, which is the
+// better model of a photograph than the match card's half-dither rows.
+static float evoVerifyStaircase(const uint8_t lum[16], uint8_t *scOut = nullptr) {
   Serial.println("[evo] ---- verification: full-height staircase ----");
   static float ref[16], nat[16];
   if (!evoMeasureBars(true,  ref)) return -1;
@@ -737,6 +774,7 @@ static float evoVerifyStaircase(const uint8_t lum[16]) {
   for (int g = 0; g < 16; g++)
     sc[g] = (uint8_t)constrain((int)lroundf(255.0f * (meas[g] - black) / span), 0, 255);
 
+  if (scOut) memcpy(scOut, sc, 16);
   Serial.print("[evo] staircase curve:");
   for (int g = 0; g < 16; g++) Serial.printf(" %3d", sc[g]);
   Serial.println();
@@ -834,6 +872,10 @@ static bool runUniformityProbe(EPD_Painter::Quality q, const int *levels, int nl
                        : epd.driver()._config.g16_pass_us_normal;
   if (tunePeriodUs) periodCfg = (int)tunePeriodUs;
   if (!epd.driver().setGreyLevels(16)) return false;
+  if (!tuneAdoptInstalled()) {
+    Serial.println("[evo] no installed trains to derive erases from");
+    return false;
+  }
   if (!tgeo.valid && !tuneRegister()) return false;
   Serial.println("[evo] ===== UNIFORMITY PROBE =====");
   Serial.printf("[evo] period %d us, row_extra %d us\n",
@@ -1003,9 +1045,19 @@ static bool runStabilitySweep() {
   if (!tgeo.valid && !tuneRegister()) return false;
 
   static const int ROWEXTRA[] = { 0, 2, 4, 8 };
-  static const int PERIOD[]   = { 15000, 17000, 19000 };
   const int NR = sizeof(ROWEXTRA) / sizeof(ROWEXTRA[0]);
-  const int NP = sizeof(PERIOD)   / sizeof(PERIOD[0]);
+  // Periods swept around THIS board's own presets, the same rule the dose
+  // ladder ('D') uses. The old fixed 15/17/19 ms list was the LilyGo's
+  // answer: on a board whose preset asks for 20 and 24 ms every entry sat
+  // under the row loop, so the sweep measured the clamp, not the panel.
+  const int pn = epd.driver()._config.g16_pass_us_normal;
+  const int ph = epd.driver()._config.g16_pass_us_high;
+  int PERIOD[3];
+  int NP = 0;
+  PERIOD[NP++] = ph;
+  if (pn != ph) PERIOD[NP++] = pn;
+  const int lower = min(pn, ph) - 2000;
+  if (lower >= 10000) PERIOD[NP++] = lower;
 
   Serial.println("[stab] ===== STABILITY SWEEP (HIGH) =====");
   Serial.println("[stab] 3 levels x 3 positions x 3 backgrounds, native minus");
@@ -1150,7 +1202,6 @@ static void benchLeHold() {
 // ---------------------------------------------------------------------------
 static const int COMP_LEVELS[3] = { 4, 8, 12 };
 static const int COMP_BG[3]     = { 0, 8, 15 };                    // white, grey, black
-static const int COMP_PERIOD[5] = { 13000, 14000, 15000, 16000, 17000 };
 static const int COMP_ROWUS[5]  = { 0, 2, 4, 6, 8 };
 // LE width, ns. The first sweep ran 0..1000 and the dithered reference was
 // still falling at the top of it, so this range is extended to find where
@@ -1244,6 +1295,13 @@ static bool runCompSweep(CompKnob knob) {
   const int savedRow    = epd.driver()._config.row_extra_us_high;
   const int savedLe     = epd.driver()._config.le_hold_ns;
 
+  // Period candidates centred on this board's own in-use value (which sits
+  // at index COMP_NOMINAL), in 1 ms steps. The old fixed 13..17 ms list was
+  // the LilyGo's range, and sat under other boards' row loops entirely.
+  int compPeriod[5];
+  for (int q = 0; q < NP; q++)
+    compPeriod[q] = savedPeriod + (q - COMP_NOMINAL) * 1000;
+
   Serial.println("[comp] ===== COMPENSATION SWEEP (HIGH) =====");
   Serial.println("[comp] cells fixed in place, whole-panel background varied:");
   Serial.println("[comp] position cannot confound this, only frame ink demand");
@@ -1284,7 +1342,7 @@ static bool runCompSweep(CompKnob knob) {
       epd.driver()._config.row_extra_us_high = savedRow;
       epd.driver()._config.le_hold_ns        = savedLe;
       if (knob == COMP_KNOB_PERIOD) {
-        epd.driver()._config.g16_pass_us_high  = COMP_PERIOD[q];
+        epd.driver()._config.g16_pass_us_high  = compPeriod[q];
       } else if (knob == COMP_KNOB_ROW) {
         epd.driver()._config.row_extra_us_high = COMP_ROWUS[q];
         epd.driver()._config.le_hold_ns        = COMP_LE_FIXED;
@@ -1300,7 +1358,7 @@ static bool runCompSweep(CompKnob knob) {
         return false;
       }
       Serial.printf("[comp] bg %s %s %4d %s |", compBgName(COMP_BG[b]), knobName,
-                    knob == COMP_KNOB_PERIOD ? COMP_PERIOD[q] / 1000
+                    knob == COMP_KNOB_PERIOD ? compPeriod[q] / 1000
                   : knob == COMP_KNOB_ROW    ? COMP_ROWUS[q]
                                              : COMP_LENS[q],
                     knobUnit);
@@ -1315,7 +1373,7 @@ static bool runCompSweep(CompKnob knob) {
 
   float xs[5];
   for (int q = 0; q < NP; q++)
-    xs[q] = knob == COMP_KNOB_PERIOD ? COMP_PERIOD[q] / 1000.0f
+    xs[q] = knob == COMP_KNOB_PERIOD ? compPeriod[q] / 1000.0f
           : knob == COMP_KNOB_ROW    ? (float)COMP_ROWUS[q]
                                      : (float)COMP_LENS[q];
 
@@ -1397,6 +1455,168 @@ static bool runCompSweep(CompKnob knob) {
   return true;
 }
 
+// Re-measure the level curve on the STAIRCASE and store it as the blob's
+// level_lum, replacing the match-card curve the tune saved.
+//
+// The curve exists for image dithering, and the two content types
+// disagree: the match card's rows are half dither, half native (cheap
+// rows, calibration conditions), while a photograph is full-height mixed
+// content — staircase-like — whose heavier row loops shift every level.
+// Measured on this board the two curves differ by up to 7 lum, a whole
+// level step at the mid-tones, and diffusing error against a curve that
+// wrong is exactly what photo banding looks like. Two scans per quality
+// against a ten-minute retune.
+static bool runStaircaseCurveStore(EPD_Painter::Quality q) {
+  if (!scPort) { Serial.println("[stair] no scanner selected"); return false; }
+  const Set s = (q == EPD_Painter::Quality::QUALITY_HIGH) ? SET_HIGH : SET_NORMAL;
+  if (!tunedPresent(epd.driver(), s)) {
+    Serial.printf("[stair] no stored %s blob to update - tune first\n",
+                  tunedSetName(s));
+    return false;
+  }
+  epd.setQuality(q);
+  tuneLen = epd.driver().g16TrainLen();
+  if (!epd.driver().setGreyLevels(16)) return false;
+  if (!tuneAdoptInstalled()) {
+    Serial.println("[stair] no installed trains to derive erases from");
+    return false;
+  }
+  if (!tgeo.valid && !tuneRegister()) return false;
+
+  // The stored curve, for the side-by-side the verdict prints.
+  const uint8_t *cur = epd.driver()._config.levelLum(16);
+  uint8_t curLum[16];
+  if (cur) memcpy(curLum, cur, 16);
+  else for (int i = 0; i < 16; i++) curLum[i] = (uint8_t)(255 - i * 255 / 15);
+
+  Serial.printf("[stair] measuring the %s level curve on the staircase...\n",
+                tunedSetName(s));
+  uint8_t stairLum[16];
+  if (evoVerifyStaircase(curLum, stairLum) < 0) return false;
+  if (!tunedStoreCurve(epd.driver(), s, stairLum)) {
+    Serial.println("[stair] could not update the stored blob");
+    return false;
+  }
+  Serial.printf("[stair] %s blob now carries the staircase curve "
+                "(trains and timing untouched)\n", tunedSetName(s));
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Photo-context level curve (Tony's method, 28 Jul 2026).
+//
+// Paint the SPLASH ARTWORK as the background, overlay one small native
+// patch per level at randomised positions, scan, and repeat with fresh
+// positions. Four rounds average position sensitivity and lamp falloff
+// into noise — and the surrounding content is exactly what the curve
+// exists to serve: a photograph's ink demand, not a test card's. The
+// staircase curve was a step closer to photo content than the match
+// card; this is the photo itself. The result replaces the stored blob's
+// level_lum, trains untouched.
+//
+// Layout: a 4x4 grid of cells, the 16 levels dealt into the cells in a
+// fresh shuffle each round and jittered inside them — non-overlapping by
+// construction, every level sampling four different regions of the
+// panel and four different local neighbourhoods of the artwork.
+// ---------------------------------------------------------------------------
+static const int PHOTO_ROUNDS = 4;
+static const int PHOTO_PATCH  = 84;      // px square; interior measured
+
+static uint8_t photoLv[16];              // cell -> level this round
+static int     photoPx[16], photoPy[16];
+
+static void photoLayout() {
+  const int W = epd.width(), H = epd.height();
+  const int cw = W / 4, ch = H / 4;
+  for (int i = 0; i < 16; i++) photoLv[i] = (uint8_t)i;
+  for (int i = 15; i > 0; i--) {
+    const int j = (int)random(0, i + 1);
+    const uint8_t t = photoLv[i]; photoLv[i] = photoLv[j]; photoLv[j] = t;
+  }
+  for (int c = 0; c < 16; c++) {
+    photoPx[c] = (c % 4) * cw + (int)random(8, cw - PHOTO_PATCH - 8);
+    photoPy[c] = (c / 4) * ch + (int)random(8, ch - PHOTO_PATCH - 8);
+  }
+}
+
+static void photoPaintCard() {
+  uint8_t *fb = epd.getBuffer();
+  const int W = epd.width();
+  tuneupSplashDraw(fb, W, epd.height());
+  for (int c = 0; c < 16; c++)
+    for (int y = 0; y < PHOTO_PATCH; y++)
+      memset(fb + (size_t)(photoPy[c] + y) * W + photoPx[c],
+             photoLv[c], PHOTO_PATCH);
+}
+
+static void photoRepaint() { photoPaintCard(); tuneClear(); tunePaint(); }
+
+static bool runPhotoCurveStore(EPD_Painter::Quality q) {
+  if (!scPort) { Serial.println("[photo] no scanner selected"); return false; }
+  const Set s = (q == EPD_Painter::Quality::QUALITY_HIGH) ? SET_HIGH : SET_NORMAL;
+  if (!tunedPresent(epd.driver(), s)) {
+    Serial.printf("[photo] no stored %s blob to update - tune first\n",
+                  tunedSetName(s));
+    return false;
+  }
+  epd.setQuality(q);
+  tuneLen = epd.driver().g16TrainLen();
+  if (!epd.driver().setGreyLevels(16)) return false;
+  if (!tuneAdoptInstalled()) {
+    Serial.println("[photo] no installed trains to derive erases from");
+    return false;
+  }
+  if (!tgeo.valid && !tuneRegister()) return false;
+
+  Serial.printf("[photo] %s: %d rounds of 16 patches over the splash "
+                "artwork...\n", tunedSetName(s), PHOTO_ROUNDS);
+  randomSeed(micros());
+  float sum[16] = {0};
+  int   nread[16] = {0};
+  for (int round = 0; round < PHOTO_ROUNDS; round++) {
+    photoLayout();
+    photoPaintCard();
+    tuneClear();
+    tunePaint();
+    tuneRepaint = photoRepaint;
+    if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
+    Serial.printf("[photo] round %d:", round);
+    const int m = 14;                    // stay well inside the patch
+    for (int c = 0; c < 16; c++) {
+      int sx0, sx1, sy0, sy1;
+      tunePanelRect(photoPx[c] + m, photoPx[c] + PHOTO_PATCH - m,
+                    photoPy[c] + m, photoPy[c] + PHOTO_PATCH - m,
+                    &sx0, &sx1, &sy0, &sy1);
+      const float v = tuneRectMean(sx0, sx1, sy0, sy1);
+      sum[photoLv[c]] += v;
+      nread[photoLv[c]]++;
+      Serial.printf(" L%d=%.0f", photoLv[c], v);
+    }
+    Serial.println();
+    evoUnpaintAll();                     // charge-matched erase between rounds
+  }
+
+  float meas[16];
+  for (int g = 0; g < 16; g++)
+    meas[g] = nread[g] ? sum[g] / nread[g] : 0.0f;
+  uint8_t lum[16];
+  tuneCurveFrom(meas, 16, lum, "photo");
+  // A curve that is not monotone cannot be quantised against sensibly;
+  // report rather than store, so a bad scan cannot poison the blob.
+  for (int g = 1; g < 16; g++)
+    if (lum[g] > lum[g - 1]) {
+      Serial.printf("[photo] curve INVERTS at L%d - not storing\n", g);
+      return false;
+    }
+  if (!tunedStoreCurve(epd.driver(), s, lum)) {
+    Serial.println("[photo] could not update the stored blob");
+    return false;
+  }
+  Serial.printf("[photo] %s blob now carries the photo-context curve\n",
+                tunedSetName(s));
+  return true;
+}
+
 // Standalone staircase check against whatever tables are currently
 // installed - the flash-tuned set if the board has one, the preset or
 // formula library otherwise. Nothing is changed; this only measures.
@@ -1406,6 +1626,10 @@ static bool runStaircaseCheck(EPD_Painter::Quality q) {
   tuneLen = epd.driver().g16TrainLen();
   if (!epd.driver().setGreyLevels(16)) {
     Serial.println("[evo] setGreyLevels(16) refused");
+    return false;
+  }
+  if (!tuneAdoptInstalled()) {
+    Serial.println("[evo] no installed trains to derive erases from");
     return false;
   }
   Serial.printf("[evo] staircase check: %s, %d passes at %d us\n",
@@ -1430,27 +1654,109 @@ static bool runStaircaseCheck(EPD_Painter::Quality q) {
 // ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The incumbent — what this board is already running.
+// ---------------------------------------------------------------------------
+// Seeding every level from the same synthetic genome throws away a table that
+// cost forty scans to produce and is already within single-digit units. The
+// search is (1+3) mutation from an elite, so the seed IS the starting point:
+// begin at the incumbent and generation 1 is refining a good answer; begin at
+// the formula and the first several generations are spent walking back to
+// where the board already was.
+//
+// Cross-quality seeding is where the slot count matters. A HIGH train has 20
+// slots and a NORMAL one 13, so there is no straight copy — but a drive code
+// means the same thing in either as long as the PASS PERIOD is the same,
+// because that is what fixes the dose a slot delivers. So NORMAL's tuned
+// train goes into HIGH's first 13 slots and the remaining 7 are left float:
+// the level lands exactly where it did before, and evolution gets seven spare
+// slots to shape with rather than seven passes to discover from scratch.
+//
+// If the two qualities run DIFFERENT periods the mapping is approximate — the
+// shape is still right but each slot's dose is not — so runEvoTune says so
+// rather than letting it pass silently.
+static uint8_t     evoIncumbent[16][TUNE_LEN_MAX];
+static int         evoIncumbentLen  = 0;         // 0 = nothing worth seeding from
+static const char *evoIncumbentWhat = "the formula library";
+
+static void evoCaptureIncumbent(EPD_Painter::Quality target) {
+  evoIncumbentLen  = 0;
+  evoIncumbentWhat = "the formula library";
+  memset(evoIncumbent, 0, sizeof(evoIncumbent));
+
+  const bool high = (target == EPD_Painter::Quality::QUALITY_HIGH);
+  const auto &tr = epd.driver()._config.trains;
+  const bool haveTarget = high
+      ? (tr.g16_apply_high != nullptr || tunedPresent(epd.driver(), SET_HIGH))
+      : (tr.g16_apply      != nullptr || tunedPresent(epd.driver(), SET_NORMAL));
+
+  // Best case: this quality has its own table. Read what is INSTALLED rather
+  // than the preset directly, so a flash blob (a previous tune) wins over the
+  // shipped table, which is the whole point of having tuned it.
+  if (haveTarget) {
+    // From level 1: level 0 is paper white and is never driven, so it has no
+    // train and decisionTrain() rightly refuses id 0. Asking for it and then
+    // treating the refusal as "no tables here" is how this silently fell back
+    // to the formula on a board that had a perfectly good tuned set.
+    for (int g = 1; g < 16; g++) {
+      const uint8_t *t = epd.driver().decisionTrain((uint8_t)((g << 1) | 0));
+      if (!t) return;
+      memcpy(evoIncumbent[g], t, tuneLen);
+    }
+    evoIncumbentLen  = tuneLen;
+    evoIncumbentWhat = "this quality's own installed table";
+    return;
+  }
+
+  // NORMAL with no table: the formula is genuinely all there is.
+  if (!high) return;
+
+  // HIGH with no HIGH table, which is every board today. Borrow NORMAL's,
+  // which means briefly rebuilding the library at NORMAL to read it.
+  if (tr.g16_apply == nullptr && !tunedPresent(epd.driver(), SET_NORMAL)) return;
+  epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+  bool ok = true;
+  for (int g = 1; g < 16 && ok; g++) {   // level 0 is never driven — see above
+    const uint8_t *t = epd.driver().decisionTrain((uint8_t)((g << 1) | 0));
+    if (!t) { ok = false; break; }
+    memcpy(evoIncumbent[g], t, EPD_Painter::DEC_WF_LEN16);
+  }
+  epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+  if (!ok) { memset(evoIncumbent, 0, sizeof(evoIncumbent)); return; }
+  evoIncumbentLen  = EPD_Painter::DEC_WF_LEN16;
+  evoIncumbentWhat = "NORMAL's installed table in the first 13 of 20 slots";
+}
+
 static void evoSeed() {
   for (int g = 0; g < 16; g++) {
     EvoLv &L = ev[g];
     memset(&L, 0, sizeof(L));
     memset(L.elite, 0, TUNE_LEN_MAX);
-    int p = 0, placed = 0;
-    while (placed < evoSeedDark() && p < tuneLen) {
-      if (evoSlotUsable(p)) { L.elite[p] = 1; placed++; }
-      p++;
-    }
-    placed = 0;
-    while (placed < evoSeedLight() && p < tuneLen) {
-      if (evoSlotUsable(p)) { L.elite[p] = 2; placed++; }
-      p++;
+    if (evoIncumbentLen) {
+      // The tail past evoIncumbentLen is already float from the capture.
+      memcpy(L.elite, evoIncumbent[g], TUNE_LEN_MAX);
+    } else {
+      int p = 0, placed = 0;
+      while (placed < evoSeedDark() && p < tuneLen) {
+        if (evoSlotUsable(p)) { L.elite[p] = 1; placed++; }
+        p++;
+      }
+      placed = 0;
+      while (placed < evoSeedLight() && p < tuneLen) {
+        if (evoSlotUsable(p)) { L.elite[p] = 2; placed++; }
+        p++;
+      }
     }
     memcpy(L.best,   L.elite, TUNE_LEN_MAX);
     memcpy(L.second, L.elite, TUNE_LEN_MAX);
     L.eliteErr  = 1e9f;
     L.bestAbs   = 1e9f;
     L.secondAbs = 1e9f;
-    L.sigma     = 2.0f;
+    // Mutate gently when starting from a measured table: the job is to refine
+    // an answer that is already close, and 2.0 expected edits would knock a
+    // good train apart faster than selection can put it back. From the
+    // formula there is nothing to protect, so explore at the old strength.
+    L.sigma     = evoIncumbentLen ? 1.0f : 2.0f;
   }
 }
 
@@ -1469,12 +1775,18 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   tuneLen = epd.driver().g16TrainLen();
   int &periodCfg = high ? epd.driver()._config.g16_pass_us_high
                         : epd.driver()._config.g16_pass_us_normal;
-  if (high) periodCfg = EVO_PERIOD_US_HIGH;   // pinned, not inherited
+  // What the board was running before the run pins its own timing, so a
+  // SKIP can put ALL of it back — preset tables at evo-pinned timing would
+  // be a mismatch that lasts until reboot.
+  const int savedPeriodCfg = periodCfg;
+  const int savedLeHold    = epd.driver()._config.le_hold_ns;
+  if (high && EVO_PERIOD_US_HIGH) periodCfg = EVO_PERIOD_US_HIGH;
   if (tunePeriodUs) periodCfg = (int)tunePeriodUs;
   const uint32_t period = (uint32_t)periodCfg;
   // Pin the row timing for this quality before measuring anything.
   int &rowExtra = high ? epd.driver()._config.row_extra_us_high
                        : epd.driver()._config.row_extra_us_normal;
+  const int savedRowExtra = rowExtra;
   rowExtra = EVO_ROW_EXTRA_US;
   // And the latch width, for exactly the same reason. Installing a blob
   // restores the timing it was tuned at, and every blob written before
@@ -1518,7 +1830,24 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   tuneScanGapMs = savedGap + 1000;
 
   randomSeed(micros());
+  evoCaptureIncumbent(quality);
   evoSeed();
+  Serial.printf("[evo] seeded from %s\n", evoIncumbentWhat);
+  if (evoIncumbentLen && evoIncumbentLen != tuneLen) {
+    // Borrowed across qualities: only exact if a slot delivers the same dose
+    // in both, which means the same pass period.
+    const int other = epd.driver()._config.g16_pass_us_normal;
+    Serial.printf("[evo] seed borrowed from a %d-slot table into %d slots; "
+                  "periods %d us -> %d us%s\n",
+                  evoIncumbentLen, tuneLen, other, (int)period,
+                  (int)period == other
+                      ? " (same, so each seeded level lands where it did)"
+                      : " (DIFFER, so the seed is a shape not a landing point)");
+  }
+  if (!evoIncumbentLen)
+    Serial.printf("[evo] no tuned table to start from - seeding %d darkens "
+                  "then %d whitens on every level\n",
+                  evoSeedDark(), evoSeedLight());
   if (!tgeo.valid && !tuneRegister()) { tuneScanGapMs = savedGap; return false; }
 
   // Static: this task's stack is 8 KB and the save path below adds a
@@ -1800,22 +2129,27 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   {
     float meas[16];
     for (int i = 0; i < 16; i++) meas[i] = probeRef[i] + tl[i].err;
-    const float white = meas[0], black = meas[15];
-    const float span = (white - black) > 1.0f ? (white - black) : 1.0f;
-    Serial.print("[evo] measured level curve (255=white): ");
-    for (int i = 0; i < 16; i++) {
-      lum[i] = (uint8_t)constrain((int)lroundf(255.0f * (meas[i] - black) / span), 0, 255);
-      Serial.printf("%d ", lum[i]);
-    }
-    Serial.println();
+    tuneCurveFrom(meas, 16, lum, "evo");
   }
   tuneDumpTables();
 
   // Independent check on content the tables were NOT tuned against, before
   // anything is written. If this disagrees with the match card, the tables
   // are card-specific and should not be kept.
-  const float stair = evoVerifyStaircase(lum);
-  if (stair >= 0) mx = max(mx, stair);
+  uint8_t stairLum[16];
+  const float stair = evoVerifyStaircase(lum, stairLum);
+  if (stair >= 0) {
+    mx = max(mx, stair);
+    // Store the STAIRCASE curve, not the match card's. The curve exists
+    // for one purpose — image dithering — and a photograph is full-height
+    // mixed content like the staircase, not half-dither rows like the
+    // card. The two disagreed by up to 7 lum on this board, and error
+    // diffusion against a curve that is a level-step wrong at the
+    // mid-tones is exactly what photo banding looks like.
+    memcpy(lum, stairLum, 16);
+    Serial.println("[evo] storing the staircase-measured curve "
+                   "(photo-like content), not the match card's");
+  }
 
   const bool keep = tuneResultsScreen(mx, worst < 0 ? 0.0f : worst);
   bool saved = false, loaded = false;
@@ -1831,8 +2165,14 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
                       loaded ? "Your panel now uses these greys" : "Nothing was stored",
                       loaded ? sub : "Could not write to storage.");
   } else {
+    // Tables AND timing: the run pinned period, row charge and latch width
+    // for its own measurements, and the restored tables are only valid at
+    // the timing they came with.
+    periodCfg = savedPeriodCfg;
+    rowExtra  = savedRowExtra;
+    epd.driver()._config.le_hold_ns = savedLeHold;
     epd.driver().rebuildDecisionTrains();
-    Serial.println("[evo] discarded - built-in tables restored");
+    Serial.println("[evo] discarded - built-in tables and timing restored");
     tuneConfirmScreen("SKIPPED", "Nothing was changed",
                       "The built-in tables are still in charge.");
   }
