@@ -56,7 +56,10 @@ void initBricks() {
   for (int r = 0; r < BRICK_ROWS; r++) {
     for (int c = 0; c < BRICK_COLS; c++) {
       bricks[r][c].alive = true;
-      bricks[r][c].color = (r % 3) + 1;
+      // One grey per row, light at the top down to near-black: the whole
+      // tuned ramp on screen at once, and every ball crossing exercises a
+      // different grey-to-grey pair.
+      bricks[r][c].color = (uint8_t)(2 + r * 2);   // rows: 2,4,6,8,10,12
     }
   }
 }
@@ -149,7 +152,7 @@ void drawBricks() {
 }
 
 void drawBall(const Ball &ball) {
-  epd.fillCircle((int)ball.x + BALL_SIZE / 2, (int)ball.y + BALL_SIZE / 2, BALL_SIZE / 2, 3);
+  epd.fillCircle((int)ball.x + BALL_SIZE / 2, (int)ball.y + BALL_SIZE / 2, BALL_SIZE / 2, 15);
 }
 
 void setup() {
@@ -160,10 +163,19 @@ void setup() {
     while (1);
   }
 
-  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+  // 16-grey HIGH. Grey-to-grey needs no separate direct engine at this
+  // tier — the 16-grey engine drives remove(from) and apply(to) in ONE
+  // paint (temporal partition), so a ball crossing a brick never flashes
+  // through white. The tables come from the board's tuned set: the NVS
+  // blob a tuneup session stored, or the per-board *_Trains.h defaults.
+  // ~2.5 fps: 20 passes at the constant 20 ms period is the price of
+  // sixteen calibrated greys at their best.
+  epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+  if (!epd.driver().setGreyLevels(16))
+    Serial.println("16-grey unavailable - staying at 4 levels");
   epd.clear();
 
-  epd.fillScreen(3);
+  epd.fillScreen(15);
   epd.paint();
   epd.fillScreen(0);
   epd.paint();
