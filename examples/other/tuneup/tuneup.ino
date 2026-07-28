@@ -39,8 +39,8 @@
 // ---------------------------------------------------------------------------
 // >>> YOUR NETWORK GOES HERE <<<
 // ---------------------------------------------------------------------------
-#define WIFI_SSID "REDACTED"
-#define WIFI_PASS "REDACTED"
+#define WIFI_SSID ""
+#define WIFI_PASS ""
 
 // Choose your board (or leave all commented for auto-probe).
 //#define EPD_PAINTER_PRESET_M5PAPER_S3
