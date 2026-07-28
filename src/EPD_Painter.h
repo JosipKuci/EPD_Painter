@@ -100,11 +100,24 @@ struct PowerCtlConfig {
   // g16 pair leaves the 16-grey mode on the formula library; a null
   // direct table leaves that quality on the two-step transition path.
   // Array bounds are DEC_WF_LEN16 / DEC_WF_LEN_DIR (asserted below).
+  //
+  // The 16-grey tables come in one set PER QUALITY, because a train is
+  // only valid at the LENGTH it was calibrated at: NORMAL spends 13
+  // passes, HIGH spends 20. The pass period is the same for both, so the
+  // extra seven are not extra dose — the panel saturates around pass 10
+  // either way — they are extra ROOM. Every level below the saturation
+  // knee has to be placed by whitening and re-darkening rather than by
+  // stretching a darken run that has stopped responding, and those
+  // shapes need spare slots to fit. A board may be tuned for one quality
+  // and not the other; the unset pair falls back to the formula library
+  // for that quality alone.
   struct TrainTables {
-      const uint8_t (*g16_apply)[13]     = nullptr;  // [16][13] apply trains
-      const uint8_t (*g16_remove)[13]    = nullptr;  // [16][13] charge-matched removes
-      const uint8_t (*dir_normal)[4][26] = nullptr;  // [4][4][26] NORMAL direct trains
-      const uint8_t (*dir_fast)[4][26]   = nullptr;  // [4][4][26] FAST direct trains
+      const uint8_t (*g16_apply)[13]      = nullptr;  // [16][13] NORMAL applies
+      const uint8_t (*g16_remove)[13]     = nullptr;  // [16][13] NORMAL removes
+      const uint8_t (*g16_apply_high)[32] = nullptr;  // [16][32] HIGH applies
+      const uint8_t (*g16_remove_high)[32]= nullptr;  // [16][32] HIGH removes
+      const uint8_t (*dir_normal)[4][26]  = nullptr;  // [4][4][26] NORMAL direct trains
+      const uint8_t (*dir_fast)[4][26]    = nullptr;  // [4][4][26] FAST direct trains
   };
 
 
@@ -135,14 +148,159 @@ struct PowerCtlConfig {
 
       Shift shift;
 
-      // 16-grey constant pass period per quality (microseconds). The pass
-      // loop pads every pass to this so retention dose depends only on the
-      // trains, and the trains are calibrated AT this period — so it is
-      // per-board: it must exceed the board's worst-case row loop plus the
-      // quality's settle floor. Boards whose control lines ride a shift
-      // register (H716) have much slower rows and need a longer period.
+      // 16-grey constant pass period (microseconds). The pass loop pads
+      // every pass to this so retention dose depends only on the trains,
+      // and the trains are calibrated AT this period — so it is per-board:
+      // it must exceed the board's worst-case row loop plus the settle
+      // floor below. Boards whose control lines ride a shift register
+      // (H716) have much slower rows and need a longer period.
+      //
+      // Times the train length, this is the frame cost: NORMAL 13 x 15 ms
+      // ~ 195 ms, HIGH 20 x 15 ms ~ 300 ms.
+      //
+      // Both qualities run the SAME period. HIGH is not slower passes, it
+      // is more of them: 20 slots against 13. Measured on a LilyGo (dose
+      // ladder at 19/15/13 ms, 26 July 2026), a longer pass bought no
+      // extra depth whatsoever - all three periods bottomed out at the
+      // identical black - while making every slot coarser and, worse,
+      // making most of them useless: at 19 ms the response stopped moving
+      // after 7 passes, at 15 ms it was still resolving at 10. A longer
+      // pass therefore costs accuracy AND wastes slots AND takes longer,
+      // which is not a trade.
       int g16_pass_us_normal = 15000;
-      int g16_pass_us_high   = 19000;
+      int g16_pass_us_high   = 15000;
+
+      // Minimum idle time appended to a pass when the row loop has already
+      // eaten the period. It is a SAFETY FLOOR, not a tuning knob: if it
+      // ever engages, that pass ran longer than the period and dose is
+      // content-dependent again — the exact fault the constant period was
+      // introduced to remove. Keep it comfortably below
+      // (period - worst-case row loop), which on these boards is about
+      // 10.5 ms at ten sweeps.
+      //
+      // One value for both qualities. HIGH used to hold 8000 against
+      // NORMAL's 4000, which is what forced HIGH's period up to 19 ms and
+      // therefore made its dose quantum 27% coarser than NORMAL's — for
+      // settle time the panel demonstrably does not use. The float-gap
+      // probe hands a pixel a WHOLE extra pass period of idle and measures
+      // the effect as zero, thirteen times across three panels; 4 ms more
+      // of the same is not going to register.
+      // 1500, not 4000. The old 4 ms was pure margin, and it was expensive
+      // margin: the budget for a row loop is (period - floor), so 4 ms of
+      // floor meant rich content had only 11 ms to work in. A photograph
+      // measures 13.3 ms, so the pass silently stretched to 17.3 ms and
+      // every level on that content came out ~15% over-dosed - which is
+      // exactly why tables tuned on the match card banded on real images.
+      //
+      // Reclaiming it is safe on the evidence: the float-gap probe hands a
+      // pixel a WHOLE extra pass period of idle settle and measures the
+      // effect as zero, thirteen times across three panels. Guaranteed
+      // settle is not buying anything, and 1.5 ms leaves the budget at
+      // 13.5 ms - above the worst row loop actually observed.
+      int g16_settle_us = 1500;
+
+      // Extra microseconds held after each row's latch, before the next
+      // row's data starts clocking. Zero by default: the charging window is
+      // then just the row transfer time (~9-19 us at measured row-loop
+      // rates). Applied at NORMAL and HIGH only — FAST cannot afford it
+      // (see sendRow).
+      //
+      // Exists to test WHY a panel shows a left-to-right gradient. Every
+      // column of a line is latched and driven simultaneously, so the
+      // gradient cannot come from any sequential drive along the row - it
+      // must be the supply rail drooping with distance from its feed point
+      // while the whole line draws current at once. Two mechanisms fit:
+      //
+      //   transient   the pixel capacitor is still charging through that
+      //               resistance when the window closes. MORE TIME HELPS.
+      //   steady      the rail simply sits lower for the whole window; the
+      //               capacitor reaches that lower voltage and stops.
+      //               More time buys nothing.
+      //
+      // Both look identical in a scan. Raising this and re-measuring the
+      // gradient separates them. Costs height x this per pass, so it eats
+      // into the pass period's padding - check the row loop still fits.
+      // Default 4 us, measured. At 16-grey this is FREE: a pass is already
+      // padded to a constant period with ~8 ms spare, so the 2.2 ms it costs
+      // (540 rows x 4 us) is taken out of idle padding and the frame time is
+      // unchanged - 195 ms at NORMAL either way. What it buys is charge that
+      // was otherwise being cut off mid-transfer: on a LilyGo, L12's landing
+      // moved 13 units darker and its left-to-right gradient fell from 6.0 to
+      // 2.4 scan units. Beyond ~4 us the gradient stops improving, so this is
+      // the knee rather than a round number.
+      //
+      // Tables are only valid at the row timing they were tuned at, exactly
+      // as they are only valid at their pass period - so changing this
+      // invalidates every tuned blob on the board.
+      // Back to 0. The 4 us it briefly defaulted to genuinely improved
+      // charging (L12's left-to-right gradient 6.0 -> 2.4 scan units, and
+      // its landing 13 units darker), but it adds 2.2 ms to EVERY row loop -
+      // and that pushed rich content over the pass budget: a photograph
+      // measured 13.3 ms of row loop against a 15 ms period with a 4 ms
+      // settle floor, so the pass stretched to 17.3 ms and every level on
+      // that content landed 15% over-dosed. Tables tuned on the match card
+      // (7-8 ms row loops, period exactly 15 ms) then band badly on real
+      // images. Timing integrity first; the charging fix needs the budget
+      // sorted before it can come back.
+      // 4 us, measured. Held after each row's latch so the pixel finishes
+      // charging: L12's left-to-right gradient fell 6.0 -> 2.4 scan units
+      // and its landing moved 13 units darker. The control experiment -
+      // the same 2.16 ms added as pass padding instead - moved the mean
+      // only 2.5, so this is the row charging window and not dose.
+      //
+      // Free at 16-grey: the pass is already padded to a constant period,
+      // so this comes out of idle time and the frame stays 195 ms at
+      // NORMAL. Never applied at 4-level (see sendRow) - there is no
+      // padding there and it would cost ~27% of the frame rate.
+      // PER QUALITY, exactly like the pass period above - and for the same
+      // reason. A table is only valid at the row timing it was tuned at, so
+      // a board carrying a NORMAL set tuned at 0 and a HIGH set tuned at 4
+      // needs both, or whichever blob loads last silently dictates the
+      // timing for the other. (That is not hypothetical: load order is
+      // FAST, NORMAL, HIGH, so HIGH used to win and drive NORMAL's tables
+      // ~2 grey steps out at the deep end.)
+      int row_extra_us_normal = 4;
+      int row_extra_us_high   = 4;
+
+      // The value in force for the quality currently selected.
+      int rowExtraUs() const {
+        return quality == Quality::QUALITY_HIGH ? row_extra_us_high
+                                                : row_extra_us_normal;
+      }
+
+      // Held LE pulse width, in nanoseconds. 0 keeps the historical
+      // behaviour, which is that the pulse has NO defined width at all: it
+      // is `set(true); set(false);` back to back through a virtual call, so
+      // the high time is whatever the vtable dispatch and I-cache happen to
+      // cost that iteration — order 40-80 ns, unspecified and variable.
+      //
+      // That is close enough to a source driver's minimum latch width to be
+      // worth controlling, because a marginal LE would latch LOAD-DEPENDENTLY:
+      // a line switching many outputs droops the rail, moving the effective
+      // logic threshold, so busy lines would latch less completely than
+      // quiet ones. That is indistinguishable, from the glass, from an
+      // incomplete charge — and it is the competing explanation for the
+      // content-dependent darkening that row_extra_us also treats.
+      //
+      // Cost is per row per pass: 540 rows x 20 passes = 10800 pulses in a
+      // HIGH frame, so 200 ns costs 2.2 ms of frame and 1 us costs 10.8 ms.
+      // At 16-grey that comes out of the pass padding and is free.
+      //
+      // 1000 ns is MEASURED, and it is an optimum rather than a floor -
+      // going further is actively harmful. LE is a level-transparent latch
+      // and the next row's DMA is already running when it goes high, so a
+      // long hold lets the source outputs track the incoming data. Solid
+      // content does not care (neighbouring rows are identical) but a Bayer
+      // dither's neighbouring rows are anti-correlated, so the bleed drags
+      // fine detail toward its local average. Measured on the glass, the
+      // dithered reference falls to a minimum at 1 us and then climbs back:
+      // at 4 us it is WORSE than no hold at all (L8 104.0 vs 103.1).
+      //
+      // Beware of tuning this against flat patches alone: their content
+      // dependence keeps improving to 4 us, so that metric on its own picks
+      // a value that wrecks detail. Judge it on the dither.
+      int le_hold_ns = 1000;
+
 
       // Scanner-tuned trains for this board (null members = untuned; see
       // TrainTables). setGreyLevels(16) and setDirectTransitions() load
@@ -160,7 +318,32 @@ struct PowerCtlConfig {
       // diffusing error against an assumed even ramp is what banding looks
       // like. Null means the panel has never been measured, in which case
       // an even ramp is the only honest guess available.
-      const uint8_t *level_lum = nullptr;
+      //
+      // Per quality, for the same reason the trains are: HIGH's longer
+      // trains reach a deeper black and re-space everything below it, so
+      // quantising a HIGH image against the NORMAL curve diffuses error
+      // into levels that are no longer where it thinks. levelLum() picks;
+      // a board tuned for only one quality falls back to the set it has.
+      const uint8_t *level_lum      = nullptr;
+      const uint8_t *level_lum_high = nullptr;
+
+      // The four levels of 4-level mode, same convention, measured by the
+      // FAST tune. Separate because 4-level mode does NOT render levels
+      // 0..3 of the 16-grey curve — it drives its own waveform tables to
+      // its own four landings, and reading the first four entries of a
+      // 16-entry curve (which is what happened before this existed) hands
+      // the dither four near-white values for a full black-to-white ramp.
+      const uint8_t *level_lum4 = nullptr;
+
+      // The measured level curve to quantise against, for the mode and
+      // quality currently selected. Null = never measured; assume even
+      // spacing, which is the only honest guess and also exactly the
+      // assumption that produces banding.
+      const uint8_t *levelLum(int levels = 16) const {
+        if (levels == 4) return level_lum4;
+        if (quality == Quality::QUALITY_HIGH && level_lum_high) return level_lum_high;
+        return level_lum ? level_lum : level_lum_high;
+      }
 
       // Returns a copy of this config with rotation set — lets you write:
       //   EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_CW));
@@ -249,21 +432,62 @@ struct PowerCtlConfig {
   // Call after begin(). Returns false on refusal or allocation failure.
   bool setGreyLevels(int levels);
 
+  // 16-grey train length, per quality. NORMAL spends 13 passes; HIGH
+  // spends 20. (Briefly 25, with alternate slots pinned float to give the
+  // supply recovery time - dropped once row_extra_us fixed the charging
+  // directly, which is both simpler and cheaper than spending slots on it.) This is the whole difference in kind between the two
+  // modes: a 13-pass pure-darken run saturates well before the glass is
+  // as dark as it can get, and every level below the saturation knee has
+  // to be placed by re-darkening after a whiten — a knob that needs
+  // spare passes to turn. HIGH buys both with seven more.
+  //
+  // Public because the calibration rig and the blob format are both
+  // sized by them: a stored table read at the wrong stride is silently
+  // the wrong tables.
+  static constexpr int DEC_WF_LEN16      = 13;  // NORMAL
+  static constexpr int DEC_WF_LEN16_HIGH = 20;  // HIGH
+  // Array bound, deliberately larger than either length in use. Storage is
+  // sized by THIS, so widening the max changes the blob layout and
+  // invalidates saved tables - leaving headroom now avoids doing that
+  // again the next time a train wants to get longer.
+  static constexpr int DEC_WF_LEN16_MAX  = 32;
+  static constexpr int DEC_WF_LEN_DIR    = 26;  // max direct-train length
+
+  // How many passes a 16-grey train has at the current quality: 13 at
+  // NORMAL, 20 at HIGH. Everything that builds, uploads or stores a
+  // 16-grey train must agree with this — a train tuned at one length is
+  // meaningless at the other, and so is a table read at the wrong stride.
+  int g16TrainLen() const {
+    return _config.quality == Quality::QUALITY_HIGH ? DEC_WF_LEN16_HIGH
+                                                    : DEC_WF_LEN16;
+  }
+
   // Override one 16-grey decision train (id = (level << 1) | dir, dir 0 =
-  // apply / 1 = remove; train = DEC_WF_LEN16 drive codes). The calibration
+  // apply / 1 = remove; train = g16TrainLen() drive codes). The calibration
   // rig's hook: probe sketches load candidate trains and the scanner
   // measures what the glass actually does with them. Only meaningful after
   // setGreyLevels(16) has built the default library.
   void setDecisionTrain(uint8_t id, const uint8_t *train) {
-    if (id >= 2 && id < DEC_IDS && train)
-      for (int p = 0; p < DEC_WF_LEN16; p++) dec_trains16[id][p] = train[p];
+    if (id < 2 || id >= DEC_IDS || !train) return;
+    const int len = g16TrainLen();
+    for (int p = 0; p < len; p++) dec_trains16[id][p] = train[p];
+    // Tail beyond the quality's length must read as float, or a train
+    // left behind by a longer HIGH upload keeps driving under NORMAL.
+    for (int p = len; p < DEC_WF_LEN16_MAX; p++) dec_trains16[id][p] = 0;
   }
 
   // Rebuild the 16-grey train library to its defaults: the formula trains
-  // overlaid with the preset's scanner-tuned tables (Config::trains) when
-  // the board has them. Runs automatically on the first setGreyLevels(16);
-  // call it manually to undo experimental setDecisionTrain() uploads.
+  // overlaid with the preset's scanner-tuned tables for the CURRENT
+  // quality (Config::trains) when the board has them. Runs automatically
+  // on the first setGreyLevels(16) and on every setQuality() while
+  // 16-grey is on; call it manually to undo experimental
+  // setDecisionTrain() uploads.
   void rebuildDecisionTrains() { _grey16_build_trains(); }
+
+  // Re-read Config::trains for the direct grey-to-grey engine — the hook
+  // for installing tuned direct tables after begin(). No-op unless the
+  // direct engine has been enabled.
+  void reloadDirectTrains() { if (dec_spill_dir) _load_preset_direct_trains(); }
 
   // Direct grey-to-grey transitions (4-level mode — see DECISION_ENGINE.md
   // "direct grey-to-grey transitions"). When on, a changed occupied pixel
@@ -485,8 +709,10 @@ private:
   static constexpr int DEC_MAX_SWEEPS_DIR = 4; // direct-transition lists
   static constexpr int DEC_MAX_SWEEPS16 = 10;  // 16-grey: ceil(30 decisions / 3)
   static constexpr int DEC_IDS          = 32;  // 16 levels x 2 directions
-  static constexpr int DEC_WF_LEN16     = 13;  // train length (NORMAL/HIGH)
-  static constexpr int DEC_WF_LEN_DIR   = 26;  // max direct-train length
+  // A grey-to-grey pixel's apply is shifted right past its remove
+  // (temporal partition), so a shifted train can be as long as two
+  // 16-grey trains back to back.
+  static constexpr int DEC_WF_LEN_SHIFT  = 2 * DEC_WF_LEN16_MAX;
   // TrainTables (declared before these constants exist) hard-codes the
   // same lengths in its pointer types — keep them in lock-step. (Member
   // access through a null pointer, not construction: an unevaluated
@@ -495,6 +721,9 @@ private:
   static_assert(sizeof(*static_cast<TrainTables*>(nullptr)->g16_apply) ==
                 DEC_WF_LEN16,
                 "TrainTables g16 row length must equal DEC_WF_LEN16");
+  static_assert(sizeof(*static_cast<TrainTables*>(nullptr)->g16_apply_high) ==
+                DEC_WF_LEN16_MAX,
+                "TrainTables g16 HIGH row length must equal DEC_WF_LEN16_MAX");
   static_assert(sizeof(*static_cast<TrainTables*>(nullptr)->dir_normal) ==
                 4 * DEC_WF_LEN_DIR,
                 "TrainTables direct row length must equal DEC_WF_LEN_DIR");
@@ -504,7 +733,7 @@ private:
   // fixed period makes dose depend only on the trains (phase D; see
   // DECISION_ENGINE.md "dose is content-dependent").
   static constexpr int DEC_PASS_US16_NORMAL = 15000;
-  static constexpr int DEC_PASS_US16_HIGH   = 19000;
+  static constexpr int DEC_PASS_US16_HIGH   = 15000;
   struct LineSweep {
     const uint8_t *plane_row;  // slot-encoded 2bpp row
     uint32_t       mask;       // chunk mask for this row
@@ -548,13 +777,13 @@ private:
   uint8_t   *packed4_screenbuffer = nullptr;  // w*h/2
   uint8_t   *dec_spill            = nullptr;  // (DEC_MAX_SWEEPS16-2) slot planes
   LineSweep *dec_sweeps16         = nullptr;  // [height * DEC_MAX_SWEEPS16]
-  uint8_t    dec_trains16[DEC_IDS][DEC_WF_LEN16];
+  uint8_t    dec_trains16[DEC_IDS][DEC_WF_LEN16_MAX];
   // Temporal partition state: dec_gg_from[to] = bitmask of from-levels
   // that transitioned to `to` this frame (set by discovery). Each apply
   // id shifts by the longest remove among ITS OWN from-partners — not a
   // global R — into the per-frame dec_shifted scratch.
   uint16_t   dec_gg_from[16];
-  uint8_t    dec_shifted[DEC_IDS][DEC_WF_LEN_DIR];
+  uint8_t    dec_shifted[DEC_IDS][DEC_WF_LEN_SHIFT];
   bool       _grey16 = false;
   uint32_t _decision_discover16();
   void _decision_discover16_row(int row);

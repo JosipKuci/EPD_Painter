@@ -441,44 +441,67 @@ uint32_t EPD_Painter::_decision_discover_direct() {
 }
 
 // ---- train library --------------------------------------------------------
-// Formula trains for NORMAL/HIGH's 13 passes, overlaid with the preset's
-// scanner-tuned tables when the board has them (phase D — see
-// EPD_Painter_trains.h). Formula dose is counted in half-pass units: a darken
-// pass is 2 units, and an odd dose gets one extra darken pass immediately
-// half-undone by a whiten in the following pass — the pixel-cap retention
-// physics gives roughly a half-step net. 15 levels map onto doses
-// round(g * 26 / 15) = 2..26, all distinct, so every level lands on its own
-// dose even though there are more levels than passes. Removes whiten from
-// pass 0 for long enough to erase their level with margin; overdriving
-// toward white is self-limiting (it is how clear() works).
+// Formula trains for the current quality's pass count (13 NORMAL, 20 HIGH),
+// overlaid with the preset's scanner-tuned tables for THAT quality when the
+// board has them (phase D — see EPD_Painter_trains.h). Formula dose is
+// counted in half-pass units: a darken pass is 2 units, and an odd dose gets
+// one extra darken pass immediately half-undone by a whiten in the following
+// pass — the pixel-cap retention physics gives roughly a half-step net. 15
+// levels map onto doses round(g * 2L / 15), all distinct, so every level
+// lands on its own dose even though there are more levels than passes.
+// Removes whiten from pass 0 for long enough to erase their level with
+// margin; overdriving toward white is self-limiting (it is how clear()
+// works).
+//
+// The formula is a placeholder in both qualities — it assumes the darken
+// response is linear in pass count, and it demonstrably is not (the deep end
+// saturates). It exists so an untuned board renders 16 monotonic greys, not
+// so it renders accurate ones. At HIGH the assumption is worse, because the
+// extra seven passes land entirely in the saturated region: expect an
+// untuned HIGH ramp to bunch at the dark end until the tuner has run.
 
 void EPD_Painter::_grey16_build_trains() {
   memset(dec_trains16, 0, sizeof(dec_trains16));
+  const int L = g16TrainLen();
   for (int g = 1; g <= 15; g++) {
     uint8_t *ap = dec_trains16[(g << 1) | 0];
     uint8_t *rm = dec_trains16[(g << 1) | 1];
 
-    const int dose = (g * 2 * DEC_WF_LEN16 + 7) / 15;   // half-pass units
+    const int dose = (g * 2 * L + 7) / 15;              // half-pass units
     const int full = dose / 2;
-    for (int p = 0; p < full; p++) ap[p] = 1;           // darken
-    if ((dose & 1) && full + 1 < DEC_WF_LEN16) {
+    for (int p = 0; p < full && p < L; p++) ap[p] = 1;  // darken
+    if ((dose & 1) && full + 1 < L) {
       ap[full]     = 1;                                 // extra darken…
       ap[full + 1] = 2;                                 // …half taken back
     }
 
     int wh = full + 3;                                  // erase with margin
-    if (wh > DEC_WF_LEN16) wh = DEC_WF_LEN16;
+    if (wh > L) wh = L;
     for (int p = 0; p < wh; p++) rm[p] = 2;             // whiten
   }
 
-  // Overlay the preset's scanner-tuned tables. Both or neither: an apply
-  // without its charge-matched remove would break the DC ledger.
-  if (_config.trains.g16_apply && _config.trains.g16_remove) {
+  // Overlay the preset's scanner-tuned tables for this quality. Both or
+  // neither: an apply without its charge-matched remove would break the DC
+  // ledger. A board tuned for one quality only keeps the formula for the
+  // other rather than borrowing tables calibrated at the wrong period and
+  // the wrong length.
+  const uint8_t *ap_tbl = nullptr, *rm_tbl = nullptr;
+  int stride = 0;
+  if (_config.quality == Quality::QUALITY_HIGH) {
+    if (_config.trains.g16_apply_high && _config.trains.g16_remove_high) {
+      ap_tbl = &_config.trains.g16_apply_high[0][0];
+      rm_tbl = &_config.trains.g16_remove_high[0][0];
+      stride = DEC_WF_LEN16_MAX;      // tables are stored at full width
+    }
+  } else if (_config.trains.g16_apply && _config.trains.g16_remove) {
+    ap_tbl = &_config.trains.g16_apply[0][0];
+    rm_tbl = &_config.trains.g16_remove[0][0];
+    stride = DEC_WF_LEN16;
+  }
+  if (ap_tbl) {
     for (int g = 1; g <= 15; g++) {
-      memcpy(dec_trains16[(g << 1) | 0], _config.trains.g16_apply[g],
-             DEC_WF_LEN16);
-      memcpy(dec_trains16[(g << 1) | 1], _config.trains.g16_remove[g],
-             DEC_WF_LEN16);
+      memcpy(dec_trains16[(g << 1) | 0], ap_tbl + (size_t)g * stride, stride);
+      memcpy(dec_trains16[(g << 1) | 1], rm_tbl + (size_t)g * stride, stride);
     }
   }
 }

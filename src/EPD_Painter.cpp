@@ -127,6 +127,59 @@ extern "C" void epd_painter_convert_packed_fb_to_ink_or(
   const uint8_t *packed_fb, uint8_t *output, uint32_t length,
   const uint8_t *waveform, uint32_t chunk_flags);
 
+// Wait until an absolute microsecond deadline.
+//
+// Every inter-pass wait in this driver is part of the retention dose the
+// waveform tables are calibrated against, so "about 4 ms" is not good
+// enough. vTaskDelay quantises to the FreeRTOS tick, unblocks on a tick
+// boundary rather than when the interval expires, and then still has to be
+// scheduled behind WiFi and everything else - several percent of a 15 ms
+// period, where a 15% dose error is enough to band a ramp visibly.
+//
+// esp_timer_get_time() is a 64-bit microsecond counter off the S3's
+// systimer: monotonic, no wrap to worry about, ~100 ns to read. Sleep while
+// there is more than ~1.5 ms left (so the CPU is yielded and the watchdog
+// fed), then spin out the remainder. The spin is bounded and the paint task
+// is dedicated, so it costs nothing that matters, and the deadline lands
+// within interrupt latency instead of within a tick.
+static inline void epd_wait_until_us(int64_t target_us) {
+  for (;;) {
+    const int64_t left = target_us - esp_timer_get_time();
+    if (left <= 1500) break;
+    EPD_DELAY_MS((uint32_t)((left - 1200) / 1000));
+  }
+  while (esp_timer_get_time() < target_us) { /* fine wait */ }
+}
+
+// Sub-microsecond hold, off the CPU cycle counter.
+//
+// esp_timer_get_time() has ~100 ns of read overhead and 1 us resolution, so
+// it cannot express the widths that matter for a latch pulse. CCOUNT ticks
+// once per CPU clock — 4.17 ns at 240 MHz — and reads in a few cycles.
+//
+// The loop itself sets the resolution floor: a read, a subtract and a
+// compare is order 10-15 cycles, so anything under ~60 ns is simply "one
+// pass of the loop" rather than the width asked for. Values are therefore
+// a lower bound on the true hold, never an upper one.
+// The CPU clock rate, read once at begin() and held.
+//
+// epd_hold_ns() counts CPU CYCLES, so a cycle is 4.17 ns at 240 MHz and
+// 12.5 ns at 80. Nothing in the driver changes the clock, so one reading is
+// correct — but if frequency scaling is ever added, THIS MUST BE UPDATED
+// WITH IT. A stale rate scales every LE pulse silently, and a wrong latch
+// width does not announce itself; it just quietly stops reproducing the
+// tables it was calibrated against.
+static uint32_t s_epd_cpu_mhz = 240;
+
+static inline uint32_t epd_cpu_mhz() { return s_epd_cpu_mhz; }
+
+static inline void IRAM_ATTR epd_hold_ns(uint32_t ns) {
+  if (!ns) return;
+  const uint32_t cycles = (uint32_t)(((uint64_t)ns * epd_cpu_mhz()) / 1000ULL);
+  const uint32_t t0 = esp_cpu_get_cycle_count();
+  while ((esp_cpu_get_cycle_count() - t0) < cycles) { /* spin */ }
+}
+
 extern "C" uint32_t epd_painter_ink_dual(const uint8_t *packed_paintbuffer, uint8_t *packed_fastbuffer, uint8_t *packed_lightbuffer, uint8_t *packed_screenbuffer, uint32_t length, uint32_t *maskL_out);
 
 static inline void epd_gpio_func_sel(int pin) {
@@ -154,6 +207,11 @@ void EPD_Painter::setQuality(Quality quality) {
   // Direct trains are per-quality: once the direct engine has been
   // enabled, keep the loaded set matched to the quality.
   if (changed && dec_spill_dir) _load_preset_direct_trains();
+  // So are the 16-grey trains, and by more than a table: NORMAL runs 13
+  // passes at one period, HIGH 20 at another. Leaving the library alone
+  // across a quality change silently drove one quality's trains at the
+  // other's dose, which is the single reason HIGH never looked right.
+  if (changed && _grey16) _grey16_build_trains();
 }
 
 // Load the preset's tuned direct tables for the current quality. Boards
@@ -169,10 +227,22 @@ void EPD_Painter::_load_preset_direct_trains() {
     default: break;  // HIGH: no tuned set
   }
   for (int f = 1; f <= 3; f++)
-    for (int t = 1; t <= 3; t++)
-      if (f != t)
-        setDirectTrain((uint8_t)f, (uint8_t)t, tbl ? tbl[f][t] : nullptr,
-                       DEC_WF_LEN_DIR);
+    for (int t = 1; t <= 3; t++) {
+      if (f == t) continue;
+      const uint8_t *tr = tbl ? tbl[f][t] : nullptr;
+      // An all-float row is an ABSENT pair, not a train that does nothing.
+      // A table may be partly filled — the FAST tuner publishes only the
+      // pairs it actually converged on — and loading a row of zeros would
+      // engage the direct engine for that pair and then drive no passes at
+      // all, leaving the pixel stuck at its old level. Unloaded pairs must
+      // fall back to the DC-correct two-step.
+      if (tr) {
+        bool any = false;
+        for (int p = 0; p < DEC_WF_LEN_DIR && !any; p++) any = (tr[p] != 0);
+        if (!any) tr = nullptr;
+      }
+      setDirectTrain((uint8_t)f, (uint8_t)t, tr, DEC_WF_LEN_DIR);
+    }
 }
 
 // =============================================================================
@@ -434,13 +504,33 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
     // Latch the previously transmitted data onto the source outputs without
     // advancing the gate: the current row drives this data for one more slot.
     _pin_le->set(true);
+    if (_grey16) epd_hold_ns(_config.le_hold_ns);
     _pin_le->set(false);
   } else {
     _pin_le->set(true);
+    if (_grey16) epd_hold_ns(_config.le_hold_ns);
     _pin_le->set(false);
     _pin_ckv->set(false);
     EPD_DELAY_US(1);
     _pin_ckv->set(true);
+  }
+  // Optional extra charging time per row (see Config::row_extra_us). Held
+  // after the gate advances and before the next row's transfer is started,
+  // so it lengthens the window during which this row's pixels are being
+  // charged rather than merely idling the bus.
+  //
+  // 16-GREY ONLY, and the distinction is frame rate rather than quality.
+  // This costs height x row_extra_us per pass — 2.2 ms at 540 rows and 4 us.
+  // A 16-grey pass is already padded to a constant period with ~8 ms spare,
+  // so the cost is absorbed entirely: same 195 ms frame at NORMAL, more
+  // charge delivered, nothing paid. The 4-level path has no such padding
+  // (just a fixed inter-pass delay), so the same 2.2 ms lands straight on
+  // the frame — about -27% at 4-level NORMAL and far worse at FAST. And
+  // four coarse levels barely notice the positional variation this exists
+  // to correct.
+  if (_grey16) {
+    const int extra = _config.rowExtraUs();
+    if (extra > 0) EPD_DELAY_US(extra);
   }
 #ifdef EPD_ROW_PHASE_TIMING
   g_rp_pins_us += esp_timer_get_time() - _rp_t2;
@@ -678,6 +768,14 @@ bool EPD_Painter::begin() {
   xSemaphoreGive(_paint_active_sem); 
   _paint_buffer_sem = xSemaphoreCreateBinary();
   xSemaphoreGive(_paint_buffer_sem); 
+
+  // Seed the clock rate from the hardware rather than trusting the declared
+  // default — epd_hold_ns() sizes the LE pulse in CPU cycles, so a sketch
+  // running at anything other than 240 MHz would get the wrong width.
+  {
+    const uint32_t now_mhz = (uint32_t)getCpuFrequencyMhz();
+    if (now_mhz) s_epd_cpu_mhz = now_mhz;
+  }
 
   xTaskCreatePinnedToCore(
     _paint_task_entry, "epd_paint", 8000, this, 10, &_paint_task_h, 0);
@@ -1091,6 +1189,11 @@ void EPD_Painter::_paint_task_body() {
     for (int id = 0; id < DEC_IDS; id++) dec_len[id] = (uint8_t)wf_len;
 
     if (_grey16) {
+      // 16-grey trains are the quality's own length, not the 4-level pass
+      // count wf_len was seeded from: at HIGH they are 20 long, and a
+      // stale 13 would float the last seven passes of every train.
+      const int g16len = g16TrainLen();
+      for (int id = 0; id < DEC_IDS; id++) dec_len[id] = (uint8_t)g16len;
       uint32_t inplay = 0;
       for (int row = 0; row < _config.height; row++) inplay |= dec_todo[row];
 
@@ -1113,15 +1216,15 @@ void EPD_Painter::_paint_task_body() {
           if (!(fromset & (1u << f))) continue;
           const uint8_t *rt = dec_train[(f << 1) | 1];
           if (!rt) continue;
-          for (int p = R; p < DEC_WF_LEN16; p++)
+          for (int p = R; p < g16len; p++)
             if (rt[p]) R = p + 1;
         }
         if (R > 0) {
           uint8_t *sh = dec_shifted[aid];
           memset(sh, 0, R);
-          memcpy(sh + R, dec_train[aid], DEC_WF_LEN16);
+          memcpy(sh + R, dec_train[aid], g16len);
           dec_train[aid] = sh;
-          dec_len[aid] = (uint8_t)(R + DEC_WF_LEN16);
+          dec_len[aid] = (uint8_t)(R + g16len);
         }
       }
 
@@ -1158,6 +1261,7 @@ void EPD_Painter::_paint_task_body() {
     // pixel-disjoint by construction.
 #ifdef EPD_GREY16_PASS_TIMING
     int64_t _g16_rowloop_min = 0, _g16_rowloop_max = 0;
+    int64_t _g16_period_min = 0, _g16_period_max = 0;
 #endif
 #ifdef EPD_ROW_PHASE_TIMING
     { extern int64_t g_rp_wait_us, g_rp_pins_us; extern uint32_t g_rp_rows;
@@ -1219,24 +1323,57 @@ void EPD_Painter::_paint_task_body() {
         const int64_t period = (_config.quality == Quality::QUALITY_HIGH)
                                    ? _config.g16_pass_us_high
                                    : _config.g16_pass_us_normal;
-        const int64_t settle_floor =
-            (_config.quality == Quality::QUALITY_HIGH) ? 8000 : 4000;
-        int64_t pad = period - elapsed;
-        if (pad < settle_floor) pad = settle_floor;   // overrun: keep settle
-        EPD_DELAY_MS((uint32_t)((pad + 500) / 1000));
+        const int64_t settle_floor = _config.g16_settle_us;
+
+        // Pad to an ABSOLUTE deadline, not a relative delay.
+        //
+        // The old form asked vTaskDelay for a whole number of milliseconds,
+        // which stacked three errors on a quantity the trains are calibrated
+        // against: the pad was rounded to the nearest ms (±500 us), the tick
+        // granularity added up to another 1 ms, and the task then had to be
+        // *scheduled* behind WiFi and everything else. On a 15 ms period that
+        // is several percent of jitter, and a 15% dose error is enough to
+        // band a ramp visibly - so "constant pass period" was only constant
+        // to within the range that actually matters.
+        //
+        // Coarse then fine: sleep (yielding the CPU, feeding the watchdog)
+        // while there is more than ~1.5 ms to go, then spin on the
+        // microsecond counter for the remainder. The spin is bounded and the
+        // paint task is dedicated, so the cost is nothing that matters, and
+        // the deadline is hit to within interrupt latency rather than a tick.
+        int64_t target = pass_t0 + period;
+        const int64_t floor_target = esp_timer_get_time() + settle_floor;
+        if (target < floor_target) target = floor_target;   // overrun: keep settle
+        epd_wait_until_us(target);
+#ifdef EPD_GREY16_PASS_TIMING
+        {
+          const int64_t actual = esp_timer_get_time() - pass_t0;
+          if (pass == 0 || actual < _g16_period_min) _g16_period_min = actual;
+          if (actual > _g16_period_max) _g16_period_max = actual;
+        }
+#endif
       } else if (_config.quality == Quality::QUALITY_HIGH) {
-        EPD_DELAY_MS(8);
+        // 4-level keeps its "fixed wait after the row loop" semantics - it
+        // has no constant-period model and its tables are calibrated to
+        // that - but the wait itself is now honest to the microsecond
+        // rather than to a tick.
+        epd_wait_until_us(esp_timer_get_time() + 8000);
       } else if (_config.quality == Quality::QUALITY_NORMAL) {
-        EPD_DELAY_MS(4);
+        epd_wait_until_us(esp_timer_get_time() + 4000);
       }
       // QUALITY_FAST = No delay.
     }
 #ifdef EPD_GREY16_PASS_TIMING
-    if (_grey16)
-      printf("[grey16] pass row-loop %lld..%lld us (period %d us)\n",
+    if (_grey16) {
+      const int want = (int)(_config.quality == Quality::QUALITY_HIGH
+                                 ? _config.g16_pass_us_high
+                                 : _config.g16_pass_us_normal);
+      printf("[grey16] pass row-loop %lld..%lld us | ACTUAL period %lld..%lld us "
+             "(want %d, jitter %lld us)\n",
              (long long)_g16_rowloop_min, (long long)_g16_rowloop_max,
-             (int)(_config.quality == Quality::QUALITY_HIGH
-                       ? _config.g16_pass_us_high : _config.g16_pass_us_normal));
+             (long long)_g16_period_min, (long long)_g16_period_max, want,
+             (long long)(_g16_period_max - _g16_period_min));
+    }
 #endif
 #ifdef EPD_ASM_TIMING
     printf("[paint_task] convert_packed_fb_to_ink (all passes, all rows, darker+lighter): %lld us\n", _conv_total);
@@ -1663,8 +1800,8 @@ bool EPD_Painter::GrayDither::begin(const EPD_Painter &p,
     // What each level renders as: the panel's measured curve when it has been
     // tuned, an even ramp otherwise. The even ramp is the only honest guess
     // available, and is also exactly the assumption that produces banding.
-    if (p._config.level_lum)
-        for (int i = 0; i < _levels; i++) _lum[i] = p._config.level_lum[i];
+    if (const uint8_t *lum = p._config.levelLum(_levels))
+        for (int i = 0; i < _levels; i++) _lum[i] = lum[i];
     else
         for (int i = 0; i < _levels; i++)
             _lum[i] = (uint8_t)(255 - i * 255 / (_levels - 1));

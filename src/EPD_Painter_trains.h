@@ -4,13 +4,24 @@
 // set leave the pointers null and fall back to the formula library
 // (16-grey) and the two-step transition path (direct).
 //
-// 16-grey tables: [16][13] drive codes per level (0 float, 1 darken,
-// 2 whiten), apply + charge-matched remove, indexed by level 0..15
-// (level 0 = white, never driven). Tuned with the match-card method:
-// each level's flat native patch optically matched (flatbed scan)
-// against a Bayer-dithered black/white reference of density g/15, under
-// the preset's constant 16-grey pass period — the tables are only valid
-// AT that period (Config::g16_pass_us_normal).
+// 16-grey tables: drive codes per level (0 float, 1 darken, 2 whiten),
+// apply + charge-matched remove, indexed by level 0..15 (level 0 =
+// white, never driven). Tuned with the match-card method: each level's
+// flat native patch optically matched (flatbed scan) against a
+// Bayer-dithered black/white reference of density g/15, under the
+// preset's constant 16-grey pass period.
+//
+// ONE SET PER QUALITY, and they are not interchangeable. A train is
+// valid only at the pass period AND the pass count it was calibrated
+// at, and the two 16-grey qualities share neither:
+//
+//   g16_apply / g16_remove            [16][13]  NORMAL, at g16_pass_us_normal
+//   g16_apply_high / g16_remove_high  [16][20]  HIGH,   at g16_pass_us_high
+//
+// No board below carries a HIGH set yet — tune one with
+// examples/other/tuneup (pick HIGH) and it is stored per-board in flash.
+// A quality with no table falls back to the formula library, which is
+// monotonic but not accurate.
 //
 // Direct tables: [from][to][26] trains for the 4-level direct
 // grey-to-grey engine, NORMAL and FAST sets. DC constraint by

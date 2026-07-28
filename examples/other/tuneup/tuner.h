@@ -62,6 +62,25 @@
 
 #if TUNEUP_HAVE_JPEGDEC
 
+// ============================================================================
+// Train length — the one thing that differs in KIND between the qualities.
+//
+// NORMAL spends 13 passes per train, HIGH spends 20. That is not a knob:
+// it changes what the tuner can express. A pure-darken run saturates
+// somewhere around pass 8-10, so at 13 passes the deep end is nearly
+// flat and every level below the knee has to be placed with whitens and
+// re-darkens — which need spare passes to fit. HIGH's extra seven are
+// exactly that room, and they are also the only route to a black darker
+// than a saturating 13-pass run can reach.
+//
+// Everything in this file that emits, parses, uploads, mutates or stores
+// a train reads tuneLen. It is set once, by runSelfTune16(), from the
+// quality being tuned, and must agree with the driver's g16TrainLen() —
+// a train tuned at one length is meaningless at the other.
+// ============================================================================
+static const int TUNE_LEN_MAX = EPD_Painter::DEC_WF_LEN16_MAX;   // 20
+static int tuneLen = EPD_Painter::DEC_WF_LEN16;                  // 13 until set
+
 // ---- knobs -----------------------------------------------------------------
 // ---- tolerances are fractions of a LEVEL STEP, not scanner units ---------
 //
@@ -150,7 +169,14 @@ static const float TUNE_SPACING_W  = 0.5f;   // per neighbour, in the plan score
 // much smaller image than asked for (100 dpi became 75 on the Canon,
 // which shrank the panel below the geometry checks and failed the run).
 static const int   TUNE_DPI        = 150;
-static const int   TUNE_SCAN_GAP_MS = 4000;   // breather between scans
+// Breather between scans. Not for the panel's benefit - for the PRINTER's.
+// The pixma backend opens a fresh TCP connection to the scanner inside every
+// acquisition (the persistent SANE handle cannot prevent that), and this
+// printer starts refusing those connections under sustained rate. A variable
+// rather than a constant because the evolutionary tuner measures 60
+// candidates per scan instead of 15, so it can afford to be far more patient
+// per scan and still finish sooner.
+static int tuneScanGapMs = 4000;
 static const float TUNE_REG_W_MM   = 210.0f;
 static const float TUNE_REG_H_MM   = 148.0f;
 
@@ -188,12 +214,14 @@ struct TuneLv {
   // hand-tuned direct trains needed). Once a level goes raw the planner
   // leaves it alone; only a later rescue may change it again.
   bool    hasRaw;
-  uint8_t raw[13];
+  uint8_t raw[TUNE_LEN_MAX];
   uint8_t bad;                 // edits that made this level worse
   bool   frozen;               // give up editing: keep the best-known shape
 };
 static TuneLv tl[16];
-static float tuneDose[14];     // landing of {1 x n} (monotone-enforced), n=1..13
+// Landing of {1 x n} (monotone-enforced), n = 1..tuneLen. Indexed by pass
+// count, so it needs one more entry than the longest train.
+static float tuneDose[TUNE_LEN_MAX + 1];
 static float probeRef[16];     // dither reference means from the probe frame
 
 // ---- the unit every tolerance is expressed in ------------------------------
@@ -468,7 +496,7 @@ static bool tuneScan(float x0, float y0, float w, float h) {
   // accepting connections for a minute or so), so be patient before
   // troubling anyone: several quiet retries, and only then ask for hands.
   for (int attempt = 0;; attempt++) {
-    delay(TUNE_SCAN_GAP_MS);
+    delay(tuneScanGapMs);
     const size_t len = esclScan(x0, y0, w, h, TUNE_DPI);
     if (len && decodeGrayFromScan(len)) return true;
     if (attempt < 3) {
@@ -716,13 +744,62 @@ static bool tuneRegister() {
   tunePaint();
   tuneRepaint = tuneRepaintQuad;
   if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
-  const uint8_t qth = tuneDarkThreshold();
-  if (!qth || !tuneBBoxAdaptive(qth, &x0, &y0, &x1, &y1)) {
-    Serial.println("[tune] quadrant mark not found");
-    return false;
+
+  // WHICH QUADRANT IS DARKEST, not where the dark pixels are.
+  //
+  // The obvious implementation - threshold and take a bounding box - is
+  // wrong, and it took a second board to show it. The M5PaperS3 has a
+  // pronounced dark border around its active area; that border is darker
+  // than the threshold and spans the full width, so the "mark" bbox comes
+  // back as the whole panel (rmax 613 of 715 px) and the derived centre is
+  // the panel centre, which encodes no orientation at all. On a low
+  // contrast scan the same border also drags the histogram spread under
+  // the 25-level gate and the step fails outright.
+  //
+  // Comparing quadrant MEANS is immune to both: a border contributes
+  // equally to all four, so it cancels, and there is no threshold to fail.
+  // The mark is a full quarter of the panel, so the signal is enormous.
+  {
+    const int qw = grayW / 2, qh = grayH / 2;
+    double q[2][2] = { { 0, 0 }, { 0, 0 } };
+    long   n[2][2] = { { 0, 0 }, { 0, 0 } };
+    // Inset by an eighth all round so the bezel and any bed at the edges
+    // stay out of it entirely.
+    const int ix = grayW / 8, iy = grayH / 8;
+    for (int y = iy; y < grayH - iy; y++) {
+      const uint8_t *row = grayImg + (size_t)y * grayW;
+      const int qy = (y < qh) ? 0 : 1;
+      for (int x = ix; x < grayW - ix; x++) {
+        const int qx = (x < qw) ? 0 : 1;
+        q[qy][qx] += row[x];
+        n[qy][qx]++;
+      }
+    }
+    for (int a = 0; a < 2; a++)
+      for (int b = 0; b < 2; b++) q[a][b] = n[a][b] ? q[a][b] / n[a][b] : 255.0;
+
+    int dy = 0, dx = 0;
+    double lowest = 1e9;
+    for (int a = 0; a < 2; a++)
+      for (int b = 0; b < 2; b++)
+        if (q[a][b] < lowest) { lowest = q[a][b]; dy = a; dx = b; }
+
+    // The mark is a quarter of the panel painted black: it must be clearly
+    // darker than the brightest quadrant or something is wrong.
+    double brightest = 0;
+    for (int a = 0; a < 2; a++)
+      for (int b = 0; b < 2; b++) brightest = max(brightest, q[a][b]);
+    Serial.printf("[tune] quadrant means TL %.0f TR %.0f BL %.0f BR %.0f\n",
+                  q[0][0], q[0][1], q[1][0], q[1][1]);
+    if (brightest - lowest < 15.0) {
+      Serial.println("[tune] quadrant mark not found (no quadrant stands out)");
+      return false;
+    }
+    // The mark is painted TOP-LEFT in panel space. Wherever it landed in
+    // scan space tells us the mirroring.
+    tgeo.flipx = (dx == 1);
+    tgeo.flipy = (dy == 1);
   }
-  tgeo.flipx = ((x0 + x1) / 2) > grayW / 2;
-  tgeo.flipy = ((y0 + y1) / 2) > grayH / 2;
   Serial.printf("[tune] orientation: flipx=%d flipy=%d\n", tgeo.flipx, tgeo.flipy);
 
   Serial.println("[tune] geometry: anchor ring...");
@@ -742,18 +819,18 @@ static bool tuneRegister() {
 // ============================================================================
 // Trains: (d, w, g, r) grammar
 // ============================================================================
-static void tuneTrainOfShape(int d, int w, int g, int r, uint8_t out[13]) {
-  memset(out, 0, 13);
+static void tuneTrainOfShape(int d, int w, int g, int r, uint8_t *out) {
+  memset(out, 0, TUNE_LEN_MAX);
   int p = 0;
-  for (int i = 0; i < d && p < 13; i++) out[p++] = 1;
-  for (int i = 0; i < w && p < 13; i++) out[p++] = 2;
+  for (int i = 0; i < d && p < tuneLen; i++) out[p++] = 1;
+  for (int i = 0; i < w && p < tuneLen; i++) out[p++] = 2;
   p += g;                              // float gap
-  if (p > 13) p = 13;
-  for (int i = 0; i < r && p < 13; i++) out[p++] = 1;
+  if (p > tuneLen) p = tuneLen;
+  for (int i = 0; i < r && p < tuneLen; i++) out[p++] = 1;
 }
 
-static void tuneTrainOf(int lv, uint8_t out[13]) {
-  if (tl[lv].hasRaw) { memcpy(out, tl[lv].raw, 13); return; }
+static void tuneTrainOf(int lv, uint8_t *out) {
+  if (tl[lv].hasRaw) { memcpy(out, tl[lv].raw, TUNE_LEN_MAX); return; }
   tuneTrainOfShape(tl[lv].d, tl[lv].w, tl[lv].g, tl[lv].r, out);
 }
 
@@ -763,15 +840,15 @@ static void tuneTrainOf(int lv, uint8_t out[13]) {
 // charge-matched to a shape the level no longer has, and a DC imbalance is
 // ghosting.
 static int tuneNetOf(int lv) {
-  uint8_t t[13];
+  uint8_t t[TUNE_LEN_MAX];
   tuneTrainOf(lv, t);
   int net = 0;
-  for (int i = 0; i < 13; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
+  for (int i = 0; i < tuneLen; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
   return net;
 }
 
 static void tuneUploadApplies() {
-  uint8_t t[13];
+  uint8_t t[TUNE_LEN_MAX];
   for (int lv = 1; lv <= 15; lv++) {
     tuneTrainOf(lv, t);
     epd.driver().setDecisionTrain((uint8_t)(lv << 1), t);
@@ -779,28 +856,35 @@ static void tuneUploadApplies() {
 }
 
 // Parse a raw train into the grammar (d 1s, w 2s, g 0s, r 1s).
-static void tuneParse(const uint8_t t[13], TuneLv *L) {
+static void tuneParse(const uint8_t *t, TuneLv *L) {
   int p = 0;
   L->d = L->w = L->g = L->r = 0;
-  while (p < 13 && t[p] == 1) { L->d++; p++; }
-  while (p < 13 && t[p] == 2) { L->w++; p++; }
-  while (p < 13 && t[p] == 0) { L->g++; p++; }
-  while (p < 13 && t[p] == 1) { L->r++; p++; }
+  while (p < tuneLen && t[p] == 1) { L->d++; p++; }
+  while (p < tuneLen && t[p] == 2) { L->w++; p++; }
+  while (p < tuneLen && t[p] == 0) { L->g++; p++; }
+  while (p < tuneLen && t[p] == 1) { L->r++; p++; }
   if (!L->r) L->g = 0;                 // trailing floats aren't a gap
 }
 
 static void tuneSeedShapes() {
-  const uint8_t (*ap)[13] = epd.driver()._config.trains.g16_apply;
+  // Seed from the preset tables for the quality being tuned, when the
+  // board has them. Borrowing the other quality's would be worse than
+  // useless: at a different length and pass period those shapes are tens
+  // of units off, and the damped converger cannot walk that far.
+  const bool high = (tuneLen == EPD_Painter::DEC_WF_LEN16_HIGH);
+  const auto &trains = epd.driver()._config.trains;
+  const uint8_t *ap = high ? (trains.g16_apply_high ? &trains.g16_apply_high[0][0] : nullptr)
+                           : (trains.g16_apply      ? &trains.g16_apply[0][0]      : nullptr);
   for (int lv = 1; lv <= 15; lv++) {
-    uint8_t t[13];
+    uint8_t t[TUNE_LEN_MAX];
+    memset(t, 0, sizeof(t));
     if (ap) {
-      memcpy(t, ap[lv], 13);
+      memcpy(t, ap + (size_t)lv * tuneLen, tuneLen);
     } else {
-      memset(t, 0, 13);
-      const int dose = (lv * 2 * 13 + 7) / 15;
+      const int dose = (lv * 2 * tuneLen + 7) / 15;
       const int full = dose / 2;
-      for (int p = 0; p < full; p++) t[p] = 1;
-      if ((dose & 1) && full + 1 < 13) { t[full] = 1; t[full + 1] = 2; }
+      for (int p = 0; p < full && p < tuneLen; p++) t[p] = 1;
+      if ((dose & 1) && full + 1 < tuneLen) { t[full] = 1; t[full + 1] = 2; }
     }
     tl[lv] = {};
     tuneParse(t, &tl[lv]);
@@ -809,7 +893,13 @@ static void tuneSeedShapes() {
     tl[lv].bd = tl[lv].d; tl[lv].bw = tl[lv].w;
     tl[lv].bg = tl[lv].g; tl[lv].br = tl[lv].r;
   }
-  tl[15].d = 13; tl[15].w = 0; tl[15].g = 0; tl[15].r = 0;   // black anchor
+  // Black anchor: a provisional full-length darken run. tuneProbe()
+  // replaces it with the measured saturation knee as soon as the ladder
+  // has run — driving black for twenty passes when it stops responding at
+  // ten wastes ten passes AND forces a twenty-whiten remove to balance
+  // them, doubling the charge cycled through every black paint/erase for
+  // no extra depth at all.
+  tl[15].d = tuneLen; tl[15].w = 0; tl[15].g = 0; tl[15].r = 0;
   memset(removeExtra, 0, sizeof(removeExtra));
 }
 
@@ -819,7 +909,7 @@ static void tuneSeedShapes() {
 // Gains start as rough constants and are learned per level as the
 // converger observes what its edits actually do.
 static float tunePredict(const TuneLv &L, int d, int w, int g, int r) {
-  const int dd = constrain(d, 1, 13);
+  const int dd = constrain(d, 1, tuneLen);
   return tuneDose[dd] + w * L.gw - r * L.gr + g * L.gg;
 }
 
@@ -848,7 +938,8 @@ static void tuneSeedModel(bool reserveProbes);  // defined below, used by the pr
 // across the columns, read every column from one scan — so all cells share
 // one panel state and drift is common-mode. Three bases, because one base is
 // one panel region's opinion. The gap needs w > 0 and r > 0 to be legal, and
-// every cell here fits d+w+g+r <= 13 at g = 3.
+// every cell here fits d+w+g+r <= 13 at g = 3, so the bases stay legal at
+// either train length and the measured gain is comparable between them.
 // ============================================================================
 static bool tuneProbeGap() {
   Serial.println("[tune] float-gap ladder...");
@@ -857,27 +948,23 @@ static bool tuneProbeGap() {
   const int NB = (int)(sizeof(bases) / sizeof(bases[0]));
   const int NG = 4;                       // g = 0..3, the planner's own range
 
-  uint8_t t[13];
+  uint8_t t[TUNE_LEN_MAX];
   int col[NB][NG];
   int c = 1;
   for (int b = 0; b < NB; b++)
     for (int g = 0; g < NG; g++, c++) {
       col[b][g] = (c <= 14) ? c : 0;
       if (!col[b][g]) continue;
-      memset(t, 0, 13);
-      int p = 0;                          // same emitter shape as tuneTrainOf()
-      for (int i = 0; i < bases[b].d && p < 13; i++) t[p++] = 1;
-      for (int i = 0; i < bases[b].w && p < 13; i++) t[p++] = 2;
-      p += g;
-      if (p > 13) p = 13;
-      for (int i = 0; i < bases[b].r && p < 13; i++) t[p++] = 1;
+      // The emitter itself, so the cells cannot drift out of step with
+      // the shapes the planner will actually build.
+      tuneTrainOfShape(bases[b].d, bases[b].w, g, bases[b].r, t);
       epd.driver().setDecisionTrain((uint8_t)(col[b][g] << 1), t);
     }
 
   // Column 15 is the deep anchor the gradient correction needs; any columns
   // the bases did not claim get the same drive so they cannot mislead a scan.
-  memset(t, 0, 13);
-  for (int i = 0; i < 13; i++) t[i] = 1;
+  memset(t, 0, sizeof(t));
+  for (int i = 0; i < tuneLen; i++) t[i] = 1;
   epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
   for (int lv = c; lv <= 14; lv++)
     epd.driver().setDecisionTrain((uint8_t)(lv << 1), t);
@@ -968,38 +1055,124 @@ static bool tuneProbeGap() {
 }
 
 // ============================================================================
-// Pure-dose ladder probe. Column n runs {1 x n}; measured against the same
+// Pure-dose ladder probe. Column c runs {1 x n}; measured against the same
 // frame's dither refs. Yields the dose curve (monotone-enforced), the
 // per-level d-gains, and dose-inversion seeds for the deep levels.
+//
+// The card has 16 columns and two of them (0 and 15) are the gradient
+// anchors, so ONE card can measure at most 14 doses. That was never a
+// constraint at 13 passes. At HIGH's 20 it is, so the ladder runs a second
+// card and splices — see tuneProbe().
 // ============================================================================
-static bool tuneProbe() {
-  Serial.println("[tune] pure-dose ladder...");
-  uint8_t t[13];
-  for (int lv = 1; lv <= 15; lv++) {
-    memset(t, 0, 13);
-    for (int i = 0; i < min(lv, 13); i++) t[i] = 1;
-    epd.driver().setDecisionTrain((uint8_t)(lv << 1), t);
+
+// One card of the ladder: column c (1..14) drives {1 x (base + c - 1)},
+// column 15 keeps its full-length deep anchor so the gradient correction
+// has something to work with. Fills land[1..14] with gradient-corrected
+// landings, and refOut (if given) with the frame's dither references.
+static bool tuneDoseCard(int base, float *land, float *refOut) {
+  uint8_t t[TUNE_LEN_MAX];
+  for (int c = 1; c <= 14; c++) {
+    const int n = min(base + c - 1, tuneLen);
+    memset(t, 0, sizeof(t));
+    for (int i = 0; i < n; i++) t[i] = 1;
+    epd.driver().setDecisionTrain((uint8_t)(c << 1), t);
   }
+  memset(t, 0, sizeof(t));
+  for (int i = 0; i < tuneLen; i++) t[i] = 1;
+  epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
+
   tunePaintMatchCard();
   tuneClear();
   tunePaint();
   float ref[16], nat[16];
   if (!tuneMeasureCard(ref, nat)) return false;
-  tunePrintBands("probe", ref, nat);
+  tunePrintBands(base == 1 ? "probe" : "probe2", ref, nat);
   const float g0 = nat[0] - ref[0], g15 = nat[15] - ref[15];
-  for (int n = 1; n <= 13; n++)
-    tuneDose[n] = nat[n] - (g0 + (g15 - g0) * (n / 15.0f));
-  for (int n = 2; n <= 13; n++)                     // saturation is monotone;
-    if (tuneDose[n] > tuneDose[n - 1]) tuneDose[n] = tuneDose[n - 1];  // clamp noise
+  for (int c = 1; c <= 14; c++)
+    land[c] = nat[c] - (g0 + (g15 - g0) * (c / 15.0f));
+  if (refOut) for (int i = 0; i < 16; i++) refOut[i] = ref[i];
+  return true;
+}
+
+static bool tuneProbe() {
+  Serial.printf("[tune] pure-dose ladder (1..%d passes)...\n", tuneLen);
+  float landA[16], landB[16], ref[16];
+  if (!tuneDoseCard(1, landA, ref)) return false;
   for (int i = 0; i < 16; i++) probeRef[i] = ref[i];
+  for (int n = 1; n <= min(14, tuneLen); n++) tuneDose[n] = landA[n];
+
+  // Second card for the deep end. It starts at whatever pass count makes
+  // its 14 columns finish at tuneLen, so the two cards overlap by eight
+  // doses. The overlap is not redundancy — the panel drifts between
+  // frames, and the mean difference across those eight is exactly that
+  // drift, which puts card B on card A's scale before the splice. Without
+  // it the curve would step at the join and the seeder would read the
+  // step as a response.
+  if (tuneLen > 14) {
+    const int base = tuneLen - 13;              // covers base .. tuneLen
+    if (!tuneDoseCard(base, landB, nullptr)) return false;
+    float sum = 0;
+    int nov = 0;
+    for (int c = 1; c <= 14; c++) {
+      const int pass = base + c - 1;
+      if (pass <= 14) { sum += tuneDose[pass] - landB[c]; nov++; }
+    }
+    const float shift = nov ? sum / nov : 0.0f;
+    Serial.printf("[tune] deep card %d..%d passes, overlap shift %+.1f (n=%d)\n",
+                  base, tuneLen, shift, nov);
+    for (int c = 1; c <= 14; c++) {
+      const int pass = base + c - 1;
+      if (pass > 14 && pass <= tuneLen) tuneDose[pass] = landB[c] + shift;
+    }
+  }
+
+  for (int n = 2; n <= tuneLen; n++)                // saturation is monotone;
+    if (tuneDose[n] > tuneDose[n - 1]) tuneDose[n] = tuneDose[n - 1];  // clamp noise
 
   Serial.print("[tune] dose curve: ");
-  for (int n = 1; n <= 13; n++) Serial.printf("%.0f ", tuneDose[n]);
+  for (int n = 1; n <= tuneLen; n++) Serial.printf("%.0f ", tuneDose[n]);
   Serial.println();
+  // What the extra passes actually bought, stated plainly. If this is
+  // near zero the panel has saturated and HIGH's depth is coming from
+  // the grammar, not from the longer darken run - worth knowing before
+  // reading anything else into the run.
+  if (tuneLen > 13)
+    Serial.printf("[tune] passes 14..%d bought %.1f units of extra depth\n",
+                  tuneLen, tuneDose[13] - tuneDose[tuneLen]);
+
+  // ---- saturation knee: where darkening stops paying ----------------------
+  //
+  // Read from the FIRST card only (passes 1..14). That card is one frame
+  // with one gradient correction, so its deltas are trustworthy; the deep
+  // card's values are spliced across a join and every sweep taken so far
+  // shows a 3-4 unit step landing exactly ON that join, which is the
+  // signature of residual horizontal bias rather than of depth. Past the
+  // knee the curve is therefore held flat, so the planner cannot spend
+  // train length buying depth the splice only appeared to offer.
+  {
+    const float thr = 0.15f * tuneStep();
+    const int last = min(14, tuneLen);
+    int knee = last;
+    for (int n = 1; n < last; n++)
+      if (tuneDose[n] - tuneDose[n + 1] < thr) { knee = n; break; }
+    // One pass of margin: the panel drifts over a session and the anchor
+    // must stay saturated at the end of the run, not just at the start.
+    const int anchor = min(tuneLen, knee + 1);
+    Serial.printf("[tune] saturation knee at pass %d -> black anchored at %d "
+                  "darkens (was %d); %d slots freed\n",
+                  knee, anchor, tuneLen, tuneLen - anchor);
+    if (anchor < tuneLen) {
+      Serial.printf("[tune] holding the dose curve flat past pass %d "
+                    "(was reading %.0f at %d)\n",
+                    anchor, tuneDose[tuneLen], tuneLen);
+      for (int n = anchor; n <= tuneLen; n++) tuneDose[n] = tuneDose[anchor];
+    }
+    tl[15].d = (int8_t)anchor; tl[15].w = 0; tl[15].g = 0; tl[15].r = 0;
+  }
 
   // d-gain per level from the local slope at its seed depth
   for (int lv = 1; lv <= 14; lv++) {
-    const int d = constrain((int)tl[lv].d, 1, 12);
+    const int d = constrain((int)tl[lv].d, 1, tuneLen - 1);
     tl[lv].gd = constrain(fabsf(tuneDose[d + 1] - tuneDose[d]), 2.0f, 30.0f);
   }
 
@@ -1031,13 +1204,13 @@ static float tuneSolveShape(const TuneLv &L, float target, bool whitenOnly,
   const int rmax = whitenOnly ? 0 : 5;
   int bd = 1, bw = w0, bg = 0, br = 0;
   float best = 1e9f;
-  for (int d = 1; d <= 13; d++)
+  for (int d = 1; d <= tuneLen; d++)
     for (int w = w0; w <= 4; w++)
       for (int g = 0; g <= 3; g++)
         for (int r = 0; r <= rmax; r++) {
           if (w == 0 && (r || g)) continue;   // re-darkens need a whiten first
           if (r == 0 && g) continue;          // a gap only weakens re-darkens
-          if (d + w + g + r > 13) continue;
+          if (d + w + g + r > tuneLen) continue;
           const float score = fabsf(tunePredict(L, d, w, g, r) - target)
                             + 0.10f * (d + w + g + r);
           if (score < best) { best = score; bd = d; bw = w; bg = g; br = r; }
@@ -1121,7 +1294,7 @@ static void tuneSeedModel(bool reserveProbes) {
     L.hasRaw = false;                    // re-seeding returns it to the grammar
     L.bestAbs = 1e9f;                    // shapes changed: old bests are void
     L.bd = L.d; L.bw = L.w; L.bg = L.g; L.br = L.r;
-    L.gd = constrain(fabsf(tuneDose[min((int)L.d + 1, 13)] - tuneDose[(int)L.d]),
+    L.gd = constrain(fabsf(tuneDose[min((int)L.d + 1, tuneLen)] - tuneDose[(int)L.d]),
                      2.0f, 30.0f);
     Serial.printf("[tune] seed L%-2d (%d,%d,%d,%d) -> %.0f  (ref %.0f)\n",
                   lv, L.d, L.w, L.g, L.r,
@@ -1144,7 +1317,7 @@ static void tuneCalibrateGains() {
     const TuneLv &L = tl[lv];
     if (L.w > 0 && L.r == 0) {
       const float landing = probeRef[lv] + L.err;
-      sw += (landing - tuneDose[constrain((int)L.d, 1, 13)]) / L.w;
+      sw += (landing - tuneDose[constrain((int)L.d, 1, tuneLen)]) / L.w;
       nw++;
     }
   }
@@ -1158,7 +1331,7 @@ static void tuneCalibrateGains() {
       const float landing = probeRef[lv] + L.err;
       // L.gg is measured by tuneProbeGap() before this runs; using the old
       // hardcoded 5.0 here would contradict it and corrupt the re-darken solve.
-      const float without_r = tuneDose[constrain((int)L.d, 1, 13)] + L.w * gw + L.g * L.gg;
+      const float without_r = tuneDose[constrain((int)L.d, 1, tuneLen)] + L.w * gw + L.g * L.gg;
       sr += (without_r - landing) / L.r;
       nr++;
     }
@@ -1228,7 +1401,7 @@ static bool tunePlanOne(int lv) {
   float bestScore = 1e9f;
   bool found = false;
 
-  const int d0 = max(1, L.d - 3), d1 = min(13, L.d + 3);
+  const int d0 = max(1, L.d - 3), d1 = min(tuneLen, L.d + 3);
   for (int d = d0; d <= d1; d++)
     for (int w = 0; w <= 4; w++)
       for (int g = 0; g <= 3; g++)
@@ -1243,7 +1416,7 @@ static bool tunePlanOne(int lv) {
           // Candidates with g == 0 stay enumerated, so a level carrying a gap
           // from a loaded blob can still shed it.
           if (g && L.gg <= 0.0f) continue;
-          if (d + w + g + r > 13) continue;
+          if (d + w + g + r > tuneLen) continue;
           if (d == L.d && w == L.w && g == L.g && r == L.r) continue;
 
           // predicted change in this level's error
@@ -1271,8 +1444,8 @@ static bool tunePlanOne(int lv) {
                 fabsf((float)(w - L.w)) * L.gw
               + fabsf((float)(r - L.r)) * L.gr
               + fabsf((float)(g - L.g)) * L.gg
-              + fabsf(tuneDose[constrain(d, 1, 13)]
-                    - tuneDose[constrain((int)L.d, 1, 13)]);
+              + fabsf(tuneDose[constrain(d, 1, tuneLen)]
+                    - tuneDose[constrain((int)L.d, 1, tuneLen)]);
           if (risk * TUNE_GAIN_ERR > tuneMaxRisk()) continue;
           const int changed = (d != L.d) + (w != L.w) + (g != L.g) + (r != L.r);
           // primary: residual error, PLUS what this landing does to the two
@@ -1343,8 +1516,8 @@ static bool tuneRescueLevel(int lv) {
   // shapes are worth trying, so the rescue edits the sequence itself:
   // substitute a pass, INSERT one (shifting the rest right, dropping the
   // last), or DELETE one (shifting left, padding with a float).
-  uint8_t cand[15][13];
-  uint8_t cur[13];
+  uint8_t cand[15][TUNE_LEN_MAX];
+  uint8_t cur[TUNE_LEN_MAX];
   tuneTrainOf(lv, cur);
 
   // Slot 1 is the incumbent, so the scan re-measures it under the SAME
@@ -1355,49 +1528,53 @@ static bool tuneRescueLevel(int lv) {
   // every rescue would test identical candidates.
   randomSeed(micros() ^ (uint32_t)(lv * 2654435761u));
 
-  memcpy(cand[1], cur, 13);
+  memcpy(cand[1], cur, TUNE_LEN_MAX);
   int n = 1;
+  const int last = tuneLen - 1;
   for (int s = 2; s <= 14; s++) {
     for (int tries = 0; tries < 60; tries++) {
-      uint8_t c[13];
-      memcpy(c, cur, 13);
-      const int edits = 1 + (int)random(0, 2);      // one or two edits
+      uint8_t c[TUNE_LEN_MAX];
+      memcpy(c, cur, TUNE_LEN_MAX);
+      // A longer train is a bigger space to search with the same 13
+      // candidate slots, so scale the mutation count with it rather than
+      // nudging a 20-pass sequence one pass at a time.
+      const int edits = 1 + (int)random(0, tuneLen > 13 ? 3 : 2);
       for (int e = 0; e < edits; e++) {
-        const int pos = (int)random(0, 13);
+        const int pos = (int)random(0, tuneLen);
         switch ((int)random(0, 3)) {
           case 0:                                    // substitute
             c[pos] = (uint8_t)random(0, 3);
             break;
           case 1:                                    // insert, shift right
-            for (int i = 12; i > pos; i--) c[i] = c[i - 1];
+            for (int i = last; i > pos; i--) c[i] = c[i - 1];
             c[pos] = (uint8_t)random(0, 3);
             break;
           default:                                   // delete, shift left
-            for (int i = pos; i < 12; i++) c[i] = c[i + 1];
-            c[12] = 0;
+            for (int i = pos; i < last; i++) c[i] = c[i + 1];
+            c[last] = 0;
             break;
         }
       }
       // A train of nothing but floats drives no ink; skip it rather than
       // waste a slot measuring paper.
       bool any = false;
-      for (int i = 0; i < 13; i++) if (c[i]) { any = true; break; }
+      for (int i = 0; i < tuneLen; i++) if (c[i]) { any = true; break; }
       if (!any) continue;
       bool dup = false;
       for (int j = 1; j <= n && !dup; j++)
-        if (!memcmp(cand[j], c, 13)) dup = true;
+        if (!memcmp(cand[j], c, tuneLen)) dup = true;
       if (dup) continue;
-      memcpy(cand[++n], c, 13);
+      memcpy(cand[++n], c, TUNE_LEN_MAX);
       break;
     }
   }
   Serial.printf("[tune] rescue L%d: %d distinct candidates (raw edits)\n", lv, n);
 
-  uint8_t t[13];
+  uint8_t t[TUNE_LEN_MAX];
   for (int s = 1; s <= n; s++)
     epd.driver().setDecisionTrain((uint8_t)(s << 1), cand[s]);
-  memset(t, 0, 13);                        // column 15: deep anchor
-  for (int i = 0; i < 13; i++) t[i] = 1;
+  memset(t, 0, sizeof(t));                 // column 15: deep anchor
+  for (int i = 0; i < tuneLen; i++) t[i] = 1;
   epd.driver().setDecisionTrain((uint8_t)(15 << 1), t);
 
   tunePaintMatchCard();
@@ -1435,7 +1612,7 @@ static bool tuneRescueLevel(int lv) {
     // The level is now rescue-owned: store the sequence literally, because
     // it may be off-grammar and (d,w,g,r) could not represent it.
     tl[lv].hasRaw = true;
-    memcpy(tl[lv].raw, cand[best], 13);
+    memcpy(tl[lv].raw, cand[best], TUNE_LEN_MAX);
     // Record the new shape as this level's best-known ONLY if it really is
     // better than what was already banked. Blindly resetting bestAbs threw
     // away a good shape the converger had found earlier, and the best-shape
@@ -1454,7 +1631,7 @@ static bool tuneRescueLevel(int lv) {
     Serial.print(" -> ");
     Serial.print(bestErr, 1);
     Serial.print("  {");
-    for (int i = 0; i < 13; i++) { Serial.print(cand[best][i]); if (i < 12) Serial.print(","); }
+    for (int i = 0; i < tuneLen; i++) { Serial.print(cand[best][i]); if (i < tuneLen - 1) Serial.print(","); }
     Serial.println("}");
   } else {
     Serial.printf("[tune] rescue L%d: nothing beat %.1f (best challenger %.1f)\n",
@@ -1577,8 +1754,8 @@ static void tuneAbsorb(const float err[16]) {
 // ============================================================================
 // Charge-matched removes: k darkens then k + net whitens (wr − k = net).
 // ============================================================================
-static void tuneRemoveOf(int lv, uint8_t out[13]) {
-  memset(out, 0, 13);
+static void tuneRemoveOf(int lv, uint8_t *out) {
+  memset(out, 0, TUNE_LEN_MAX);
   if (lv == 0) return;
   const int net = tuneNetOf(lv);          // from the real train, raw or not
   if (net <= 0) {
@@ -1588,21 +1765,21 @@ static void tuneRemoveOf(int lv, uint8_t out[13]) {
   // Depth proxy: the darken count of the actual train, so a raw shape sizes
   // its remove sensibly too.
   int darks = 0;
-  { uint8_t t[13]; tuneTrainOf(lv, t);
-    for (int i = 0; i < 13; i++) if (t[i] == 1) darks++; }
+  { uint8_t t[TUNE_LEN_MAX]; tuneTrainOf(lv, t);
+    for (int i = 0; i < tuneLen; i++) if (t[i] == 1) darks++; }
   int wr = max(net, max(3, darks / 2 + 3) + removeExtra[lv]);
-  if (wr > 13) wr = 13;
+  if (wr > tuneLen) wr = tuneLen;
   int k = wr - net;
   if (k < 0) k = 0;
-  while (k + wr > 13 && k > 0) { k--; wr--; }
-  if (k + wr > 13) { wr = min(13, net); k = 0; }
+  while (k + wr > tuneLen && k > 0) { k--; wr--; }
+  if (k + wr > tuneLen) { wr = min(tuneLen, net); k = 0; }
   int p = 0;
   for (int i = 0; i < k; i++) out[p++] = 1;
-  for (int i = 0; i < wr && p < 13; i++) out[p++] = 2;
+  for (int i = 0; i < wr && p < tuneLen; i++) out[p++] = 2;
 }
 
 static void tuneUploadRemoves() {
-  uint8_t t[13];
+  uint8_t t[TUNE_LEN_MAX];
   for (int lv = 1; lv <= 15; lv++) {
     tuneRemoveOf(lv, t);
     epd.driver().setDecisionTrain((uint8_t)((lv << 1) | 1), t);
@@ -1634,7 +1811,12 @@ static float tuneVerifyRemoves() {
     const float res = col[i] - col[0];
     Serial.printf("%+.1f ", res);
     if (fabsf(res) > fabsf(worst)) { worst = res; worstLv = i; }
-    if (res < -6.0f) removeExtra[i]++;   // ghost: widen that level's erase
+    // Widen the erase for any level leaving a visible residual. -6.0 was too
+    // slack: the evolutionary HIGH run left black at -4.6 - the worst level
+    // on the card - and sailed under the trigger. removeExtra adds k darkens
+    // AND k whitens, so it buys erase strength at IDENTICAL net charge; it
+    // is close to free and there is no reason to be stingy with it.
+    if (res < -2.5f) removeExtra[i]++;   // ghost: widen that level's erase
   }
   Serial.printf("  worst L%d %+.1f\n", worstLv, worst);
   return fabsf(worst);
@@ -1644,19 +1826,19 @@ static float tuneVerifyRemoves() {
 // Reports
 // ============================================================================
 static void tuneDumpTables() {
-  uint8_t t[13];
-  Serial.println("[tune] final apply trains (d,w,g,r):");
+  uint8_t t[TUNE_LEN_MAX];
+  Serial.printf("[tune] final apply trains, %d passes (d,w,g,r):\n", tuneLen);
   for (int lv = 1; lv <= 15; lv++) {
     tuneTrainOf(lv, t);
     Serial.printf("  L%-2d (%d,%d,%d,%d)  {", lv, tl[lv].d, tl[lv].w, tl[lv].g, tl[lv].r);
-    for (int p = 0; p < 13; p++) Serial.printf("%d%s", t[p], p < 12 ? "," : "");
+    for (int p = 0; p < tuneLen; p++) Serial.printf("%d%s", t[p], p < tuneLen - 1 ? "," : "");
     Serial.println("}");
   }
   Serial.println("[tune] removes:");
   for (int lv = 1; lv <= 15; lv++) {
     tuneRemoveOf(lv, t);
     Serial.printf("  L%-2d {", lv);
-    for (int p = 0; p < 13; p++) Serial.printf("%d%s", t[p], p < 12 ? "," : "");
+    for (int p = 0; p < tuneLen; p++) Serial.printf("%d%s", t[p], p < tuneLen - 1 ? "," : "");
     Serial.println("}");
   }
 }
@@ -1848,6 +2030,98 @@ static void tunePreviewResults() {
 }
 
 // ============================================================================
+// Dose-ladder sweep: what does the pass period actually buy?
+//
+// The pass period IS the per-pass dose — a row holds its latched drive
+// until its next latch, so shortening the period shortens every pixel's
+// exposure by the same factor. That makes the period the quantiser of the
+// whole system: the finest placement any train can achieve is one pass,
+// and one pass is worth however many scan units the period delivers.
+//
+// The light end is where that bites. From white, the first darken pass is
+// the strongest response the panel has, so if it is worth more than a
+// level step then levels 1..3 cannot be reached by darkening at all and
+// have to be built as darken-then-whiten shapes.
+//
+// This runs ONLY the ladder, at each period in turn, and prints the curve
+// and the step sizes. Six scans a period against forty for a full tune, so
+// the period can be chosen by measurement instead of by argument.
+// Registration is reused across periods — the board has not moved.
+// ============================================================================
+static bool tuneAbortRequested();
+
+static bool runDoseSweep(const int *periods, int nper) {
+  if (!scPort) { Serial.println("[sweep] no scanner selected"); return false; }
+  epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+  tuneLen = epd.driver().g16TrainLen();
+  if (!epd.driver().setGreyLevels(16)) {
+    Serial.println("[sweep] setGreyLevels(16) refused");
+    return false;
+  }
+  tuneSeedShapes();
+  if (!tgeo.valid && !tuneRegister()) return false;
+
+  const int savedPeriod = epd.driver()._config.g16_pass_us_high;
+  Serial.printf("[sweep] %d passes per train, settle floor %d us\n",
+                tuneLen, epd.driver()._config.g16_settle_us);
+  for (int i = 0; i < nper; i++) {
+    if (tuneAbortRequested()) { Serial.println("[sweep] aborted"); break; }
+    const int per = periods[i];
+    epd.driver()._config.g16_pass_us_high = per;
+    Serial.printf("\n[sweep] ===== %d us per pass (%.2f s per full paint) =====\n",
+                  per, per * tuneLen / 1e6f);
+
+    float landA[16], landB[16], ref[16];
+    if (!tuneDoseCard(1, landA, ref)) return false;
+    for (int i2 = 0; i2 < 16; i2++) probeRef[i2] = ref[i2];
+    for (int n = 1; n <= min(14, tuneLen); n++) tuneDose[n] = landA[n];
+    if (tuneLen > 14) {
+      const int base = tuneLen - 13;
+      if (!tuneDoseCard(base, landB, nullptr)) return false;
+      float sum = 0;
+      int nov = 0;
+      for (int c = 1; c <= 14; c++) {
+        const int pass = base + c - 1;
+        if (pass <= 14) { sum += tuneDose[pass] - landB[c]; nov++; }
+      }
+      const float shift = nov ? sum / nov : 0.0f;
+      for (int c = 1; c <= 14; c++) {
+        const int pass = base + c - 1;
+        if (pass > 14 && pass <= tuneLen) tuneDose[pass] = landB[c] + shift;
+      }
+    }
+    for (int n = 2; n <= tuneLen; n++)
+      if (tuneDose[n] > tuneDose[n - 1]) tuneDose[n] = tuneDose[n - 1];
+
+    const float step = tuneStep();
+    Serial.printf("[sweep] %d us  step %.2f units  curve:", per, step);
+    for (int n = 1; n <= tuneLen; n++) Serial.printf(" %.0f", tuneDose[n]);
+    Serial.println();
+    Serial.printf("[sweep] %d us  per-pass deltas:", per);
+    Serial.printf(" %.1f", probeRef[0] - tuneDose[1]);
+    for (int n = 2; n <= tuneLen; n++) Serial.printf(" %.1f", tuneDose[n - 1] - tuneDose[n]);
+    Serial.println();
+    // The two numbers that decide the period. The first is how much of a
+    // level step the coarsest single pass costs - above 1.0 the light end
+    // cannot be placed by darkening. The second is the knee: how many
+    // passes before the curve stops moving, which is where black should
+    // be anchored.
+    const float first = (probeRef[0] - tuneDose[1]) / step;
+    int knee = tuneLen;
+    for (int n = 2; n <= tuneLen; n++)
+      if (tuneDose[n - 1] - tuneDose[n] < 0.15f * step) { knee = n - 1; break; }
+    Serial.printf("[sweep] %d us  FIRST PASS = %.2f level steps   knee at pass %d "
+                  "(depth %.0f of %.0f units)\n",
+                  per, first, knee, probeRef[0] - tuneDose[knee],
+                  probeRef[0] - tuneDose[tuneLen]);
+  }
+  epd.driver()._config.g16_pass_us_high = savedPeriod;
+  epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+  Serial.println("\n[sweep] done - period restored to the preset");
+  return true;
+}
+
+// ============================================================================
 // The whole show
 // ============================================================================
 static bool tuneAbortRequested() {
@@ -1857,22 +2131,36 @@ static bool tuneAbortRequested() {
   return false;
 }
 
-static bool runSelfTune() {
+// Tune one quality's 16-grey tables. NORMAL and HIGH only — FAST has no
+// 16-grey mode at all (see runSelfTuneFast()).
+//
+// The two differ in exactly three things, and all three must move
+// together or the result is nonsense: the pass period the panel is driven
+// at, the number of passes a train has, and the blob the tables land in.
+static bool runSelfTune16(EPD_Painter::Quality quality) {
+  const bool high = (quality == EPD_Painter::Quality::QUALITY_HIGH);
+  const Set set = high ? SET_HIGH : SET_NORMAL;
   if (!scPort) {
     Serial.println("[tune] no scanner selected");
     return false;
   }
-  Serial.println("[tune] ===== SELF-TUNE START =====");
+  Serial.printf("[tune] ===== SELF-TUNE START (%s) =====\n", tunedSetName(set));
   Serial.println("[tune] send q to abort between cycles");
 
-  epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+  epd.setQuality(quality);
+  tuneLen = epd.driver().g16TrainLen();
+  int &periodCfg = high ? epd.driver()._config.g16_pass_us_high
+                        : epd.driver()._config.g16_pass_us_normal;
   if (tunePeriodUs) {
-    epd.driver()._config.g16_pass_us_normal = (int)tunePeriodUs;
+    periodCfg = (int)tunePeriodUs;
     Serial.printf("[tune] pass period overridden to %lu us\n",
                   (unsigned long)tunePeriodUs);
   }
-  const uint32_t period = (uint32_t)epd.driver()._config.g16_pass_us_normal;
-  Serial.printf("[tune] tuning at %lu us NORMAL period\n", (unsigned long)period);
+  const uint32_t period = (uint32_t)periodCfg;
+  Serial.printf("[tune] tuning at %lu us %s period, %d passes per train "
+                "(%.2f s per full-screen paint)\n",
+                (unsigned long)period, tunedSetName(set), tuneLen,
+                period * tuneLen / 1e6f);
   if (!epd.driver().setGreyLevels(16)) {
     Serial.println("[tune] setGreyLevels(16) refused");
     return false;
@@ -2101,8 +2389,9 @@ static bool runSelfTune() {
     Serial.println("[tune] widening ghosting removes and re-checking...");
   }
 
-  uint8_t ap[16][13], rm[16][13];
+  uint8_t ap[16][TUNE_LEN_MAX], rm[16][TUNE_LEN_MAX];
   memset(ap, 0, sizeof(ap));
+  memset(rm, 0, sizeof(rm));
   for (int lv = 1; lv <= 15; lv++) {
     tuneTrainOf(lv, ap[lv]);
     tuneRemoveOf(lv, rm[lv]);
@@ -2143,17 +2432,18 @@ static bool runSelfTune() {
   const bool keep = tuneResultsScreen(mx, worst < 0 ? 0.0f : worst);
   bool saved = false, loaded = false;
   if (keep) {
-    saved = tunedSave(epd.driver(), period, ap, rm, lum);
+    saved = tunedSave16(epd.driver(), set, period, tuneLen, ap, rm, lum);
     // Read it straight back rather than trusting the write: this is the
     // same path every future boot will take, so if it can't be reloaded
     // now it was never really saved.
-    loaded = saved && tunedLoad(epd.driver());
+    loaded = saved && tunedLoad(epd.driver(), set);
     Serial.printf("[tune] flash save %s, reload %s\n",
                   saved ? "OK" : "FAILED", loaded ? "OK" : "FAILED");
     if (loaded) {
-      char sub[80];
-      snprintf(sub, sizeof(sub), "Verified in flash - loaded at %lu us on every boot",
-               (unsigned long)period);
+      char sub[96];
+      snprintf(sub, sizeof(sub),
+               "Verified in flash - %s, %d passes at %lu us, loaded every boot",
+               tunedSetName(set), tuneLen, (unsigned long)period);
       tuneConfirmScreen("SAVED", "Your panel now uses these greys", sub);
     } else {
       tuneConfirmScreen("SAVE FAILED", "Nothing was stored",
@@ -2169,17 +2459,16 @@ static bool runSelfTune() {
                       "The built-in tables are still in charge.");
   }
 
-  Serial.printf("[tune] ===== SELF-TUNE DONE (maxerr %.1f, removes worst %.1f, %s) =====\n",
-                mx, worst, keep ? "saved" : "discarded");
+  Serial.printf("[tune] ===== SELF-TUNE DONE (%s: maxerr %.1f, removes worst %.1f, %s) =====\n",
+                tunedSetName(set), mx, worst, keep ? "saved" : "discarded");
   return keep && saved && loaded;
 }
 
 #else  // !TUNEUP_HAVE_JPEGDEC
 
+// Without an image decoder there is nothing to measure a scan with, so the
+// whole tuner compiles out. runSelfTune() in the sketch reports it; only
+// the period override needs to still exist for the serial handler.
 static uint32_t tunePeriodUs = 0;
-static bool runSelfTune() {
-  Serial.println("[tune] JPEGDEC required - set TUNEUP_HAVE_JPEGDEC to 1");
-  return false;
-}
 
 #endif

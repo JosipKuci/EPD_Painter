@@ -16,11 +16,57 @@ then on. No PC in the loop.
    is remembered in NVS, so later boots need no interaction.
 3. **DEMO SCAN** — scans the bed and shows the image on the panel in 16
    native greys. Proves the plumbing.
-4. **TUNE ME** — instructions + a 30 s countdown to lay the board face-down
-   and close the lid, then the self-tune runs (10–15 minutes, progress on
-   serial). Or send `T` over serial to start immediately.
+4. **TUNE ME** — pick which quality to tune, then instructions and a 30 s
+   countdown to lay the board face-down and close the lid. Or send `T`
+   over serial for the same choice.
 
-## What the self-tune does (see tuner.h)
+## Three qualities, three tunes, three blobs
+
+They are not one tune with a speed setting. Each measures different
+tables, and each is stored on its own — **tuning one leaves the other two
+exactly as they were**, so you can tune HIGH without risking a NORMAL set
+that already works.
+
+| | levels | passes | period | what gets tuned | roughly |
+|---|---|---|---|---|---|
+| **FAST** | 4 | 7 | none | `fast_darker`/`fast_lighter` + the six grey-to-grey direct trains | ~10 min |
+| **NORMAL** | 16 | 13 | 15 ms | 16-grey applies + charge-matched removes | ~10–15 min |
+| **HIGH** | 16 | 20 | 15 ms | the same, at 20 passes | ~20 min |
+
+**HIGH is NORMAL's timing with more slots** — same 15 ms pass period, 20
+passes instead of 13, so a 300 ms full-screen paint against NORMAL's
+195 ms. It is emphatically *not* "the same trains, driven slower".
+
+That was measured, not assumed. A dose-ladder sweep at 19 / 15 / 13 ms
+(LilyGo, 26 July 2026) found a longer pass buys **no extra depth at all**
+— all three periods bottomed out at the identical black — while making
+every slot coarser *and* wasting most of them: at 19 ms the response
+stopped moving after 7 passes, at 15 ms it was still resolving at 10. So
+a longer pass costs accuracy, wastes slots, and takes longer.
+
+What the extra slots are actually for is room. The panel saturates around
+pass 10 whatever the period, so every level below that knee has to be
+placed by whitening and re-darkening rather than by lengthening a darken
+run that has stopped responding — and those shapes need spare passes to
+fit. Black is anchored at the *measured* knee (typically 11 darkens), not
+at the full train length: driving it for 20 when it stops responding at
+10 wastes ten passes and forces a 20-whiten erase to balance them,
+doubling the charge cycled through every black paint for no extra depth.
+
+Run the sweep yourself with `D` — six scans per period, against forty for
+a full tune, so the period is chosen by measurement.
+
+**FAST** is the odd one out because it has no 16-grey mode at all — seven
+undelayed passes cannot hold sixteen distinguishable doses, and
+`setGreyLevels(16)` refuses while the quality is FAST. Its tune is
+therefore about its four levels and, more usefully, the six grey-to-grey
+transitions: without those every grey-to-grey pixel two-steps through
+white and punches a visible hole in motion. One limit worth knowing —
+4-level mode has only three drive trains on the glass at once, so a card
+measures three candidates rather than fourteen, and the FAST tune
+converges by iterating rather than by breadth.
+
+## What the self-tune does (see tuner.h, tuner_fast.h)
 
 - **Registration**: paints full black and takes a wide scan to find the
   panel on the bed, then a corner mark to learn the face-down mirroring.
@@ -39,40 +85,41 @@ then on. No PC in the loop.
 - **Removes**: charge-matched erase trains derived from the tuned applies
   (the DC ledger stays exact), then verified optically — paint the card,
   repaint white, scan the residual; ghosting levels get a wider erase.
-- **Save**: tables + tuning period go to LittleFS via
-  `src/EPD_Painter_tuned.h`, and are reloaded through the same path every
-  boot.
+- **Save**: tables + train length + tuning period go to LittleFS via
+  `src/EPD_Painter_tuned.h` — one file per quality — and are reloaded
+  through the same path every boot.
 
 ## Using the tuned tables in YOUR sketch
 
 ```cpp
 #include <LittleFS.h>
-#include "EPD_Painter_tuned.h"
+#include "tuned_storage.h"          // the ~100-line LittleFS half
 ...
 epd.begin();
-LittleFS.begin(true);                        // true = format if unformatted
+LittleFS.begin(true);               // true = format if unformatted
 
-// Pass the driver: EPD_PainterAdafruit wraps one, so hand over
-// epd.driver(). With a raw EPD_Painter, pass the painter itself.
-if (EPD_PainterTuned::load(epd.driver()))    // no-op if there is no valid blob
-  Serial.println("using flash-tuned trains");
+// Installs every set this board has been tuned for. Pass the driver:
+// EPD_PainterAdafruit wraps one, so hand over epd.driver().
+Serial.printf("%d tuned sets\n", tunedLoadAll(epd.driver()));
 
 epd.setGreyLevels(16);
 ```
 
 Order doesn't matter relative to `setGreyLevels(16)` — call it either side
-and the train library ends up built from the tuned tables. `load()` also
-restores the **pass period** the tuning was done at, which is essential:
-trains are only valid at the period they were calibrated against.
+and the train library ends up built from the tuned tables. Loading also
+restores the **pass period** each set was tuned at, which is essential:
+trains are only valid at the period *and the length* they were calibrated
+against, and `setQuality()` re-picks the matching set every time you
+change quality.
 
-The blob is board-keyed (pins + geometry) and CRC-guarded; on any mismatch
-`load()` returns false and the preset tables stay in charge, so it is safe
-to call unconditionally on any board.
+Blobs are board-keyed (pins + geometry) and CRC-guarded; on any mismatch
+they are refused and the preset tables stay in charge, so it is safe to
+call unconditionally on any board. Blobs written by the pre-split version
+of this sketch are still read, as the NORMAL set.
 
-**Scope:** version 1 of the blob holds the **16-grey NORMAL** apply and
-remove trains only. Your 4-level, FAST and direct grey-to-grey trains
-still come from the board preset — tuneup improves greyscale rendering,
-not the speed modes.
+**Scope:** a board may carry any subset. An untuned quality keeps its
+preset tables — or, if the preset has none for it, the formula library,
+which renders sixteen monotonic greys but not accurate ones.
 
 ## Requirements
 
@@ -87,12 +134,13 @@ not the speed modes.
 | Key | Action |
 |-----|--------|
 | `s` | demo scan |
-| `T` | self-tune now (no countdown) |
-| `q` | abort a running tune (between cycles) |
+| `T` | self-tune: offers the quality choice, then starts (no countdown) |
+| `f` / `n` / `h` | at that choice: FAST / NORMAL / HIGH |
+| `q` | back out of the choice, or abort a running tune (between cycles) |
 | `P <us>` | override the tuning pass period (0 = preset) |
-| `L` | tuned-blob status |
-| `X` | erase the tuned blob (reboot to fall back to presets) |
-| `n` | re-pick the scanner |
+| `L` | which blobs are present, and the 16-grey periods and lengths |
+| `X` | erase **all** tuned blobs (reboot to fall back to presets) |
+| `n` | re-pick the scanner (from the menu) |
 | `m` | reprint the menu |
 | `r` | reboot |
 

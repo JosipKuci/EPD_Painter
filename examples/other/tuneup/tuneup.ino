@@ -737,21 +737,152 @@ static bool demoScan() {
 }
 
 // ============================================================================
-// The self-tuner (stage 2) — see tuner.h.
+// The self-tuner (stage 2) — see tuner.h (16-grey) and tuner_fast.h (FAST).
 // ============================================================================
 #include "tuner.h"
+#include "tuner_fast.h"
+#include "tuner_evo.h"
+
+// One entry point for all three. They share the rig — registration, the
+// scanner, the results screen — and differ in what they are measuring.
+// How many generations the evolutionary tuner runs. It measures 60
+// candidates per scan, and on the first run reached worst 3.3 units by
+// generation 13 - matching the best result this board has ever produced,
+// in a third of the scans. 30 leaves room to refine without feeding the
+// printer more acquisitions than it tolerates.
+static int evoGenerations = 30;
+
+static bool runSelfTune(Set which) {
+#if TUNEUP_HAVE_JPEGDEC
+  switch (which) {
+    case SET_FAST: return runSelfTuneFast();
+    case SET_HIGH: return runEvoTune(EPD_Painter::Quality::QUALITY_HIGH, evoGenerations);
+    default:       return runEvoTune(EPD_Painter::Quality::QUALITY_NORMAL, evoGenerations);
+  }
+#else
+  (void)which;
+  Serial.println("[tune] JPEGDEC required - set TUNEUP_HAVE_JPEGDEC to 1");
+  return false;
+#endif
+}
+
+// ============================================================================
+// Which quality to tune.
+//
+// The three are separate tunes with separate results, kept in separate
+// blobs, so this is a real choice rather than a preference: tuning one
+// leaves the others exactly as they were. The screen says what each one
+// costs, because they differ by a factor of three in time and the user is
+// about to leave the board face-down on a scanner.
+// ============================================================================
+static Set tunePickQuality(bool *cancelled) {
+  const int W = epd.width(), H = epd.height();
+  epd.fillScreen(0);
+  epd.fillRect(0, 0, W, 40, 15);
+  epd.setTextColor(0);
+  epd.setTextSize(3);
+  epd.setCursor(12, 8);
+  epd.print("WHAT SHALL I TUNE?");
+  epd.setTextColor(15);
+  epd.setTextSize(2);
+  epd.setCursor(12, 52);
+  epd.print("Each quality is tuned and stored on its own. Tuning one");
+  epd.setCursor(12, 72);
+  epd.print("leaves the other two exactly as they are.");
+
+  const int bw = (W - 80) / 3, by = 110, bh = 210;
+  Btn bFast   = { 20,                by, bw, bh };
+  Btn bNormal = { 40 + bw,           by, bw, bh };
+  Btn bHigh   = { 60 + bw * 2,       by, bw, bh };
+  drawBtn(bFast,   "FAST",   "4 levels + motion");
+  drawBtn(bNormal, "NORMAL", "16 greys, 13 passes");
+  drawBtn(bHigh,   "HIGH",   "16 greys, 20 passes");
+
+  epd.setTextSize(1);
+  struct { Btn b; const char *l1, *l2, *l3; } notes[3] = {
+    { bFast,   "7 passes, no settle delay.",  "Four levels and the six",     "grey-to-grey transitions." },
+    { bNormal, "13 passes at 15 ms.",         "Evolutionary search over",    "raw waveforms. ~15 min." },
+    { bHigh,   "20 passes at 15 ms.",         "Same, with 20 slots to",      "shape. ~15 min." },
+  };
+  for (int i = 0; i < 3; i++) {
+    epd.setCursor(notes[i].b.x + 10, by + bh - 52);
+    epd.print(notes[i].l1);
+    epd.setCursor(notes[i].b.x + 10, by + bh - 40);
+    epd.print(notes[i].l2);
+    epd.setCursor(notes[i].b.x + 10, by + bh - 28);
+    epd.print(notes[i].l3);
+  }
+
+  // What is already on this board, so a re-tune is a decision rather than
+  // a guess.
+  epd.setTextSize(2);
+  epd.setCursor(12, by + bh + 24);
+  char have[96];
+  snprintf(have, sizeof(have), "Already tuned:  FAST %s   NORMAL %s   HIGH %s",
+           tunedPresent(epd.driver(), SET_FAST)   ? "yes" : "no ",
+           tunedPresent(epd.driver(), SET_NORMAL) ? "yes" : "no ",
+           tunedPresent(epd.driver(), SET_HIGH)   ? "yes" : "no ");
+  epd.print(have);
+
+  Btn back = { 20, H - 90, W - 40, 70 };
+  drawBtn(back, "BACK");
+  epd.paint();
+  Serial.println("[tuneup] tune which? tap, or serial: f = FAST, n = NORMAL, h = HIGH, q = back");
+
+  // The finger that tapped TUNE ME is still on the glass, and these
+  // buttons have just appeared underneath it: the menu's TUNE ME spans
+  // x 490..940 and HIGH lands at 646..939, NORMAL at 333..626. Without a
+  // settle and a drain, the press that OPENS this page also answers it,
+  // and the tune starts on whichever option happened to be under the
+  // finger. Same trap tuneConfirmScreen() documents - a full-screen paint
+  // also throws transients into the GT911, so polling straight away
+  // catches those as well as the real press.
+  while (!epd.driver().paintIdle()) delay(10);
+  delay(700);
+  while (Serial.available()) Serial.read();
+  touchRewake();
+  int drainX, drainY;
+  touchTapped(drainX, drainY);        // consume anything already latched
+
+  for (;;) {
+    if (Serial.available()) {
+      const int c = Serial.read();
+      if (c == 'f' || c == 'F') { *cancelled = false; return SET_FAST; }
+      if (c == 'n' || c == 'N') { *cancelled = false; return SET_NORMAL; }
+      if (c == 'h' || c == 'H') { *cancelled = false; return SET_HIGH; }
+      if (c == 'q') { *cancelled = true; return SET_NORMAL; }
+    }
+    int px, py;
+    if (touchTapped(px, py)) {
+      if (hitBtn(bFast, px, py))   { *cancelled = false; return SET_FAST; }
+      if (hitBtn(bNormal, px, py)) { *cancelled = false; return SET_NORMAL; }
+      if (hitBtn(bHigh, px, py))   { *cancelled = false; return SET_HIGH; }
+      if (hitBtn(back, px, py))    { *cancelled = true;  return SET_NORMAL; }
+    }
+    delay(8);
+  }
+}
 
 // Touch entry: instructions + countdown so the user can close the lid.
 static void tuneCountdownAndRun() {
+  bool cancelled = false;
+  const Set which = tunePickQuality(&cancelled);
+  if (cancelled) return;
+
   uiClear("SELF-TUNE");
-  uiLine("I am going to tune my own greyscale against the scanner.");
+  uiLine("I am going to tune my own %s trains against the scanner.",
+         tunedSetName(which));
   uiLine("");
   uiLine("1. Open the scanner lid.");
   uiLine("2. Lay me FACE DOWN on the glass, screen flat against it.");
   uiLine("3. Keep my USB lead connected (watch progress in the serial log).");
   uiLine("4. Close the lid gently as far as the cable allows.");
   uiLine("");
-  uiLine("Tuning takes 10-15 minutes and flashes many test patterns.");
+  uiLine(which == SET_FAST
+             ? "The FAST tune takes about 10 minutes and flashes many patterns."
+             : which == SET_HIGH
+             ? "The HIGH tune takes about 25 minutes and flashes many patterns."
+             : "The NORMAL tune takes 10-15 minutes and flashes many patterns.");
   for (int s = 30; s > 0; s--) {
     char b[40];
     snprintf(b, sizeof(b), "Starting in %2d s ...", s);
@@ -765,13 +896,52 @@ static void tuneCountdownAndRun() {
     delay(1000);
     if (Serial.available() && Serial.peek() == 'q') { Serial.read(); return; }
   }
-  runSelfTune();
+  runSelfTune(which);
+}
+
+// ============================================================================
+// Splash view — the artwork rendered in 16 native greys, held until tapped.
+//
+// Held rather than flashed past, because the menu would otherwise repaint
+// over it instantly. Painted at HIGH only if this board actually has a HIGH
+// table: rendering 20 passes through the formula library flatters nothing
+// and would misrepresent the panel.
+// ============================================================================
+static void showSplash() {
+  const bool haveHigh = tunedPresent(epd.driver(), SET_HIGH);
+  epd.setQuality(haveHigh ? EPD_Painter::Quality::QUALITY_HIGH
+                          : EPD_Painter::Quality::QUALITY_NORMAL);
+  epd.driver().setGreyLevels(16);
+  epd.clear();
+  while (!epd.driver().paintIdle()) delay(10);
+  tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+  epd.paint();
+  while (!epd.driver().paintIdle()) delay(10);
+  Serial.printf("[tuneup] splash at %s (%d passes, %d us, row charge %d us) "
+                "- tap to return\n",
+                haveHigh ? "HIGH" : "NORMAL", epd.driver().g16TrainLen(),
+                haveHigh ? epd.driver()._config.g16_pass_us_high
+                         : epd.driver()._config.g16_pass_us_normal,
+                epd.driver()._config.rowExtraUs());
+
+  // Settle before listening: a full-screen 16-grey paint throws transients
+  // into the GT911, and the tap that opened this page is still latched.
+  delay(700);
+  while (Serial.available()) Serial.read();
+  touchRewake();
+  int dx, dy;
+  touchTapped(dx, dy);
+  for (;;) {
+    if (Serial.available()) { while (Serial.available()) Serial.read(); return; }
+    if (touchTapped(dx, dy)) return;
+    delay(8);
+  }
 }
 
 // ============================================================================
 // Menu
 // ============================================================================
-static Btn btnScan, btnTune, btnScanner;
+static Btn btnScan, btnTune, btnSplash, btnScanner;
 
 static void showMenuCard() {
   const int W = epd.width(), H = epd.height();
@@ -793,17 +963,20 @@ static void showMenuCard() {
   epd.print(tunedLoaded ? "Running flash-tuned trains."
                         : "Running preset trains (not yet self-tuned).");
 
-  btnScan    = { 20,          100, (W - 60) / 2, 150 };
-  btnTune    = { 40 + (W - 60) / 2, 100, (W - 60) / 2, 150 };
+  const int bw3 = (W - 80) / 3;
+  btnScan    = { 20,                100, bw3, 150 };
+  btnTune    = { 40 + bw3,          100, bw3, 150 };
+  btnSplash  = { 60 + bw3 * 2,      100, bw3, 150 };
   btnScanner = { 20, 270, W - 40, 70 };
   drawBtn(btnScan, "DEMO SCAN", "scan the bed, show it here");
-  drawBtn(btnTune, "TUNE ME", "face-down self-calibration");
+  drawBtn(btnTune, "TUNE ME", "pick FAST / NORMAL / HIGH");
+  drawBtn(btnSplash, "SHOW PHOTO", "see the greys on real art");
   drawBtn(btnScanner, "CHANGE SCANNER");
 
   epd.setCursor(12, H - 130);
-  epd.print("Serial: s scan  T tune (q aborts)  P <us> tune period  L blob");
+  epd.print("Serial: s scan  T tune (pick quality)  P <us> period  L blobs");
   epd.setCursor(12, H - 110);
-  epd.print("        X erase tuned blob  n scanner  r reboot");
+  epd.print("        X erase all tuned blobs  n scanner  r reboot");
   epd.paint();
   Serial.println("[tuneup] menu: s/T/P/L/X/n/r (or tap)");
 }
@@ -824,9 +997,15 @@ void setup() {
   }
 
   if (!LittleFS.begin(true)) Serial.println("[tuneup] LittleFS mount failed");
-  tunedLoaded = tunedLoad(epd.driver());
-  Serial.printf("[tuneup] tuned blob: %s\n",
-                tunedLoaded ? "loaded from flash" : "none (preset tables)");
+  {
+    const int n = tunedLoadAll(epd.driver());
+    tunedLoaded = (n > 0);
+    Serial.printf("[tuneup] tuned blobs: %d installed (FAST %s, NORMAL %s, HIGH %s)\n",
+                  n,
+                  tunedPresent(epd.driver(), SET_FAST)   ? "yes" : "no",
+                  tunedPresent(epd.driver(), SET_NORMAL) ? "yes" : "no",
+                  tunedPresent(epd.driver(), SET_HIGH)   ? "yes" : "no");
+  }
 
   epd.driver().setGreyLevels(16);   // builds trains: preset or flash-tuned
 
@@ -888,6 +1067,9 @@ void loop() {
     } else if (hitBtn(btnTune, px, py)) {
       tuneCountdownAndRun();
       showMenuCard();
+    } else if (hitBtn(btnSplash, px, py)) {
+      showSplash();
+      showMenuCard();
     } else if (hitBtn(btnScanner, px, py)) {
       pickScanner();
       showMenuCard();
@@ -899,7 +1081,12 @@ void loop() {
   const int c = Serial.read();
   switch (c) {
     case 's': demoScan(); Serial.println("[tuneup] (any key for menu)"); break;
-    case 'T': runSelfTune(); showMenuCard(); break;
+    case 'T': {
+      bool cancelled = false;
+      const Set which = tunePickQuality(&cancelled);
+      if (!cancelled) runSelfTune(which);
+      showMenuCard();
+    } break;
     case 'P': {
       tunePeriodUs = (uint32_t)Serial.parseInt();
       Serial.printf("[tuneup] tune period override: %lu us%s\n",
@@ -907,16 +1094,146 @@ void loop() {
                     tunePeriodUs ? "" : " (preset)");
     } break;
     case 'L': {
-      const bool p = tunedPresent(epd.driver());
-      Serial.printf("[tuneup] tuned blob: %s, running %s, period %d us\n",
-                    p ? "present+valid" : "absent",
-                    tunedLoaded ? "flash-tuned" : "preset",
-                    epd.driver()._config.g16_pass_us_normal);
+      Serial.printf("[tuneup] blobs: FAST %s  NORMAL %s  HIGH %s\n",
+                    tunedPresent(epd.driver(), SET_FAST)   ? "present" : "absent",
+                    tunedPresent(epd.driver(), SET_NORMAL) ? "present" : "absent",
+                    tunedPresent(epd.driver(), SET_HIGH)   ? "present" : "absent");
+      Serial.printf("[tuneup] 16-grey periods: NORMAL %d us x %d passes, "
+                    "HIGH %d us x %d passes\n",
+                    epd.driver()._config.g16_pass_us_normal, EPD_Painter::DEC_WF_LEN16,
+                    epd.driver()._config.g16_pass_us_high, EPD_Painter::DEC_WF_LEN16_HIGH);
     } break;
     case 'X':
-      tunedErase();
-      Serial.println("[tuneup] tuned blob erased - reboot ('r') for preset tables");
+      tunedEraseAll();
+      Serial.println("[tuneup] all tuned blobs erased - reboot ('r') for preset tables");
       break;
+    case 'E': {
+      // E [gens]  evolutionary tune (HIGH). Mutation-only search over the
+      // raw drive sequence, 60 candidates per scan.
+      int gens = Serial.parseInt();
+      if (gens < 1) gens = evoGenerations;
+      if (gens > 200) gens = 200;
+      runEvoTune(EPD_Painter::Quality::QUALITY_HIGH, gens);
+      showMenuCard();
+    } break;
+    case 'A': {
+      // A 0|1 - alternate-slot mode: even slots pinned float.
+      evoSettleMask = (Serial.parseInt() != 0);
+      Serial.printf("[tuneup] settle mask: %s\n",
+                    evoSettleMask ? "ON" : "off");
+    } break;
+    case 'R': {
+      // R 0|1 - patch position randomisation off/on.
+      evoRandomPos = (Serial.parseInt() != 0);
+      Serial.printf("[tuneup] patch positions: %s\n",
+                    evoRandomPos ? "shuffled" : "fixed");
+    } break;
+    case 'B': {
+      // Stability sweep: which (row charge, pass period) holds a grey
+      // steadiest across position and surrounding content.
+      runStabilitySweep();
+      showMenuCard();
+    } break;
+    case 'Q': {
+      // Paint the registration quadrant mark and hold, so it can be scanned
+      // independently when registration fails.
+      epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+      epd.driver().setGreyLevels(16);
+      tunePaintQuadrant();
+      tuneClear();
+      tunePaint();
+      Serial.println("[tuneup] quadrant mark painted and held");
+    } break;
+    case 'g': {
+      // Same, at NORMAL - for comparing the two qualities on identical
+      // content. 13 slots against HIGH's 20.
+      epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      Serial.printf("[tuneup] splash painted at NORMAL (%d passes, %d us, "
+                    "row_extra %d us)\n",
+                    epd.driver().g16TrainLen(),
+                    epd.driver()._config.g16_pass_us_normal,
+                    epd.driver()._config.rowExtraUs());
+    } break;
+    case 'G': {
+      // Paint the splash artwork at HIGH, 16 greys. A visual check of the
+      // tuned trains on real photographic content rather than on a test
+      // card - which is the content that exposed the pass-budget overrun,
+      // so it is the one worth looking at.
+      epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      Serial.printf("[tuneup] splash painted at HIGH (%d passes, %d us, "
+                    "row_extra %d us)\n",
+                    epd.driver().g16TrainLen(),
+                    epd.driver()._config.g16_pass_us_high,
+                    epd.driver()._config.rowExtraUs());
+    } break;
+    case 'W': {
+      // W <us> - extra per-row charging time. Tests whether the horizontal
+      // gradient is transient charging (more time helps) or steady-state
+      // rail droop (it does not).
+      const int us = (int)Serial.parseInt();
+      const int v = constrain(us, 0, 40);
+      epd.driver()._config.row_extra_us_normal = v;
+      epd.driver()._config.row_extra_us_high   = v;
+      Serial.printf("[tuneup] row charge = %d us both qualities (adds %.1f ms "
+                    "per pass over %d rows)\n", v,
+                    v * epd.height() / 1000.0f, epd.height());
+    } break;
+    case 'U': {
+      // Positional uniformity: driven vs dithered at the same density.
+      static const int LV[] = { 4, 8, 12 };
+      runUniformityProbe(EPD_Painter::Quality::QUALITY_HIGH, LV, 3);
+      showMenuCard();
+    } break;
+    case 'S': {
+      // Staircase check on the INSTALLED tables. Independent of the tuner:
+      // full-height solid bars, which is the worst case for sweeps per row
+      // and therefore the content most likely to expose a dose problem.
+      runStaircaseCheck(EPD_Painter::Quality::QUALITY_HIGH);
+      showMenuCard();
+    } break;
+    case 'D': {
+      // Dose-ladder sweep: pick the pass period from measurement.
+      static const int PERIODS[] = { 19000, 15000, 13000 };
+      runDoseSweep(PERIODS, (int)(sizeof(PERIODS) / sizeof(PERIODS[0])));
+      showMenuCard();
+    } break;
+    case 'K': {
+      // Compensation sweep: cells fixed, whole-panel background varied,
+      // period swept. Yields lum-per-ms and the ms that cancels a
+      // background shift — the coefficient a renderer would need.
+      runCompSweep(COMP_KNOB_PERIOD);
+      showMenuCard();
+    } break;
+    case 'k': {
+      // Same sweep, but varying row charge time instead of pass period.
+      runCompSweep(COMP_KNOB_ROW);
+      showMenuCard();
+    } break;
+    case 'l': {
+      // LE pulse width, with row charge forced to 0: does a properly held
+      // latch remove the content dependence on its own?
+      runCompSweep(COMP_KNOB_LE);
+      showMenuCard();
+    } break;
+    case 'F': {
+      // F 0|1 - reference-ladder correction (see evoRefLadderFix).
+      evoRefLadderFix = (Serial.parseInt() != 0);
+      Serial.printf("[tuneup] reference ladder correction: %s\n",
+                    evoRefLadderFix ? "ON" : "off (plain density)");
+    } break;
+    case 'J': benchLumaScan(); benchLeHold(); break;
     case 'V': tunePreviewResults(); showMenuCard(); break;
     case 'C': {
       // Paint the tuner's own match card and leave it up, so the levels
