@@ -68,14 +68,18 @@
 #if TUNEUP_HAVE_JPEGDEC
 
 static const int EVO_BANDS   = 4;               // candidates per level per scan
+// How many times the staircase repair may swap inverted levels to their
+// runner-up before giving up. Each attempt costs one scan pair.
+static const int EVO_REPAIR_TRIES = 2;
 static const int EVO_REF_H   = 140;             // dithered reference band
 static const int EVO_BAND_H  = 100;             // each candidate patch
 static const int EVO_FIRST_L = 1;               // levels evolved: 1..14
 static const int EVO_LAST_L  = 14;
 // How hard neighbour spacing is weighed against absolute placement. Banding
 // is a spacing artefact, so this is not a refinement - it is the term that
-// decides whether the ramp looks smooth.
-static const float EVO_SPACING_W = 0.6f;
+// decides whether the ramp looks smooth. Applied in the SQUARED domain
+// (fitness is err^2 + resid^2), hence smaller than the old linear 0.6.
+static const float EVO_SPACING_W = 0.35f;
 // How hard a fragile incumbent is penalised, per scan unit of measured
 // spread. Position sensitivity is a property of the WAVEFORM, not only the
 // panel - tuning once made a level 5x MORE position-sensitive while placing
@@ -233,21 +237,34 @@ static void evoShufflePositions() {
   }
 }
 
+// An individual is a PAIR: the apply that lands the grey AND the remove
+// that takes it back to white (Tony's design, 28 Jul 2026). The two are
+// DC-locked — the remove's net whitens always equal the apply's net
+// darkens — and BOTH halves are measured every generation: the card is
+// erased band-by-band with each candidate's own remove anyway (the ledger
+// demands it), so one extra scan of the erased card turns that erase from
+// pure overhead into half the experiment. Fitness is the round trip:
+// err^2 + residual^2, smaller is better.
 struct EvoLv {
   uint8_t elite[TUNE_LEN_MAX];
-  float   eliteErr;                 // signed, as measured last generation
+  uint8_t eliteRm[TUNE_LEN_MAX];    // its DC-locked erase train
+  float   eliteErr;                 // signed apply error, last generation
+  float   eliteResid;               // signed erase residual, last generation
   uint8_t cand[EVO_BANDS][TUNE_LEN_MAX];
+  uint8_t candRm[EVO_BANDS][TUNE_LEN_MAX];
   float   sigma;                    // mutation strength (expected edit count)
   int     stale;                    // generations since the elite improved
   int     wins;                     // accepted mutations, for the 1/5th rule
   int     trials;
-  // Hall of fame: the two best shapes this level has ever measured. Kept
-  // because the elite DRIFTS - once true differences fall below the scan
-  // noise a lucky read can displace a better incumbent, and the run walks
-  // away from shapes it had already found. Re-tested against the incumbent
-  // at the end, in one frame, before anything is committed.
-  float   bestAbs, secondAbs;
-  uint8_t best[TUNE_LEN_MAX], second[TUNE_LEN_MAX];
+  // Hall of fame: the two best PAIRS this level has ever measured, scored
+  // on err^2 + resid^2 alone (spacing is contextual and cannot travel).
+  // Kept because the elite DRIFTS - once true differences fall below the
+  // scan noise a lucky read can displace a better incumbent, and the run
+  // walks away from pairs it had already found. Re-tested against the
+  // incumbent at the end, in one frame, before anything is committed.
+  float   bestScore, secondScore;
+  uint8_t best[TUNE_LEN_MAX],   second[TUNE_LEN_MAX];
+  uint8_t bestRm[TUNE_LEN_MAX], secondRm[TUNE_LEN_MAX];
   // Running spread of THIS elite's measured error, Welford, reset whenever
   // the elite changes. Because the incumbent is re-measured every
   // generation at a fresh band (and column, if shuffling), that spread IS
@@ -257,7 +274,13 @@ struct EvoLv {
   float   rMean, rM2;
   int     rN;
 };
-static EvoLv ev[16];
+// PSRAM, allocated on first use: sixteen of these are ~8 KB, and .bss
+// lives in the internal RAM lwIP needs for packet buffers.
+static EvoLv *ev = nullptr;
+static bool evoAllocState() {
+  if (!ev) ev = (EvoLv *)heap_caps_calloc(16, sizeof(EvoLv), MALLOC_CAP_SPIRAM);
+  return ev != nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // The reference ladder — and why it must NOT be linear in ink density.
@@ -290,17 +313,14 @@ static EvoLv ev[16];
 static uint8_t evoRefThr[16] = { 0, 4, 9, 13, 17, 21, 26, 30,
                                  34, 38, 43, 47, 51, 55, 60, 64 };
 
-// Off by default. The correction below demonstrably evens out the reference
-// ladder - the dark-end gaps went 5.4/4.7/1.2 to 6.0/5.4/4.0 - but two runs
-// carrying it produced no better a table than the plain ladder, and its
-// premise turns out to be shaky: inverting the density->luminance curve
-// point by point assumes that curve is smooth in threshold, and it is not.
-// A Bayer pattern's clustering changes character between thresholds, so dot
-// gain moves in ways sixteen samples cannot capture, and the corrected
-// ladder still showed adjacent gap pairs (11.9 then 2.2) that the threshold
-// spacing cannot explain. Left in, and switchable, so it can be A/B'd
-// against a run that changes nothing else.
-static bool evoRefLadderFix = false;
+// On by default since the M5PaperS3 A/B (29 Jul): the corrected ladder took
+// the NORMAL staircase's worst gap from 41 to 31 and the confirm from 2.9 to
+// 2.2 on otherwise identical runs. The premise is still shaky — inverting
+// the density->luminance curve point by point assumes that curve is smooth
+// in threshold, and a Bayer pattern's dot gain moves between thresholds in
+// ways sixteen samples cannot capture — so corrected ladders still show odd
+// adjacent gap pairs, and the switch ('F 0') stays for A/B runs.
+static bool evoRefLadderFix = true;
 
 static void evoRefThrLinear() {
   for (int g = 0; g < 16; g++) evoRefThr[g] = (uint8_t)((g * 64 + 7) / 15);
@@ -402,22 +422,16 @@ static void evoPinAnchor() {
   memcpy(tl[15].raw, t, TUNE_LEN_MAX);
 }
 
-// Upload the erase trains matched to the APPLIES a given band was painted
-// with. Each band carries a different train set, so each needs its own
-// removes - a remove charge-matched to the wrong apply is a DC imbalance,
-// which is ghosting.
+// Upload the erase trains PAIRED with the applies a given band was painted
+// with. Each band carries a different candidate set, so each needs its own
+// removes — and those removes are the candidates' own evolved halves, not
+// a formula derivation: the erase that follows is how they get measured.
+// The DC lock (evoBalanceRemove) guarantees each pair's ledger is exact.
 static void evoUploadRemovesFor(int band) {
   uint8_t rm[TUNE_LEN_MAX];
-  for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
-    // Borrow the shared per-level state so tuneRemoveOf() derives the match
-    // from the exact sequence this band was driven with.
-    tl[g] = {};
-    tl[g].hasRaw = true;
-    memcpy(tl[g].raw, ev[g].cand[band], TUNE_LEN_MAX);
-    tuneRemoveOf(g, rm);
-    epd.driver().setDecisionTrain((uint8_t)((g << 1) | 1), rm);
-  }
-  tuneRemoveOf(15, rm);                    // the pinned anchor
+  for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++)
+    epd.driver().setDecisionTrain((uint8_t)((g << 1) | 1), ev[g].candRm[band]);
+  tuneRemoveOf(15, rm);                    // the pinned anchor keeps its formula
   epd.driver().setDecisionTrain((uint8_t)((15 << 1) | 1), rm);
 }
 
@@ -617,19 +631,159 @@ static bool evoUsableCandidate(const uint8_t *t) {
   return !evoAllFloat(t) && evoNetOf(t) > 0;
 }
 
-// Build the next generation for one level: band 0 keeps the elite, bands
-// 1..3 are fresh mutants of it. Duplicates are re-rolled — measuring the
-// same sequence twice wastes a quarter of the generation's information.
+// Net of a train counted over an explicit length (the 4-level tier runs
+// 7 or 13 slots, not tuneLen).
+static int evoNetOfLen(const uint8_t *t, int len) {
+  int net = 0;
+  for (int i = 0; i < len; i++) {
+    if (t[i] == 1) net++;
+    else if (t[i] == 2) net--;
+  }
+  return net;
+}
+
+// DC-NEUTRAL PAIR MUTATION (Tony's operator set, 28 Jul 2026). The genome
+// is the apply and its remove taken TOGETHER — 2*len slots — and every
+// operator preserves the combined net of zero by construction, so no
+// candidate pair can ever carry a DC imbalance and no repair step exists
+// to blur a mutation after the fact:
+//
+//   swap    exchange the contents of any two slots, same waveform or
+//           across the two — a pure reorder of the combined pulse
+//           multiset. Covers fine order-trims AND migrating drive mass
+//           between the paint and the erase (a darken leaving the apply
+//           as a whiten leaves the remove).
+//   retire  pick one darken and one whiten anywhere in the pair and set
+//           both to float — the pair shrinks by one charge-neutral quantum.
+//   add     pick two float slots anywhere and make one a darken, one a
+//           whiten — the pair grows by one charge-neutral quantum.
+//
+// Legacy code-3 pulses (old hand-built 4-level tables) are moved by swap
+// but never created or retired — their charge is outside the ledger model.
+static void evoMutatePair(uint8_t *ap, uint8_t *rm, float sigma, int len) {
+  int edits = (int)sigma;
+  if ((float)random(0, 1000) / 1000.0f < (sigma - (float)edits)) edits++;
+  if (edits < 1) edits = 1;
+  const int N = 2 * len;
+  auto slot = [&](int k) -> uint8_t & { return (k < len) ? ap[k] : rm[k - len]; };
+  for (int e = 0; e < edits; e++) {
+    const int op = (int)random(0, 4);      // 0,1 swap; 2 retire; 3 add
+    if (op <= 1) {
+      const int i = (int)random(0, N), j = (int)random(0, N);
+      const uint8_t t = slot(i); slot(i) = slot(j); slot(j) = t;
+    } else if (op == 2) {
+      int d = -1, w = -1;
+      const int s = (int)random(0, N);
+      for (int k = 0; k < N && (d < 0 || w < 0); k++) {
+        const int p = (s + k) % N;
+        if (d < 0 && slot(p) == 1) d = p;
+        else if (w < 0 && slot(p) == 2) w = p;
+      }
+      if (d >= 0 && w >= 0) { slot(d) = 0; slot(w) = 0; }
+    } else {
+      int a = -1, b = -1;
+      const int s = (int)random(0, N);
+      for (int k = 0; k < N && b < 0; k++) {
+        const int p = (s + k) % N;
+        if (slot(p) == 0) { if (a < 0) a = p; else b = p; }
+      }
+      if (a >= 0 && b >= 0) {
+        if ((int)random(0, 2)) { slot(a) = 1; slot(b) = 2; }
+        else                   { slot(a) = 2; slot(b) = 1; }
+      }
+    }
+  }
+  for (int i = len; i < TUNE_LEN_MAX; i++) { ap[i] = 0; rm[i] = 0; }
+}
+
+// The round-trip fitness, smaller is better:
+//
+//     (1 + |grey error|)^2  +  (1 + |erase residual|)^evoGhostPow
+//
+// The ghost term says a surviving ghost is worse than a slightly-off grey:
+// the grey is a rendering nuance the dither absorbs, the ghost haunts
+// every frame after it. The +1 floors keep both terms alive near zero so
+// neither half of the pair ever stops mattering.
+//
+// THE EXPONENT IS A KNOB. It defaults to 3 — CUBED — because that is the
+// product decision: a ghost is worse than a slightly-off grey, and the
+// dither absorbs grey error that no amount of rendering can hide a ghost
+// behind (Tony, 29 and 30 Jul). At 4 units each the ghost costs 125
+// against the grey's 25, and the preference grows with magnitude.
+//
+// What the cube costs, so a future reader does not rediscover it the hard
+// way: the cheapest way for a level to be erasable is to barely move ink,
+// so the cube biases the search toward thin applies.
+//
+//   - At 4 LEVELS that was fatal, and is not used there: the H716's first
+//     from-scratch FAST run (30 Jul) collapsed L1 and L2 onto white,
+//     curve 255 255 253 0. The 4-level tier therefore has its own
+//     square-weighted evo4PairFitness — see tuner_evo4.h.
+//   - At 16 levels it shows up at the LIGHT END, where placing a level
+//     less than one darken below white needs a darken-then-whiten
+//     combination — MORE pulses, which the cube reads as harder to erase.
+//     Compare the H716's L1 apply: 28 Jul chose {1,1,2,2}, net zero,
+//     landing 13 lum under white; 30 Jul cubed chose a lone darken,
+//     landing 39 under, with L2 collapsed onto it.
+//
+// Neither of those is what produced the 30 Jul staircase inversions,
+// though — that was card-vs-staircase context drift (up to 17 lum at L7),
+// measured and printed by the verdict. Fitness weighting and context
+// drift are independent problems; do not blame one for the other.
+//
+// Set to 2.0 ('Z 2' over serial) to A/B the square against a run that
+// changes nothing else.
+static float evoGhostPow = 3.0f;
+
+static float evoPairFitness(float err, float resid) {
+  const float ge = 1.0f + fabsf(err);
+  const float gh = 1.0f + fabsf(resid);
+  return ge * ge + powf(gh, evoGhostPow);
+}
+
+// SEED-TIME ONLY: bring an inherited remove into exact balance with its
+// apply before the first generation. Every mutation thereafter is
+// DC-neutral by construction (evoMutatePair), so this never runs again.
+static void evoBalanceRemove(const uint8_t *ap, uint8_t *rm, int len) {
+  const int need = -evoNetOfLen(ap, len);
+  int have = evoNetOfLen(rm, len);
+  for (int guard = 0; have != need && guard < 400; guard++) {
+    const int i = (int)random(0, len);
+    if (have > need) {                     // shed darkening
+      if (rm[i] == 1)      { rm[i] = 0; have--; }
+      else if (rm[i] == 0) { rm[i] = 2; have--; }
+    } else {                               // add darkening
+      if (rm[i] == 2)      { rm[i] = 0; have++; }
+      else if (rm[i] == 0) { rm[i] = 1; have++; }
+    }
+  }
+  // Random repair exhausted (train nearly saturated): finish linearly.
+  for (int i = 0; have != need && i < len; i++) {
+    while (have > need && rm[i] != 2) { rm[i] = (rm[i] == 1) ? 0 : 2; have--; }
+    while (have < need && rm[i] != 1) { rm[i] = (rm[i] == 2) ? 0 : 1; have++; }
+  }
+}
+
+// Build the next generation for one level: band 0 keeps the elite pair,
+// bands 1..3 are fresh mutant pairs, each produced by the DC-neutral pair
+// operators so its ledger is exact without any repair. A mutant whose
+// apply went non-darkening is re-rolled, as is a duplicate pair —
+// measuring the same sequences twice wastes a quarter of the generation's
+// information.
 static void evoBreed(int g) {
   EvoLv &L = ev[g];
-  memcpy(L.cand[0], L.elite, TUNE_LEN_MAX);
+  memcpy(L.cand[0],   L.elite,   TUNE_LEN_MAX);
+  memcpy(L.candRm[0], L.eliteRm, TUNE_LEN_MAX);
   for (int b = 1; b < EVO_BANDS; b++) {
     for (int tries = 0; tries < 40; tries++) {
-      evoMutate(L.elite, L.cand[b], L.sigma);
+      memcpy(L.cand[b],   L.elite,   TUNE_LEN_MAX);
+      memcpy(L.candRm[b], L.eliteRm, TUNE_LEN_MAX);
+      evoMutatePair(L.cand[b], L.candRm[b], L.sigma, tuneLen);
       if (!evoUsableCandidate(L.cand[b])) continue;
       bool dup = false;
       for (int j = 0; j < b && !dup; j++)
-        if (!memcmp(L.cand[j], L.cand[b], tuneLen)) dup = true;
+        if (!memcmp(L.cand[j], L.cand[b], tuneLen) &&
+            !memcmp(L.candRm[j], L.candRm[b], tuneLen)) dup = true;
       if (!dup) break;
     }
   }
@@ -648,7 +802,8 @@ static void evoBreed(int g) {
     for (int i = EVO_BANDS - 1; i > 0; i--) {
       const int j = (int)random(0, i + 1);
       for (int p = 0; p < TUNE_LEN_MAX; p++) {
-        const uint8_t t = L.cand[i][p]; L.cand[i][p] = L.cand[j][p]; L.cand[j][p] = t;
+        uint8_t t = L.cand[i][p];   L.cand[i][p]   = L.cand[j][p];   L.cand[j][p]   = t;
+        t = L.candRm[i][p];         L.candRm[i][p] = L.candRm[j][p]; L.candRm[j][p] = t;
       }
       if (home == i)      home = j;
       else if (home == j) home = i;
@@ -723,6 +878,14 @@ static bool tuneAdoptInstalled() {
     tl[g] = {};
     tl[g].hasRaw = true;
     memcpy(tl[g].raw, t, tuneLen);
+    // The installed removes too, verbatim: they may be evolved pairs, and
+    // re-deriving them by formula here would erase with something other
+    // than what selection chose.
+    const uint8_t *r = epd.driver().decisionTrain((uint8_t)((g << 1) | 1));
+    if (r) {
+      tl[g].hasRawRm = true;
+      memcpy(tl[g].rawRm, r, tuneLen);
+    }
   }
   memset(removeExtra, 0, sizeof(removeExtra));
   return true;
@@ -749,7 +912,8 @@ static bool evoMeasureBars(bool dithered, float out[16]) {
 // scOut, if given, receives the staircase-measured level curve — the curve
 // of the levels as FULL-HEIGHT SOLID content renders them, which is the
 // better model of a photograph than the match card's half-dither rows.
-static float evoVerifyStaircase(const uint8_t lum[16], uint8_t *scOut = nullptr) {
+static float evoVerifyStaircase(const uint8_t lum[16], uint8_t *scOut = nullptr,
+                                uint16_t *invMask = nullptr) {
   Serial.println("[evo] ---- verification: full-height staircase ----");
   static float ref[16], nat[16];
   if (!evoMeasureBars(true,  ref)) return -1;
@@ -790,11 +954,15 @@ static float evoVerifyStaircase(const uint8_t lum[16], uint8_t *scOut = nullptr)
 
   // Steps and monotonicity, which is what banding actually is.
   int inversions = 0, minStep = 999, maxStep = -999;
+  if (invMask) *invMask = 0;
   Serial.print("[evo] staircase steps:");
   for (int g = 0; g < 15; g++) {
     const int st = (int)sc[g] - (int)sc[g + 1];
     Serial.printf(" %d", st);
-    if (st <= 0) inversions++;
+    // A non-decreasing step means level g+1 failed to be darker than g.
+    // Flag BOTH, since either one landing wrong produces the same reversal
+    // and the repair pass has no way to know which is at fault.
+    if (st <= 0) { inversions++; if (invMask) *invMask |= (1u << g) | (1u << (g + 1)); }
     minStep = min(minStep, st);
     maxStep = max(maxStep, st);
   }
@@ -1601,13 +1769,47 @@ static bool runPhotoCurveStore(EPD_Painter::Quality q) {
     meas[g] = nread[g] ? sum[g] / nread[g] : 0.0f;
   uint8_t lum[16];
   tuneCurveFrom(meas, 16, lum, "photo");
-  // A curve that is not monotone cannot be quantised against sensibly;
-  // report rather than store, so a bad scan cannot poison the blob.
-  for (int g = 1; g < 16; g++)
-    if (lum[g] > lum[g - 1]) {
-      Serial.printf("[photo] curve INVERTS at L%d - not storing\n", g);
+  // A photo-context curve is allowed SMALL inversions: the white/black/
+  // photo probe (29 Jul) showed adjacent levels genuinely swapping under
+  // dithered content, and the cure is to stop pretending there is
+  // contrast between them. Pool each run of violators to its weighted
+  // mean (isotonic regression), so the dither treats those levels as the
+  // equals the glass says they are. A LARGE inversion is still a broken
+  // measurement - a lifted lid, a failed scan - not physics: refuse it.
+  {
+    float val[16]; int wgt[16]; int np = 0;
+    for (int g = 0; g < 16; g++) {
+      val[np] = (float)lum[g]; wgt[np] = 1; np++;
+      while (np > 1 && val[np - 1] > val[np - 2]) {   // violates decreasing
+        val[np - 2] = (val[np - 2] * wgt[np - 2] + val[np - 1] * wgt[np - 1])
+                      / (float)(wgt[np - 2] + wgt[np - 1]);
+        wgt[np - 2] += wgt[np - 1];
+        np--;
+      }
+    }
+    float worstAdj = 0;
+    int idx = 0;
+    uint8_t pooled[16];
+    for (int b = 0; b < np; b++)
+      for (int k = 0; k < wgt[b]; k++, idx++) {
+        const float adj = fabsf(val[b] - (float)lum[idx]);
+        if (adj > worstAdj) worstAdj = adj;
+        pooled[idx] = (uint8_t)lroundf(val[b]);
+      }
+    if (worstAdj > 12.0f) {
+      Serial.printf("[photo] inversion needs a %.0f-lum pool - measurement "
+                    "broken, not storing\n", worstAdj);
       return false;
     }
+    if (worstAdj > 0) {
+      Serial.print("[photo] pooled inverted neighbours:");
+      for (int g = 0; g < 16; g++) {
+        if (pooled[g] != lum[g]) Serial.printf(" L%d %d->%d", g, lum[g], pooled[g]);
+        lum[g] = pooled[g];
+      }
+      Serial.println();
+    }
+  }
   if (!tunedStoreCurve(epd.driver(), s, lum)) {
     Serial.println("[photo] could not update the stored blob");
     return false;
@@ -1676,13 +1878,17 @@ static bool runStaircaseCheck(EPD_Painter::Quality q) {
 // shape is still right but each slot's dose is not — so runEvoTune says so
 // rather than letting it pass silently.
 static uint8_t     evoIncumbent[16][TUNE_LEN_MAX];
+static uint8_t     evoIncumbentRm[16][TUNE_LEN_MAX];
+static bool        evoIncumbentHasRm = false;
 static int         evoIncumbentLen  = 0;         // 0 = nothing worth seeding from
 static const char *evoIncumbentWhat = "the formula library";
 
 static void evoCaptureIncumbent(EPD_Painter::Quality target) {
   evoIncumbentLen  = 0;
+  evoIncumbentHasRm = false;
   evoIncumbentWhat = "the formula library";
   memset(evoIncumbent, 0, sizeof(evoIncumbent));
+  memset(evoIncumbentRm, 0, sizeof(evoIncumbentRm));
 
   const bool high = (target == EPD_Painter::Quality::QUALITY_HIGH);
   const auto &tr = epd.driver()._config.trains;
@@ -1702,6 +1908,15 @@ static void evoCaptureIncumbent(EPD_Painter::Quality target) {
       const uint8_t *t = epd.driver().decisionTrain((uint8_t)((g << 1) | 0));
       if (!t) return;
       memcpy(evoIncumbent[g], t, tuneLen);
+    }
+    // The installed removes seed the erase half of each pair. They are
+    // charge-matched by construction wherever they came from; a missing
+    // one falls back to the code-swap mirror in evoSeed().
+    evoIncumbentHasRm = true;
+    for (int g = 1; g < 16; g++) {
+      const uint8_t *t = epd.driver().decisionTrain((uint8_t)((g << 1) | 1));
+      if (!t) { evoIncumbentHasRm = false; break; }
+      memcpy(evoIncumbentRm[g], t, tuneLen);
     }
     evoIncumbentLen  = tuneLen;
     evoIncumbentWhat = "this quality's own installed table";
@@ -1747,11 +1962,24 @@ static void evoSeed() {
         p++;
       }
     }
-    memcpy(L.best,   L.elite, TUNE_LEN_MAX);
-    memcpy(L.second, L.elite, TUNE_LEN_MAX);
-    L.eliteErr  = 1e9f;
-    L.bestAbs   = 1e9f;
-    L.secondAbs = 1e9f;
+    // The erase half of the pair: the installed remove when there is one,
+    // else the code-swap mirror of the apply (11d+6w seeds as 11w+6d) —
+    // net exactly negated by construction, order for evolution to find.
+    if (evoIncumbentLen && evoIncumbentHasRm) {
+      memcpy(L.eliteRm, evoIncumbentRm[g], TUNE_LEN_MAX);
+    } else {
+      for (int i = 0; i < TUNE_LEN_MAX; i++)
+        L.eliteRm[i] = (L.elite[i] == 1) ? 2 : (L.elite[i] == 2) ? 1 : 0;
+    }
+    evoBalanceRemove(L.elite, L.eliteRm, tuneLen);
+    memcpy(L.best,     L.elite,   TUNE_LEN_MAX);
+    memcpy(L.second,   L.elite,   TUNE_LEN_MAX);
+    memcpy(L.bestRm,   L.eliteRm, TUNE_LEN_MAX);
+    memcpy(L.secondRm, L.eliteRm, TUNE_LEN_MAX);
+    L.eliteErr    = 1e9f;
+    L.eliteResid  = 0.0f;
+    L.bestScore   = 1e9f;
+    L.secondScore = 1e9f;
     // Mutate gently when starting from a measured table: the job is to refine
     // an answer that is already close, and 2.0 expected edits would knock a
     // good train apart faster than selection can put it back. From the
@@ -1830,6 +2058,11 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   tuneScanGapMs = savedGap + 1000;
 
   randomSeed(micros());
+  if (!evoAllocState()) {
+    Serial.println("[evo] no PSRAM for the evolution state");
+    tuneScanGapMs = savedGap;
+    return false;
+  }
   evoCaptureIncumbent(quality);
   evoSeed();
   Serial.printf("[evo] seeded from %s\n", evoIncumbentWhat);
@@ -1888,28 +2121,42 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
     // span and the level curve are all built from these, and a set measured
     // generations ago would carry the session's drift into all three.
     for (int i = 0; i < 16; i++) probeRef[i] = ref[i];
-    evoEraseCard();      // DC ledger: undo exactly what was applied
+    evoEraseCard();      // each band erased by its candidates' OWN removes
+
+    // The erase is half the experiment (Tony's design): the card had to be
+    // taken back to white anyway, each band by its candidates' own paired
+    // removes — so one scan of the now-white card reads all 56 erase
+    // residuals at once. Immediately, which is the only time a ghost can
+    // be measured: residuals decay within minutes. Column 0 is never
+    // driven, so it is each band's own paper-white reference.
+    static float refW[16], natW[EVO_BANDS][16];
+    if (!evoMeasure(refW, natW)) { tuneScanGapMs = savedGap; return false; }
+    static float resid[EVO_BANDS][16];
+    for (int b = 0; b < EVO_BANDS; b++)
+      for (int g = 0; g < 16; g++)
+        resid[b][g] = natW[b][g] - natW[b][0];
 
     int improved = 0;
-    float worst = 0;
+    float worst = 0, worstR = 0;
     for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
       EvoLv &L = ev[g];
-      // Band 0 IS the elite, measured in this frame. Selection uses these
-      // numbers only — never a value carried over from a previous scan.
-      // Fitness = placement + SPACING. Placement alone is not enough and
-      // this is the whole reason a ramp bands: banding is a function of the
-      // step between neighbours, not of any one level's absolute error. The
-      // dither references are evenly spaced by construction, so UNIFORM
-      // error is exactly correct spacing - two levels both 3 units dark
-      // look perfect together, while +3 and -3 puts a step 6 units wrong
-      // against a nominal 6.5. So penalise a candidate whose error differs
-      // from its neighbours', using their current elites as the reference.
-      auto score = [&](float e) {
+      // Band 0's home IS the elite, measured in this frame. Selection uses
+      // these numbers only — never a value carried over from a previous
+      // scan. Fitness is evoPairFitness() — the ghost-weighted round trip
+      // — plus the spacing term: banding is a function of the step between
+      // neighbours, not of any one level's absolute error, so a candidate
+      // whose error differs from its neighbours' is penalised against
+      // their current elites.
+      auto score = [&](float e, float r) {
         float sp = 0;
         int   n  = 0;
-        if (g > EVO_FIRST_L  && ev[g - 1].eliteErr < 1e8f) { sp += fabsf(e - ev[g - 1].eliteErr); n++; }
-        if (g < EVO_LAST_L   && ev[g + 1].eliteErr < 1e8f) { sp += fabsf(e - ev[g + 1].eliteErr); n++; }
-        return fabsf(e) + (n ? EVO_SPACING_W * sp / n : 0.0f);
+        if (g > EVO_FIRST_L && ev[g - 1].eliteErr < 1e8f) {
+          const float d = e - ev[g - 1].eliteErr; sp += d * d; n++;
+        }
+        if (g < EVO_LAST_L && ev[g + 1].eliteErr < 1e8f) {
+          const float d = e - ev[g + 1].eliteErr; sp += d * d; n++;
+        }
+        return evoPairFitness(e, r) + (n ? EVO_SPACING_W * sp / n : 0.0f);
       };
       const int home = evoEliteBand[g];
       // Robustness penalty on the INCUMBENT only. A challenger has no
@@ -1919,20 +2166,22 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
       float rsd = 0.0f;
       if (L.rN >= 4) rsd = sqrtf(L.rM2 / (L.rN - 1));
       float bestErr = err[home][g];
-      float bestSc  = score(err[home][g]) + EVO_ROBUST_W * rsd;
+      float bestRes = resid[home][g];
+      float bestSc  = score(err[home][g], resid[home][g]) + EVO_ROBUST_W * rsd * rsd;
       int   bestB   = home;
       for (int b = 0; b < EVO_BANDS; b++) {
         if (b == home) continue;
         L.trials++;
-        const float sc = score(err[b][g]);
-        if (sc < bestSc) { bestSc = sc; bestErr = err[b][g]; bestB = b; }
+        const float sc = score(err[b][g], resid[b][g]);
+        if (sc < bestSc) { bestSc = sc; bestErr = err[b][g]; bestRes = resid[b][g]; bestB = b; }
       }
       if (bestB != home) {
-        memcpy(L.elite, L.cand[bestB], TUNE_LEN_MAX);
+        memcpy(L.elite,   L.cand[bestB],   TUNE_LEN_MAX);
+        memcpy(L.eliteRm, L.candRm[bestB], TUNE_LEN_MAX);
         L.wins++;
         L.stale = 0;
         improved++;
-        L.rMean = L.rM2 = 0.0f;      // new shape: its history starts now
+        L.rMean = L.rM2 = 0.0f;      // new pair: its history starts now
         L.rN = 0;
       } else {
         L.stale++;
@@ -1943,21 +2192,32 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
         L.rMean += d / L.rN;
         L.rM2   += d * (bestErr - L.rMean);
       }
-      L.eliteErr = bestErr;
-      if (fabsf(bestErr) < L.bestAbs) {
+      L.eliteErr   = bestErr;
+      L.eliteResid = bestRes;
+      // Hall of fame is scored on the pair's own round trip alone —
+      // spacing is contextual and cannot travel between frames.
+      const float raw = evoPairFitness(bestErr, bestRes);
+      if (raw < L.bestScore) {
         // Demote the old champion rather than discard it - two independent
-        // shapes to re-test is a better hedge against a lucky read than one.
-        if (memcmp(L.best, L.elite, tuneLen)) {
-          L.secondAbs = L.bestAbs;
-          memcpy(L.second, L.best, TUNE_LEN_MAX);
+        // pairs to re-test is a better hedge against a lucky read than one.
+        if (memcmp(L.best, L.elite, tuneLen) ||
+            memcmp(L.bestRm, L.eliteRm, tuneLen)) {
+          L.secondScore = L.bestScore;
+          memcpy(L.second,   L.best,   TUNE_LEN_MAX);
+          memcpy(L.secondRm, L.bestRm, TUNE_LEN_MAX);
         }
-        L.bestAbs = fabsf(bestErr);
-        memcpy(L.best, L.elite, TUNE_LEN_MAX);
-      } else if (fabsf(bestErr) < L.secondAbs && memcmp(L.best, L.elite, tuneLen)) {
-        L.secondAbs = fabsf(bestErr);
-        memcpy(L.second, L.elite, TUNE_LEN_MAX);
+        L.bestScore = raw;
+        memcpy(L.best,   L.elite,   TUNE_LEN_MAX);
+        memcpy(L.bestRm, L.eliteRm, TUNE_LEN_MAX);
+      } else if (raw < L.secondScore &&
+                 (memcmp(L.best, L.elite, tuneLen) ||
+                  memcmp(L.bestRm, L.eliteRm, tuneLen))) {
+        L.secondScore = raw;
+        memcpy(L.second,   L.elite,   TUNE_LEN_MAX);
+        memcpy(L.secondRm, L.eliteRm, TUNE_LEN_MAX);
       }
-      if (fabsf(bestErr) > worst) worst = fabsf(bestErr);
+      if (fabsf(bestErr) > worst)  worst  = fabsf(bestErr);
+      if (fabsf(bestRes) > worstR) worstR = fabsf(bestRes);
 
       // Self-adaptation, Rechenberg's 1/5th success rule: if more than a
       // fifth of mutations are being accepted the search is in easy country
@@ -1975,8 +2235,11 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
       L.sigma = constrain(L.sigma, 1.0f, 6.0f);
     }
 
-    Serial.printf("[evo] gen %2d  worst %5.1f  improved %2d/14  |", gen, worst, improved);
+    Serial.printf("[evo] gen %2d  worst %5.1f  ghost %4.1f  improved %2d/14  |",
+                  gen, worst, worstR, improved);
     for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) Serial.printf("%+3.0f", ev[g].eliteErr);
+    Serial.print("  rm|");
+    for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) Serial.printf("%+3.0f", ev[g].eliteResid);
     Serial.println();
 
     // The dither references themselves, every few generations. These are the
@@ -2025,43 +2288,64 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
         // every level - so putting it up against a converged near-black
         // elite and adopting it on a lucky read is a ~59 unit error. That
         // is precisely what happened before this guard existed.
-        const bool haveChal = useSecond ? (ev[g].secondAbs < 1e8f)
-                                        : (ev[g].bestAbs   < 1e8f);
-        const uint8_t *chal = useSecond ? ev[g].second : ev[g].best;
-        if (!haveChal) chal = ev[g].elite;   // nothing to test: run unopposed
+        const bool haveChal = useSecond ? (ev[g].secondScore < 1e8f)
+                                        : (ev[g].bestScore   < 1e8f);
+        const uint8_t *chal   = useSecond ? ev[g].second   : ev[g].best;
+        const uint8_t *chalRm = useSecond ? ev[g].secondRm : ev[g].bestRm;
+        if (!haveChal) { chal = ev[g].elite; chalRm = ev[g].eliteRm; }
         // Incumbent in bands 0 and 3, challenger in 1 and 2 - deliberately
         // interleaved rather than blocked, so each gets one outer band and
         // one inner one and any top-to-bottom trend affects both equally.
-        memcpy(ev[g].cand[0], ev[g].elite, TUNE_LEN_MAX);
-        memcpy(ev[g].cand[3], ev[g].elite, TUNE_LEN_MAX);
-        memcpy(ev[g].cand[1], chal,        TUNE_LEN_MAX);
-        memcpy(ev[g].cand[2], chal,        TUNE_LEN_MAX);
+        memcpy(ev[g].cand[0],   ev[g].elite,   TUNE_LEN_MAX);
+        memcpy(ev[g].cand[3],   ev[g].elite,   TUNE_LEN_MAX);
+        memcpy(ev[g].cand[1],   chal,          TUNE_LEN_MAX);
+        memcpy(ev[g].cand[2],   chal,          TUNE_LEN_MAX);
+        memcpy(ev[g].candRm[0], ev[g].eliteRm, TUNE_LEN_MAX);
+        memcpy(ev[g].candRm[3], ev[g].eliteRm, TUNE_LEN_MAX);
+        memcpy(ev[g].candRm[1], chalRm,        TUNE_LEN_MAX);
+        memcpy(ev[g].candRm[2], chalRm,        TUNE_LEN_MAX);
       }
       evoPaintCard();
       if (!evoMeasure(ref, nat2)) break;
       evoErrors(ref, nat2, err2);
       for (int i = 0; i < 16; i++) probeRef[i] = ref[i];
       evoEraseCard();
+      // The pair is judged on its whole round trip, so the confirmation
+      // needs the erase residuals too — same extra scan as a generation.
+      static float refW2[16], natW2[EVO_BANDS][16];
+      if (!evoMeasure(refW2, natW2)) break;
+      static float res2[EVO_BANDS][16];
+      for (int b = 0; b < EVO_BANDS; b++)
+        for (int g = 0; g < 16; g++)
+          res2[b][g] = natW2[b][g] - natW2[b][0];
 
       float noise = 0;
       int   nn = 0;
       for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
         const float eliteE = 0.5f * (err2[0][g] + err2[3][g]);
         const float chalE  = 0.5f * (err2[1][g] + err2[2][g]);
+        const float eliteR = 0.5f * (res2[0][g] + res2[3][g]);
+        const float chalR  = 0.5f * (res2[1][g] + res2[2][g]);
         noise += fabsf(err2[0][g] - err2[3][g]);
         nn++;
-        const bool haveChal = useSecond ? (ev[g].secondAbs < 1e8f)
-                                        : (ev[g].bestAbs   < 1e8f);
-        if (haveChal && fabsf(chalE) < fabsf(eliteE)) {
-          memcpy(ev[g].elite, useSecond ? ev[g].second : ev[g].best, TUNE_LEN_MAX);
-          ev[g].eliteErr = chalE;
+        const bool haveChal = useSecond ? (ev[g].secondScore < 1e8f)
+                                        : (ev[g].bestScore   < 1e8f);
+        if (haveChal && evoPairFitness(chalE, chalR) <
+                        evoPairFitness(eliteE, eliteR)) {
+          memcpy(ev[g].elite,   useSecond ? ev[g].second   : ev[g].best,   TUNE_LEN_MAX);
+          memcpy(ev[g].eliteRm, useSecond ? ev[g].secondRm : ev[g].bestRm, TUNE_LEN_MAX);
+          ev[g].eliteErr   = chalE;
+          ev[g].eliteResid = chalR;
           adopted++;
         } else {
           // Average both reads of the incumbent - when it ran unopposed all
           // four bands hold it, so this is a four-read mean.
-          ev[g].eliteErr = haveChal ? eliteE
-                                    : 0.25f * (err2[0][g] + err2[1][g] +
-                                               err2[2][g] + err2[3][g]);
+          ev[g].eliteErr   = haveChal ? eliteE
+                                      : 0.25f * (err2[0][g] + err2[1][g] +
+                                                 err2[2][g] + err2[3][g]);
+          ev[g].eliteResid = haveChal ? eliteR
+                                      : 0.25f * (res2[0][g] + res2[1][g] +
+                                                 res2[2][g] + res2[3][g]);
         }
       }
       Serial.printf("[evo] confirm %d (%s): adopted %d/14, per-patch noise "
@@ -2076,10 +2360,13 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
 
   tuneScanGapMs = savedGap;
 
-  Serial.println("[evo] final elites:");
+  Serial.println("[evo] final elite pairs:");
   for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
-    Serial.printf("  L%-2d err %+5.1f (best %4.1f)  {", g, ev[g].eliteErr, ev[g].bestAbs);
+    Serial.printf("  L%-2d err %+5.1f ghost %+5.1f (best %5.1f)  {",
+                  g, ev[g].eliteErr, ev[g].eliteResid, ev[g].bestScore);
     evoPrintTrain(ev[g].elite);
+    Serial.print("} rm {");
+    evoPrintTrain(ev[g].eliteRm);
     Serial.println("}");
   }
 
@@ -2095,6 +2382,11 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
     tl[g] = {};
     tl[g].hasRaw = true;
     memcpy(tl[g].raw, ev[g].elite, TUNE_LEN_MAX);
+    // The evolved remove travels with its apply: tuneRemoveOf() returns it
+    // verbatim, so the verify below, the blob and every later erase use
+    // the pair that was actually selected — not a formula derivation.
+    tl[g].hasRawRm = true;
+    memcpy(tl[g].rawRm, ev[g].eliteRm, TUNE_LEN_MAX);
     tl[g].err = ev[g].eliteErr;
     mx = max(mx, fabsf(ev[g].eliteErr));
   }
@@ -2103,7 +2395,7 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   evoPinAnchor();
   tuneUploadApplies();
 
-  Serial.println("[evo] deriving charge-matched removes...");
+  Serial.println("[evo] verifying the evolved removes (anchor stays formula-matched)...");
   memset(removeExtra, 0, sizeof(removeExtra));
   float worst = -1;
   for (int round = 0; round < 3; round++) {
@@ -2137,7 +2429,71 @@ static bool runEvoTune(EPD_Painter::Quality quality, int generations) {
   // anything is written. If this disagrees with the match card, the tables
   // are card-specific and should not be kept.
   uint8_t stairLum[16];
-  const float stair = evoVerifyStaircase(lum, stairLum);
+  uint16_t invMask = 0;
+  float stair = evoVerifyStaircase(lum, stairLum, &invMask);
+
+  // SECOND-PLACE REPAIR (Tony's idea, 30 Jul).
+  //
+  // A staircase inversion condemns the whole table, and until now that meant
+  // throwing away a run whose other fourteen levels were fine — the LilyGo's
+  // HIGH set confirmed at 2.7, the best of the day, and was binned for one
+  // reversed pair. But the hall of fame already holds a RUNNER-UP pair per
+  // level, kept precisely because it scored nearly as well by a different
+  // shape. If the leader inverts against its neighbour, the runner-up is the
+  // obvious thing to try, and it costs one scan pair rather than a re-run.
+  //
+  // Only the flagged levels are swapped; everything else keeps its winner.
+  // The swap is kept only if the staircase genuinely improves — fewer
+  // inversions, or the same count with a better worst — so a repair that
+  // makes things worse is reverted and the run is rejected as before.
+  for (int attempt = 0; stair >= 0 && invMask && attempt < EVO_REPAIR_TRIES; attempt++) {
+    int swapped = 0;
+    for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
+      if (!(invMask & (1u << g))) continue;
+      if (ev[g].secondScore >= 1e8f) continue;          // no runner-up held
+      memcpy(ap[g], ev[g].second,   TUNE_LEN_MAX);
+      memcpy(rm[g], ev[g].secondRm, TUNE_LEN_MAX);
+      tuneTrainOf(g, ap[g]);
+      tuneRemoveOf(g, rm[g]);
+      swapped++;
+    }
+    if (!swapped) {
+      Serial.println("[evo] repair: no runner-up available for the inverted "
+                     "levels - keeping the winners");
+      break;
+    }
+    Serial.printf("[evo] repair attempt %d: swapped %d inverted level(s) to "
+                  "their runner-up, re-measuring\n", attempt + 1, swapped);
+
+    uint8_t tryLum[16];
+    uint16_t tryMask = 0;
+    const float tryStair = evoVerifyStaircase(lum, tryLum, &tryMask);
+    if (tryStair < 0) break;                            // scan failed, stop
+
+    const int wasInv = __builtin_popcount(invMask);
+    const int nowInv = __builtin_popcount(tryMask);
+    if (nowInv < wasInv || (nowInv == wasInv && tryStair < stair)) {
+      Serial.printf("[evo] repair KEPT (inverted levels %d -> %d, worst "
+                    "%.1f -> %.1f)\n", wasInv, nowInv, stair, tryStair);
+      memcpy(stairLum, tryLum, 16);
+      stair = tryStair;
+      invMask = tryMask;
+      if (!invMask) break;                              // monotonic: done
+    } else {
+      Serial.printf("[evo] repair REJECTED (inverted levels %d -> %d, worst "
+                    "%.1f -> %.1f) - restoring the winners\n",
+                    wasInv, nowInv, stair, tryStair);
+      for (int g = EVO_FIRST_L; g <= EVO_LAST_L; g++) {
+        if (!(invMask & (1u << g))) continue;
+        memcpy(ap[g], ev[g].best,   TUNE_LEN_MAX);
+        memcpy(rm[g], ev[g].bestRm, TUNE_LEN_MAX);
+        tuneTrainOf(g, ap[g]);
+        tuneRemoveOf(g, rm[g]);
+      }
+      break;
+    }
+  }
+
   if (stair >= 0) {
     mx = max(mx, stair);
     // Store the STAIRCASE curve, not the match card's. The curve exists

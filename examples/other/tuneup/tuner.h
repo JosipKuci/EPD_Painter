@@ -109,6 +109,12 @@ struct TuneLv {
   // grammar fields are ignored by tuneTrainOf().
   bool    hasRaw;
   uint8_t raw[TUNE_LEN_MAX];
+  // An EVOLVED remove, when the pair-evolution produced one. Selected on
+  // its measured erase residual, so it outranks the formula derivation in
+  // tuneRemoveOf() — and removeExtra widening does not apply to it
+  // (selection already owned that trade-off).
+  bool    hasRawRm;
+  uint8_t rawRm[TUNE_LEN_MAX];
 };
 static TuneLv tl[16];
 // Landing of {1 x n} (monotone-enforced), n = 1..tuneLen. Indexed by pass
@@ -458,7 +464,16 @@ static bool tuneBBoxAdaptive(uint8_t thresh, int *bx0, int *by0,
                              int *bx1, int *by1) {
   const int W = grayW, H = grayH;
   if (W > 2048 || H > 2048) return false;
-  static int rowsC[2048], colsC[2048];
+  // PSRAM, not .bss: these were 16 KB of INTERNAL RAM — the pool lwIP
+  // buffers received packets in. Starving it made every HTTP response
+  // vanish while requests kept sending (int heap measured at 1.8 KB free
+  // mid-session), which cost a night of scanner-chasing.
+  static int *rowsC = nullptr, *colsC = nullptr;
+  if (!rowsC) {
+    rowsC = (int *)heap_caps_malloc(2048 * sizeof(int), MALLOC_CAP_SPIRAM);
+    colsC = (int *)heap_caps_malloc(2048 * sizeof(int), MALLOC_CAP_SPIRAM);
+    if (!rowsC || !colsC) return false;
+  }
   memset(rowsC, 0, sizeof(int) * H);
   memset(colsC, 0, sizeof(int) * W);
   for (int y = 0; y < H; y++) {
@@ -859,6 +874,7 @@ static bool tuneDoseCard(int base, float *land, float *refOut) {
 static void tuneRemoveOf(int lv, uint8_t *out) {
   memset(out, 0, TUNE_LEN_MAX);
   if (lv == 0) return;
+  if (tl[lv].hasRawRm) { memcpy(out, tl[lv].rawRm, TUNE_LEN_MAX); return; }
   const int net = tuneNetOf(lv);          // from the real train, raw or not
   if (net <= 0) {
     out[0] = 1; out[1] = 2; out[2] = 1; out[3] = 2;   // charge-neutral scrub

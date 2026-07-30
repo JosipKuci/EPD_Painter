@@ -18,17 +18,18 @@
 //      bouncing-title artifact). NORMAL and the M5PaperS3 have had a tuned
 //      set since July; FAST never did.
 //
-// WHAT LIMITS THIS TUNE, and it is worth understanding before reading the
-// numbers: in 4-level mode there are only three drive trains on the glass
-// at once — one per level — so a card can measure three candidates, not
-// fourteen. The 16-grey tuner's whole strategy (spend a whole card on one
-// level's candidates) is unavailable here. The compensation is that FAST
-// paints are fast and the search space is tiny, so this converges by
-// iterating rather than by breadth.
+// THE LEVELS PHASE IS PAIR-EVOLUTION — see tuner_evo4.h. Each level's
+// apply (darker row) and remove (lighter row) evolve TOGETHER under
+// DC-neutral mutation, judged on the whole round trip err^2 + resid^2.
+// The model-based converger that used to live here (dose ladder, gap
+// probe, damped (d,w,gap,r) solve, formula removes) was superseded by it:
+// the formula's net-zero scrub erase is measurably a ghost on this glass,
+// and only a searched remove can find the shapes that are not.
 //
-// The direct card is the exception and the reason phase 2 is cheap: nine
-// columns carry three references and all six transitions in a single
-// paint, so every pair is measured every scan.
+// This file keeps the shared 4-level plumbing (card, measurement, table
+// upload, the pure-dose probe the directs-only path still uses) and the
+// direct grey-to-grey search: nine columns carry three references and all
+// six transitions in a single paint, so every pair is measured every scan.
 // ============================================================================
 
 #pragma once
@@ -77,24 +78,22 @@ static const char *fastQualityName() {
 
 // Placement tolerance, as a fraction of a level step. Four levels over the
 // same full scale means a step is five times a 16-grey step, so the same
-// fraction is a much looser absolute number — which is correct: nothing
-// about FAST is asking for 16-grey precision.
-static const float FAST_TOL_STEPS = 0.25f;
-static const int   FAST_MAX_CYCLES = 14;
+// fraction is a much looser absolute number.
+//
+// 0.25 (~8 scan units) was the model-based converger's ask, and the pair
+// evolution sailed inside it in two generations on its first outing —
+// worst 3.7 with ghosts under 4.1. Halved to 0.12 (~4 units): still 2-3x
+// the per-patch scan noise, so the search is chasing panel rather than
+// noise, and the extra generations are cheap at ~10 s each.
+static const float FAST_TOL_STEPS = 0.12f;
 static const int   FAST_DIR_CYCLES = 10;
 
 struct FastLv {
-  int8_t d, w, g, r;
   float  err;          // gradient-corrected (native - reference), scan units
-  float  bias;         // measured landing minus what the model predicted
-  float  bestAbs;
-  float  bestErr;      // the same measurement, sign kept (the level curve needs it)
-  int8_t bd, bw, bg, br;
 };
 static FastLv fl[4];
-static float fastDose[F_LEN_MAX + 1];   // landing of {1 x n}, n = 1..7
+static float fastDose[F_LEN_MAX + 1];   // landing of {1 x n} (probe diagnostic)
 static float fastRef[4];            // the four dither references
-static float fastGw = 20.0f, fastGr = 10.0f, fastGg = 0.0f;
 
 // One level step in scan units, from the panel's own reference ladder.
 static float fastStep() {
@@ -169,16 +168,6 @@ static void fastErrors(const float ref[4], const float nat[4], float err[4]) {
 // ---------------------------------------------------------------------------
 // Trains
 // ---------------------------------------------------------------------------
-static void fastTrainOfShape(int d, int w, int gap, int r, uint8_t out[F_LEN_MAX]) {
-  memset(out, 0, fastLen);
-  int p = 0;
-  for (int i = 0; i < d && p < fastLen; i++) out[p++] = 1;
-  for (int i = 0; i < w && p < fastLen; i++) out[p++] = 2;
-  p += gap;
-  if (p > fastLen) p = fastLen;
-  for (int i = 0; i < r && p < fastLen; i++) out[p++] = 1;
-}
-
 // Write straight into the live waveform table: paint() re-reads
 // Config::waveforms every frame, so an upload takes effect on the next one.
 static void fastUploadApply(int lv, const uint8_t t[F_LEN_MAX]) {
@@ -186,14 +175,6 @@ static void fastUploadApply(int lv, const uint8_t t[F_LEN_MAX]) {
 }
 static void fastUploadRemove(int lv, const uint8_t t[F_LEN_MAX]) {
   memcpy(fastLighterRow(lv - 1), t, fastLen);
-}
-
-static void fastUploadApplies() {
-  uint8_t t[F_LEN_MAX];
-  for (int lv = 1; lv <= 3; lv++) {
-    fastTrainOfShape(fl[lv].d, fl[lv].w, fl[lv].g, fl[lv].r, t);
-    fastUploadApply(lv, t);
-  }
 }
 
 // Net charge of the train a level is ACTUALLY running: darkens minus
@@ -208,38 +189,6 @@ static int fastNetOf(int lv) {
   for (int i = 0; i < fastLen; i++) { if (t[i] == 1) net++; else if (t[i] == 2) net--; }
   return net;
 }
-
-// Charge-matched erase, exactly the rule the 16-grey removes use: k
-// darkens then k + net whitens, so net whitens equals the apply's net
-// darkens and a paint/unpaint cycle is DC neutral. Darkens FIRST — an
-// appended (darken, whiten) scrub pair erases nothing, because the darken
-// undoes its whiten's gain almost exactly, whereas deepening first means
-// every whiten then fires from a dark state where it is strong.
-static void fastRemoveOf(int lv, uint8_t out[F_LEN_MAX]) {
-  memset(out, 0, fastLen);
-  const int net = fastNetOf(lv);
-  if (net <= 0) { out[0] = 1; out[1] = 2; out[2] = 1; out[3] = 2; return; }
-  int wr = max(net, 3);
-  if (wr > fastLen) wr = fastLen;
-  int k = wr - net;
-  if (k < 0) k = 0;
-  while (k + wr > fastLen && k > 0) { k--; wr--; }
-  if (k + wr > fastLen) { wr = min(fastLen, net); k = 0; }
-  int p = 0;
-  for (int i = 0; i < k; i++) out[p++] = 1;
-  for (int i = 0; i < wr && p < fastLen; i++) out[p++] = 2;
-}
-
-static void fastUploadRemoves() {
-  uint8_t t[F_LEN_MAX];
-  for (int lv = 1; lv <= 3; lv++) { fastRemoveOf(lv, t); fastUploadRemove(lv, t); }
-}
-
-static float fastPredict(int d, int w, int gap, int r) {
-  const int dd = constrain(d, 1, fastLen);
-  return fastDose[dd] + w * fastGw - r * fastGr + gap * fastGg;
-}
-
 // ---------------------------------------------------------------------------
 // Probe: the pure-darken response, 1..7 passes.
 //
@@ -302,193 +251,6 @@ static bool fastProbe() {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Float-gap gain, measured rather than assumed.
-//
-// On the 16-grey modes this knob measured as nothing, twelve times across
-// two panels, and the reason is physical: the inter-pass settle floor (4 ms
-// of a 15-20 ms period) has already saturated the relaxation, so an extra
-// idle period adds nothing. FAST is the one place that argument does NOT
-// apply — it has no inter-pass delay at all — so the question is genuinely
-// open here and worth one card.
-// ---------------------------------------------------------------------------
-static bool fastProbeGap() {
-  Serial.println("[fast] float-gap ladder...");
-  uint8_t anchor[F_LEN_MAX];
-  for (int i = 0; i < fastLen; i++) anchor[i] = 1;
-  fastUploadApply(3, anchor);
-
-  float land[4] = { 0, 0, 0, 0 };   // landing at gap = 0..3
-  float ref[4], nat[4];
-  uint8_t t[F_LEN_MAX];
-  for (int card = 0; card < 2; card++) {
-    for (int slot = 0; slot < 2; slot++) {
-      const int gap = card * 2 + slot;
-      fastTrainOfShape(2, 1, gap, 1, t);       // (d,w,g,r) = (2,1,gap,1)
-      fastUploadApply(slot + 1, t);
-    }
-    tunePaintFastCard();
-    tuneClear();
-    tunePaint();
-    if (!tuneMeasureFast(ref, nat)) return false;
-    const float g0 = nat[0] - ref[0], g3 = nat[3] - ref[3];
-    land[card * 2]     = nat[1] - (g0 + (g3 - g0) * (1 / 3.0f));
-    land[card * 2 + 1] = nat[2] - (g0 + (g3 - g0) * (2 / 3.0f));
-  }
-
-  // Least-squares slope of landing against gap length.
-  float sx = 0, sy = 0, sxx = 0, sxy = 0;
-  for (int g = 0; g < 4; g++) { sx += g; sy += land[g]; sxx += (float)g * g; sxy += g * land[g]; }
-  const float den = 4 * sxx - sx * sx;
-  const float slope = (fabsf(den) < 1e-3f) ? 0.0f : (4 * sxy - sx * sy) / den;
-
-  // A measured nothing sets the gain to ZERO, not to a floor. Clamping a
-  // null up to a minimum is what once made the gap the finest knob in the
-  // set, and the seeder then spent train length buying units the panel
-  // never delivered.
-  fastGg = (fabsf(slope) >= 0.25f * fastStep()) ? fabsf(slope) : 0.0f;
-  Serial.printf("[fast] gap gain %.1f units/pass (slope %+.1f, landings %.0f %.0f %.0f %.0f)%s\n",
-                fastGg, slope, land[0], land[1], land[2], land[3],
-                fastGg == 0.0f ? " - treating float gaps as neutral" : "");
-  if (fastGg > 0.0f)
-    Serial.println("[fast] NOTE: unlike NORMAL/HIGH, a float gap does something "
-                   "here - FAST has no inter-pass settle to saturate it");
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Convergence: two free levels, a small grammar, a learned bias.
-//
-// With only two candidates measurable per card there is no point in a
-// breadth-first search, so this is a fixed-point iteration instead: the
-// model predicts a landing, the glass says what it really did, the
-// difference is carried as a per-level bias, and the shape is re-solved
-// against the corrected model. Damped, because an undamped bias update
-// oscillates for exactly the reason the 16-grey converger does.
-// ---------------------------------------------------------------------------
-static void fastSolveShape(int lv) {
-  const FastLv &L = fl[lv];
-  int bd = 1, bw = 0, bg = 0, br = 0;
-  float best = 1e9f;
-  for (int d = 1; d <= fastLen; d++)
-    for (int w = 0; w <= 3; w++)
-      for (int gap = 0; gap <= 2; gap++)
-        for (int r = 0; r <= 3; r++) {
-          if (w == 0 && (r || gap)) continue;      // re-darkens need a whiten first
-          if (r == 0 && gap) continue;             // a gap only weakens re-darkens
-          if (d + w + gap + r > fastLen) continue;
-          const float land = fastPredict(d, w, gap, r) + L.bias;
-          const float score = fabsf(land - fastRef[lv]) + 0.10f * (d + w + gap + r);
-          if (score < best) { best = score; bd = d; bw = w; bg = gap; br = r; }
-        }
-  fl[lv].d = bd; fl[lv].w = bw; fl[lv].g = bg; fl[lv].r = br;
-}
-
-static bool fastConverge(float *worstOut) {
-  // Level 3 is the anchor: every pass a darken, which is the darkest FAST
-  // can render. Nothing to search.
-  fl[3] = {}; fl[3].d = fastLen; fl[3].bestAbs = 1e9f;
-  for (int lv = 1; lv <= 2; lv++) {
-    fl[lv] = {};
-    fl[lv].bestAbs = 1e9f;
-    fl[lv].d = lv * 2;                 // rough start; the first cycle re-solves
-  }
-  fastUploadApplies();
-
-  float ref[4], nat[4], err[4];
-  bool converged = false;
-  float mx = 999;
-  for (int cyc = 0; cyc < FAST_MAX_CYCLES; cyc++) {
-    if (tuneAbortRequested()) { Serial.println("[fast] aborted"); break; }
-    fastUploadApplies();
-    tunePaintFastCard();
-    tuneClear();
-    tunePaint();
-    if (!tuneMeasureFast(ref, nat)) return false;
-    for (int g = 0; g < 4; g++) fastRef[g] = ref[g];
-    fastErrors(ref, nat, err);
-
-    mx = 0;
-    for (int lv = 1; lv <= 2; lv++) {
-      fl[lv].err = err[lv];
-      mx = max(mx, fabsf(err[lv]));
-      if (fabsf(err[lv]) < fl[lv].bestAbs) {
-        fl[lv].bestAbs = fabsf(err[lv]);
-        fl[lv].bestErr = err[lv];
-        fl[lv].bd = fl[lv].d; fl[lv].bw = fl[lv].w;
-        fl[lv].bg = fl[lv].g; fl[lv].br = fl[lv].r;
-      }
-    }
-    Serial.printf("[fast] cycle %2d  L1 (%d,%d,%d,%d) %+5.1f   L2 (%d,%d,%d,%d) %+5.1f   "
-                  "worst %.1f / tol %.1f\n",
-                  cyc, fl[1].d, fl[1].w, fl[1].g, fl[1].r, err[1],
-                  fl[2].d, fl[2].w, fl[2].g, fl[2].r, err[2], mx, fastTol());
-    if (mx <= fastTol()) { converged = true; break; }
-
-    for (int lv = 1; lv <= 2; lv++) {
-      // What the glass did, minus what the model said it would: the model's
-      // own error for this level, learned at half strength.
-      const float measured = ref[lv] + err[lv];
-      const float predicted = fastPredict(fl[lv].d, fl[lv].w, fl[lv].g, fl[lv].r);
-      fl[lv].bias += 0.5f * (measured - predicted - fl[lv].bias);
-      fastSolveShape(lv);
-    }
-  }
-
-  // Whatever the loop ended on, keep each level's best-measured shape.
-  if (!converged)
-    for (int lv = 1; lv <= 2; lv++)
-      if (fl[lv].bestAbs < 1e8f) {
-        fl[lv].d = fl[lv].bd; fl[lv].w = fl[lv].bw;
-        fl[lv].g = fl[lv].bg; fl[lv].r = fl[lv].br;
-        fl[lv].err = fl[lv].bestErr;    // signed: the curve is built from it
-      }
-  fastUploadApplies();
-  *worstOut = mx;
-  return true;
-}
-
-// Optical check on the erases: paint the card, repaint white, and read what
-// is left against the never-driven group 0. A remove that leaves a residual
-// is a ghost.
-static void tuneRepaintFastCardThenWhite() {
-  tuneRepaintFastCard();
-  tuneFill(0);
-  tunePaint();
-}
-
-static float fastVerifyRemoves() {
-  fastUploadRemoves();
-  tunePaintFastCard();
-  tuneClear();
-  tunePaint();
-  tuneFill(0);
-  tunePaint();
-  delay(300);
-  tuneRepaint = tuneRepaintFastCardThenWhite;
-  if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return -1;
-  const int H = epd.height();
-  float col[4];
-  for (int g = 0; g < 4; g++) {
-    float s = 0;
-    for (int c = 0; c < 4; c++) {
-      int px0, px1, sx0, sx1, sy0, sy1;
-      tuneColSpan(g * 4 + c, &px0, &px1);
-      tunePanelRect(px0, px1, (int)(H * 0.08f), (int)(H * 0.92f), &sx0, &sx1, &sy0, &sy1);
-      s += tuneRectMean(sx0, sx1, sy0, sy1);
-    }
-    col[g] = s / 4;
-  }
-  float worst = 0;
-  Serial.print("[fast] remove residuals: ");
-  for (int g = 1; g <= 3; g++) {
-    const float res = col[g] - col[0];
-    Serial.printf("%+.1f ", res);
-    if (fabsf(res) > fabsf(worst)) worst = res;
-  }
-  Serial.printf("  worst %+.1f\n", worst);
-  return fabsf(worst);
-}
 
 // ---------------------------------------------------------------------------
 // Phase 2: the six grey-to-grey direct trains.
@@ -800,6 +562,8 @@ static bool fastResultsScreen(float worst, float erase, int npairs, float worstD
 // ---------------------------------------------------------------------------
 // The whole FAST run.
 // ---------------------------------------------------------------------------
+// The levels phase, defined in tuner_evo4.h (included after this file).
+static bool fastEvolve(float *worstOut, float *ghostOut);
 // The 4-level tune, at any quality that has a 4-level mode.
 //
 //   q         FAST (7 passes) or NORMAL (13). HIGH works and is untested.
@@ -867,13 +631,12 @@ static bool runSelfTuneFast(EPD_Painter::Quality q = EPD_Painter::Quality::QUALI
 
   float worst4 = 999, erase = 0;
   if (doLevels) {
-    if (!fastProbe())     return bail();
-    if (!fastProbeGap())  Serial.println("[fast] gap probe failed - assuming neutral");
-
-    if (!fastConverge(&worst4)) return bail();
-
-    Serial.println("[fast] deriving charge-matched removes...");
-    erase = fastVerifyRemoves();
+    // Pair-evolution (tuner_evo4.h): each level's apply and remove evolve
+    // together under DC-neutral mutation, fitness err^2 + resid^2. The
+    // erase residual is measured every generation, so the ghost the old
+    // formula-derived removes shipped with is now something selection
+    // kills rather than something a one-shot verify reports.
+    if (!fastEvolve(&worst4, &erase)) return bail();
   } else {
     // Directs-only: the trains already on the board are the reference, and
     // fastNetOf() reads them from the live table. The probe is still needed

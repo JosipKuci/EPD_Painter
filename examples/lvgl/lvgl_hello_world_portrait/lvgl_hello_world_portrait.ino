@@ -381,6 +381,14 @@ void setup() {
     }
 
     //display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+        display.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+    // Drive changed greys straight to their new level with the board's
+    // tuned NORMAL direct trains — no erase-to-white two-step flash on
+    // every UI repaint. Pairs without a train keep the two-step.
+    if (!display.driver().setDirectTransitions(true))
+        Serial.println("[EPD] direct transitions refused (allocation) — two-step path");
+
+
     display.clear();
 
     lv_obj_t *scr = lv_screen_active();

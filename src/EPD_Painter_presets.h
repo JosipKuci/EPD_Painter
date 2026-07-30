@@ -61,8 +61,7 @@
             .g16_apply_high  = TUNED16_H716_HIGH,
             .g16_remove_high = TUNED16_H716_HIGH_REMOVE,
             .dir_normal      = DIRECT_H716_NORMAL,
-            // No dir_fast: the July FAST directs died with the old FAST
-            // waveform pair — see LilyGo_H716_Trains.h.
+            .dir_fast        = DIRECT_H716_FAST,
         },
         .level_lum      = LEVEL_LUM_H716_NORMAL,
         .level_lum_high = LEVEL_LUM_H716_HIGH,
@@ -96,6 +95,10 @@
             .dir_normal = DIRECT_M5PAPERS3_NORMAL,
             .dir_fast   = DIRECT_M5PAPERS3_FAST,
         },
+        // Measured 4-level curve (30 Jul). Without this the dither quantised
+        // photographs against an assumed even ramp — see the note beside
+        // LEVEL_LUM4_M5PAPERS3.
+        .level_lum4 = LEVEL_LUM4_M5PAPERS3,
     };
 #endif
 #if defined(EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS) || defined(EPD_PAINTER_PRESET_AUTO)
@@ -132,11 +135,17 @@
         // landings by 3-6 levels between frames; also a ~5-unit
         // top-to-bottom panel gradient, calibrate via the L15 pair).
         .trains = {
-            .g16_apply  = TUNED16_LILYGO_T5S3_NORMAL,
-            .g16_remove = TUNED16_LILYGO_T5S3_NORMAL_REMOVE,
-            .dir_normal = DIRECT_LILYGO_T5S3_NORMAL,
-            .dir_fast   = DIRECT_LILYGO_T5S3_FAST,
+            .g16_apply       = TUNED16_LILYGO_T5S3_NORMAL,
+            .g16_remove      = TUNED16_LILYGO_T5S3_NORMAL_REMOVE,
+            .g16_apply_high  = TUNED16_LILYGO_T5S3_HIGH,
+            .g16_remove_high = TUNED16_LILYGO_T5S3_HIGH_REMOVE,
+            .dir_normal      = DIRECT_LILYGO_T5S3_NORMAL,
+            .dir_fast        = DIRECT_LILYGO_T5S3_FAST,
         },
+        // Measured curves, 30 July 2026 — see LilyGo_T5S3_GPS_Trains.h.
+        .level_lum      = LEVEL_LUM_LILYGO_T5S3_NORMAL,
+        .level_lum_high = LEVEL_LUM_LILYGO_T5S3_HIGH,
+        .level_lum4     = LEVEL_LUM4_LILYGO_T5S3,
     };
 #endif
 // -----------------------------------------------------------------------

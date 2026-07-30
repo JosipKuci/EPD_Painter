@@ -288,8 +288,14 @@ bool EPD_Painter::setGreyLevels(int levels) {
       dec_sweeps16 = nullptr;
       return false;
     }
-    _grey16_build_trains();
   }
+  // Rebuild the train library on EVERY 16-grey enable, not just the first:
+  // setQuality() skips its rebuild while 4-level mode is live (correctly —
+  // 16-grey is off), so a FAST/NORMAL detour taken in 4-level mode leaves
+  // dec_trains16 holding the previous quality's tables. Re-entering 16-grey
+  // then drove NORMAL with HIGH's 20-pass trains truncated to 13 — a
+  // posterised, scrambled grey ladder (M5PaperS3, 29 Jul).
+  if (on) _grey16_build_trains();
 
   // Carry the physical screen state across the switch so ghost tracking
   // survives: 2bpp levels 0..3 <-> 4bpp levels {0, 5, 10, 15}.
@@ -1367,11 +1373,34 @@ void EPD_Painter::_paint_task_body() {
       // Per-decision broadcast bytes for this pass: code * 0x55 replicates
       // a 2-bit drive code across the 4 pixels of a byte. Ids 0/1 (level
       // 0 = white) have no trains and always float.
+      //
+      // CODE 3 ("drive both electrodes") IS EMITTED AS FLOAT. 11 turns on
+      // both source transistors for the pixel at once: the two halves
+      // fight, so the net field — and the net charge in the DC ledger —
+      // is nominally nothing, but the contention current is real and is
+      // drawn by every pixel carrying the code, on every pass that has
+      // it. That current is the supply burden the panel is least able to
+      // afford exactly when a photograph is on the glass and thousands of
+      // pixels are switching, which is where the levels were measured
+      // drifting up to 12 lum (29 Jul context probe: flat black moved the
+      // staircase not at all, mixed dithered content moved it a lot). So
+      // the pointless pulse is dropped rather than paid for.
+      //
+      // This is the single point where a waveform code becomes bus bits
+      // for BOTH engines — the 4-level pairs are loaded into dec_train[]
+      // alongside the 16-grey trains — so it also covers tuned NVS blobs
+      // and any legacy table, without rewriting their data. Pair
+      // evolution never mints a 3 (its charge sits outside the ledger the
+      // DC-neutral operators are built on); every 3 still in the tree is
+      // inherited from the hand-built and dithertune-era 4-level pairs.
       uint8_t bcast[DEC_IDS];
       bcast[0] = bcast[1] = 0;
-      for (int id = 2; id < DEC_IDS; id++)
-        bcast[id] = (dec_train[id] && pass < dec_len[id])
-                        ? (uint8_t)(dec_train[id][pass] * 0x55) : 0;
+      for (int id = 2; id < DEC_IDS; id++) {
+        uint8_t code = (dec_train[id] && pass < dec_len[id])
+                           ? dec_train[id][pass] : 0;
+        if (code == 3) code = 0;
+        bcast[id] = (uint8_t)(code * 0x55);
+      }
 
       for (int row = 0; row < _config.height; row++) {
 #ifdef EPD_ASM_TIMING
@@ -1918,7 +1947,14 @@ void EPD_Painter::GrayDither::emit(const uint8_t *src, int y) {
     memset(_next, 0, erow);
     const int ty = _dy + y;
 
-    for (int x = 0; x < _dw; x++) {
+    // SERPENTINE: alternate scan direction per row. A fixed direction gives
+    // diffusion a standing bias, and with a wide gap in the level curve the
+    // bias organises into column-aligned worms — measured on the glass as
+    // full-height dark streaks through a photograph.
+    const bool rtl = (y & 1);
+    for (int i = 0; i < _dw; i++) {
+        const int x = rtl ? (_dw - 1 - i) : i;
+        const int fwd = rtl ? -1 : 1;             // "ahead" in scan order
         int v = (int)src[(int)((int64_t)x * _srcW / _dw)] + _cur[x + 1];
         if (v < 0) v = 0; else if (v > 255) v = 255;
 
@@ -1926,9 +1962,9 @@ void EPD_Painter::GrayDither::emit(const uint8_t *src, int y) {
         // — nothing beside the paint — and the curve is not guaranteed
         // monotonic on a poorly tuned panel, so a binary search is not safe.
         int best = 0, bestd = 1000;
-        for (int i = 0; i < _levels; i++) {
-            const int d = abs((int)_lum[i] - v);
-            if (d < bestd) { bestd = d; best = i; }
+        for (int i2 = 0; i2 < _levels; i2++) {
+            const int d = abs((int)_lum[i2] - v);
+            if (d < bestd) { bestd = d; best = i2; }
         }
         const int e = v - (int)_lum[best];        // what could not be shown
 
@@ -1937,11 +1973,19 @@ void EPD_Painter::GrayDither::emit(const uint8_t *src, int y) {
             _dst[(size_t)ty * _dstW + tx] = (uint8_t)best;
 
         // Diffuse even where clipped: an error dropped at the edge bands
-        // along it.
-        _cur [x + 2] += (int16_t)((e * 7) >> 4);
-        _next[x    ] += (int16_t)((e * 3) >> 4);
-        _next[x + 1] += (int16_t)((e * 5) >> 4);
-        _next[x + 2] += (int16_t)((e * 1) >> 4);
+        // along it. Shares divide toward zero — the old arithmetic shifts
+        // floored toward -inf, which turned a -1 error into FOUR -1 shares:
+        // a x4 amplifier for small dark errors, self-reinforcing down the
+        // image. The remainder goes to the ahead-neighbour so the total
+        // diffused is EXACTLY e: error is conserved, never invented.
+        const int e3 = (e * 3) / 16;
+        const int e5 = (e * 5) / 16;
+        const int e1 = (e * 1) / 16;
+        const int e7 = e - e3 - e5 - e1;          // ahead: share + remainder
+        _cur [x + 1 + fwd] += (int16_t)e7;        // ahead
+        _next[x + 1 - fwd] += (int16_t)e3;        // behind, next row
+        _next[x + 1      ] += (int16_t)e5;        // below
+        _next[x + 1 + fwd] += (int16_t)e1;        // ahead, next row
     }
     int16_t *t = _cur; _cur = _next; _next = t;
 }

@@ -170,9 +170,9 @@ void setup() {
   // blob a tuneup session stored, or the per-board *_Trains.h defaults.
   // ~2.5 fps: 20 passes at the constant 20 ms period is the price of
   // sixteen calibrated greys at their best.
-  epd.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
-  if (!epd.driver().setGreyLevels(16))
-    Serial.println("16-grey unavailable - staying at 4 levels");
+  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+ // if (!epd.driver().setGreyLevels(16))
+  //  Serial.println("16-grey unavailable - staying at 4 levels");
   epd.clear();
 
   epd.fillScreen(15);

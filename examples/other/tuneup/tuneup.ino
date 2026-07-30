@@ -72,7 +72,7 @@
 // Name this board gets in exported tables (`e` at the menu): "H716" prints
 // TUNED16_H716_HIGH and so on, ready to paste into src/EPD_Painter_trains.h.
 #ifndef TUNED_EXPORT_PREFIX
-  #define TUNED_EXPORT_PREFIX "BOARD"
+  #define TUNED_EXPORT_PREFIX "LILYGO_T5S3"
 #endif
 
 // Choose your board (or leave all commented for auto-probe).
@@ -275,6 +275,14 @@ static void wifiConnect() {
   }
   uiClear("WIFI");
   WiFi.mode(WIFI_STA);
+  // Modem power-save OFF. In power-save the ESP32 sleeps between beacons
+  // and depends on the router buffering downstream frames for it — and
+  // when that goes wrong, requests still SEND fine while responses are
+  // delayed or lost, which reads as "the scanner stopped answering" with
+  // a perfectly healthy scanner (one whole night went to exactly that:
+  // job POSTs arriving at the bridge, the board never seeing the replies).
+  // Costs ~70 mA; this is a mains-fed rig, not a battery app.
+  WiFi.setSleep(false);
   for (int attempt = 1;; attempt++) {
     uiLine("Connecting to \"%s\" (attempt %d) ...", WIFI_SSID, attempt);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -306,7 +314,11 @@ static bool httpTxn(const char *method, const String &path, const String &body,
   *outLen = 0;
   *outStatus = 0;
   WiFiClient c;
-  if (!c.connect(scHost.c_str(), scPort, 8000)) return false;
+  if (!c.connect(scHost.c_str(), scPort, 8000)) {
+    Serial.printf("[http] %s: connect to %s:%u failed\n", method,
+                  scHost.c_str(), scPort);
+    return false;
+  }
   c.setTimeout(timeoutMs);
 
   c.printf("%s %s HTTP/1.0\r\nHost: %s:%u\r\nConnection: close\r\nUser-Agent: EPD_Painter-tuneup\r\n",
@@ -318,7 +330,21 @@ static bool httpTxn(const char *method, const String &path, const String &body,
 
   String line = c.readStringUntil('\n');           // "HTTP/1.x 200 OK"
   int sp = line.indexOf(' ');
-  if (sp < 0) { c.stop(); return false; }
+  if (sp < 0) {
+    // The request went out and no status line ever came back — the
+    // response direction is failing. Say so, WITH the internal heap
+    // state: lwIP buffers received segments in internal RAM, and a
+    // starved pool drops them silently — sends keep working while every
+    // response "vanishes", which spent a whole night masquerading as a
+    // scanner wedge.
+    Serial.printf("[http] %s: no response from %s:%u (request sent OK; "
+                  "int heap %u free, largest %u)\n",
+                  method, scHost.c_str(), scPort,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    c.stop();
+    return false;
+  }
   *outStatus = atoi(line.c_str() + sp + 1);
 
   for (;;) {                                        // headers
@@ -434,7 +460,16 @@ static size_t esclScan(float x0mm, float y0mm, float wmm, float hmm, int dpi) {
 // JPEG -> 8-bit grayscale (grayImg/grayW/grayH)
 // ============================================================================
 #if TUNEUP_HAVE_JPEGDEC
-static JPEGDEC  jpegDec;
+// In PSRAM, NOT a static. A JPEGDEC instance is ~50 KB, and as a static it
+// lived in internal DRAM — the same pool lwIP allocates WiFi RECEIVE
+// buffers from. This sketch's statics plus the driver's fastbuffer plus
+// the WiFi stack left ~2 KB of internal free in 16-grey mode, at which
+// point every HTTP response was silently dropped on arrival while
+// requests kept sending: two days of "the scanner stopped answering"
+// with a perfectly healthy scanner. Measured at the failure: 1836 bytes
+// free, largest block 1396.
+static JPEGDEC *jpegDecP;
+#define jpegDec (*jpegDecP)
 static uint8_t *grayImg = nullptr;
 static int      grayW = 0, grayH = 0;
 
@@ -536,6 +571,12 @@ static int splashDrawCb(JPEGDRAW *d) {
 // fraction of a step — the banding-vs-grain trade, pushed toward grain.
 static int splashStride = 1;
 
+// Quantise-only mode: nearest level, NO error diffusion. The diagnostic
+// that separates dither artifacts from level artifacts — worming needs
+// diffused error to exist, so an image that cleans up here convicts the
+// dither, and streaks that survive convict the levels.
+static bool splashNoDither = false;
+
 static void splashDiffuse(uint8_t *fb, int W, int H) {
   // What each level really renders as, measured on the glass by the tuner
   // and kept with the tables. The levels are NOT evenly spaced — on this
@@ -557,30 +598,52 @@ static void splashDiffuse(uint8_t *fb, int W, int H) {
     lum = even;
   }
 
-  static int16_t errCur[TUNEUP_SPLASH_W];
-  static int16_t errNext[TUNEUP_SPLASH_W];
-  memset(errCur, 0, sizeof(errCur));
+  // PSRAM, not .bss (3.8 KB of internal otherwise — see the lwIP note in
+  // httpTxn's failure path).
+  static int16_t *errCur = nullptr, *errNext = nullptr;
+  if (!errCur) {
+    errCur  = (int16_t *)heap_caps_malloc(TUNEUP_SPLASH_W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    errNext = (int16_t *)heap_caps_malloc(TUNEUP_SPLASH_W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!errCur || !errNext) return;
+  }
+  memset(errCur, 0, TUNEUP_SPLASH_W * sizeof(int16_t));
   for (int y = 0; y < H; y++) {
-    memset(errNext, 0, sizeof(errNext));
+    // FULL-WIDTH clear and copy. When these rows moved from static arrays
+    // to PSRAM pointers, sizeof() silently became sizeof(pointer) = 8
+    // bytes: the error rows were never cleared OR carried between rows,
+    // error accumulated unbounded down the image, and every dithered
+    // photo grew catastrophic full-height streaks within hours.
+    memset(errNext, 0, TUNEUP_SPLASH_W * sizeof(int16_t));
     const uint8_t *srow = splashGray + (size_t)y * W;
     uint8_t *drow = fb + (size_t)y * W;
-    for (int x = 0; x < W; x++) {
+    // Serpentine + exact error conservation, matching the library's
+    // GrayDither: a fixed scan direction organises diffusion bias into
+    // column-aligned worms, and truncated shares leak error.
+    const bool rtl = (y & 1);
+    for (int i = 0; i < W; i++) {
+      const int x = rtl ? (W - 1 - i) : i;
+      const int fwd = rtl ? -1 : 1;
       int v = (int)srow[x] + errCur[x];
       if (v < 0) v = 0; else if (v > 255) v = 255;
       // nearest level by MEASURED luminance, over the live levels only
       int lv = 0, bestd = 1000;
-      for (int i = 0; i < nlv; i += splashStride) {
-        const int d = abs((int)lum[i] - v);
-        if (d < bestd) { bestd = d; lv = i; }
+      for (int li = 0; li < nlv; li += splashStride) {
+        const int d = abs((int)lum[li] - v);
+        if (d < bestd) { bestd = d; lv = li; }
       }
-      const int err = v - (int)lum[lv];            // what we could not show
       drow[x] = (uint8_t)lv;                       // lum[] is already level-indexed
-      if (x + 1 < W) errCur[x + 1]  += (int16_t)(err * 7 / 16);
-      if (x > 0)     errNext[x - 1] += (int16_t)(err * 3 / 16);
-      errNext[x]                    += (int16_t)(err * 5 / 16);
-      if (x + 1 < W) errNext[x + 1] += (int16_t)(err * 1 / 16);
+      if (splashNoDither) continue;                // quantise-only diagnostic
+      const int err = v - (int)lum[lv];            // what we could not show
+      const int e3 = (err * 3) / 16;
+      const int e5 = (err * 5) / 16;
+      const int e1 = (err * 1) / 16;
+      const int e7 = err - e3 - e5 - e1;           // ahead: share + remainder
+      const int xa = x + fwd, xb = x - fwd;
+      if (xa >= 0 && xa < W) { errCur[xa] += (int16_t)e7; errNext[xa] += (int16_t)e1; }
+      if (xb >= 0 && xb < W) errNext[xb] += (int16_t)e3;
+      errNext[x] += (int16_t)e5;
     }
-    memcpy(errCur, errNext, sizeof(errCur));
+    memcpy(errCur, errNext, TUNEUP_SPLASH_W * sizeof(int16_t));
   }
 }
 
@@ -797,6 +860,7 @@ static bool demoScan() {
 #include "tuner.h"
 #include "tuner_fast.h"
 #include "tuner_evo.h"
+#include "tuner_evo4.h"
 
 // One entry point for all three. They share the rig — registration, the
 // scanner, the results screen — and differ in what they are measuring.
@@ -967,42 +1031,100 @@ static void tuneCountdownAndRun() {
 }
 
 // ============================================================================
-// Splash view — the artwork rendered in 16 native greys, held until tapped.
+// Splash view — the artwork through each quality tier, held until tapped.
 //
-// Held rather than flashed past, because the menu would otherwise repaint
-// over it instantly. Painted at HIGH only if this board actually has a HIGH
-// table: rendering 20 passes through the formula library flatters nothing
-// and would misrepresent the panel.
+// A MODE button cycles FAST (4-grey) / NORMAL / HIGH; each stop repaints
+// the photo through that tier's live tables with its own measured curve,
+// and lays the tier's native staircase along the bottom — every level the
+// dither is mixing from, driven directly, so an uneven ladder is visible
+// next to the banding it causes. HIGH joins the ring only if this board
+// actually has a HIGH table: rendering 20 passes through the formula
+// library flatters nothing and would misrepresent the panel.
 // ============================================================================
 static void showSplash() {
   const bool haveHigh = tunedPresent(epd.driver(), SET_HIGH);
+  // 0 FAST (4-grey), 1 NORMAL 4-grey (what an app in direct mode shows),
+  // 2 NORMAL 16-grey, 3 HIGH 16-grey.
+  int mode = haveHigh ? 3 : 2;
+  int dx, dy;
+  for (;;) {
+    const char *qn = (mode == 0)   ? "FAST"
+                     : (mode == 1) ? "NORMAL 4-GREY"
+                     : (mode == 2) ? "NORMAL"
+                                   : "HIGH";
+    // Order matters both ways: setQuality(FAST) is refused while 16-grey
+    // is live, and setGreyLevels(16) is refused while FAST is live.
+    if (mode <= 1) {
+      epd.driver().setGreyLevels(4);
+      epd.setQuality(mode == 0 ? EPD_Painter::Quality::QUALITY_FAST
+                               : EPD_Painter::Quality::QUALITY_NORMAL);
+    } else {
+      epd.setQuality(mode == 2 ? EPD_Painter::Quality::QUALITY_NORMAL
+                               : EPD_Painter::Quality::QUALITY_HIGH);
+      epd.driver().setGreyLevels(16);
+    }
+    epd.clear();
+    while (!epd.driver().paintIdle()) delay(10);
+    tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+
+    const int W = epd.width(), H = epd.height();
+    const int nlv = epd.driver().greyLevels();
+    const int black = nlv - 1;
+    // Native staircase: one patch per live level, white left, driven
+    // directly (no dither) — the ladder itself, next to the photo.
+    const int barH = 64;
+    epd.fillRect(0, H - barH - 2, W, 2, black);
+    for (int i = 0; i < nlv; i++) {
+      const int x0 = (i * W) / nlv, x1 = ((i + 1) * W) / nlv;
+      epd.fillRect(x0, H - barH, x1 - x0, barH, (uint8_t)i);
+    }
+    Btn bMode = { W - 290, 8, 280, 60 };
+    epd.fillRect(bMode.x, bMode.y, bMode.w, bMode.h, 0);
+    epd.drawRect(bMode.x, bMode.y, bMode.w, bMode.h, black);
+    epd.drawRect(bMode.x + 1, bMode.y + 1, bMode.w - 2, bMode.h - 2, black);
+    epd.setTextColor(black);
+    epd.setTextSize(2);
+    epd.setCursor(bMode.x + 12, bMode.y + 10);
+    char mb[24];
+    snprintf(mb, sizeof(mb), "MODE: %s", qn);
+    epd.print(mb);
+    epd.setCursor(bMode.x + 12, bMode.y + 36);
+    epd.print("tap here to switch");
+
+    epd.paint();
+    while (!epd.driver().paintIdle()) delay(10);
+    Serial.printf("[tuneup] splash at %s, %d levels - MODE button or 'm' "
+                  "switches, anything else returns\n", qn, nlv);
+
+    // Settle before listening: a full-screen paint throws transients into
+    // the GT911, and the tap that opened this page is still latched.
+    delay(700);
+    while (Serial.available()) Serial.read();
+    touchRewake();
+    touchTapped(dx, dy);
+    bool next = false;
+    for (;;) {
+      if (Serial.available()) {
+        const int c = Serial.read();
+        while (Serial.available()) Serial.read();
+        if (c == 'm' || c == 'M') next = true;
+        break;
+      }
+      if (touchTapped(dx, dy)) {
+        next = hitBtn(bMode, dx, dy);
+        break;
+      }
+      delay(8);
+    }
+    if (!next) break;
+    mode = (mode + 1) % 4;
+    if (mode == 3 && !haveHigh) mode = 0;
+  }
+  // The menu draws in 16-grey; put the panel back the way it expects.
+  // Quality first: setGreyLevels(16) is refused while FAST is live.
   epd.setQuality(haveHigh ? EPD_Painter::Quality::QUALITY_HIGH
                           : EPD_Painter::Quality::QUALITY_NORMAL);
   epd.driver().setGreyLevels(16);
-  epd.clear();
-  while (!epd.driver().paintIdle()) delay(10);
-  tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
-  epd.paint();
-  while (!epd.driver().paintIdle()) delay(10);
-  Serial.printf("[tuneup] splash at %s (%d passes, %d us, row charge %d us) "
-                "- tap to return\n",
-                haveHigh ? "HIGH" : "NORMAL", epd.driver().g16TrainLen(),
-                haveHigh ? epd.driver()._config.g16_pass_us_high
-                         : epd.driver()._config.g16_pass_us_normal,
-                epd.driver()._config.rowExtraUs());
-
-  // Settle before listening: a full-screen 16-grey paint throws transients
-  // into the GT911, and the tap that opened this page is still latched.
-  delay(700);
-  while (Serial.available()) Serial.read();
-  touchRewake();
-  int dx, dy;
-  touchTapped(dx, dy);
-  for (;;) {
-    if (Serial.available()) { while (Serial.available()) Serial.read(); return; }
-    if (touchTapped(dx, dy)) return;
-    delay(8);
-  }
 }
 
 // ============================================================================
@@ -1058,6 +1180,14 @@ void setup() {
   // can run unattended for a quarter of an hour, so it must survive one.
   epd.setAutoShutdown(false);
 
+  // Keep the panel rails UP for the whole session. The 5 s idle power-off
+  // races the 5 s scan gap: the rail power-down transient lands exactly as
+  // the scan's HTTP request goes out, and the supply dip cost the radio
+  // the RESPONSE — requests reached the bridge all night while replies
+  // vanished, and on a marginal supply the same transient browned out the
+  // whole board. Rails held up, the transient never happens mid-scan.
+  epd.driver().setIdleTimeout(600);
+
   if (!epd.begin()) {
     Serial.println("EPD begin() failed - check board/preset.");
     for (;;) delay(1000);
@@ -1090,6 +1220,22 @@ void setup() {
     Serial.println("No PSRAM for the scan buffer.");
     for (;;) delay(1000);
   }
+
+#if TUNEUP_HAVE_JPEGDEC
+  // The decoder object goes to PSRAM too — see its declaration.
+  jpegDecP = new (heap_caps_malloc(sizeof(JPEGDEC), MALLOC_CAP_SPIRAM)) JPEGDEC();
+  if (!jpegDecP) {
+    Serial.println("No PSRAM for the JPEG decoder.");
+    for (;;) delay(1000);
+  }
+#endif
+
+  // The number that decides whether WiFi RECEIVES: lwIP takes its RX
+  // buffers from internal RAM. Watch this across changes — under ~10 KB
+  // free, responses start vanishing while requests still send.
+  Serial.printf("[tuneup] internal heap: %u free, largest %u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
   prefs.begin("tuneup", false);
 
@@ -1282,6 +1428,101 @@ void loop() {
                     epd.driver().g16TrainLen(),
                     epd.driver()._config.g16_pass_us_normal,
                     epd.driver()._config.rowExtraUs());
+    } break;
+    case 'N': {
+      // N <n> — generations for the 16-grey evolutionary tune. The default
+      // 30 gives each level only 30x3 = 90 candidate trials against a 13-
+      // or 20-slot genome, and the H716's 30 Jul run left individual
+      // levels visibly stuck (one column held -13 for a dozen
+      // generations). Raise it when a run has to move every level, e.g.
+      // after the reference ladder is re-spaced.
+      const int n = Serial.parseInt();
+      if (n >= 1 && n <= 200) evoGenerations = n;
+      Serial.printf("[tuneup] evolution generations: %d\n", evoGenerations);
+    } break;
+    case 'Z': {
+      // Z <2|3> — the ghost exponent in evoPairFitness. 2 = square
+      // (default, see tuner_evo.h), 3 = the 29 Jul ghost-cubed weighting.
+      const int n = Serial.parseInt();
+      if (n == 2 || n == 3) evoGhostPow = (float)n;
+      Serial.printf("[tuneup] ghost exponent: %.0f (%s)\n", evoGhostPow,
+                    evoGhostPow >= 3.0f ? "cubed" : "square");
+    } break;
+    case 'u': {
+      // u <us> — live row-charge override, both 16-grey tiers: the extra
+      // hold after LE before the next row (Tony's capacitor-recharge
+      // probe, 29 Jul). Survives until reboot or a blob reinstall. At 540
+      // rows every microsecond costs 0.54 ms per pass; past the pass
+      // period's slack the period itself stretches (watch the jitter).
+      const int us = Serial.parseInt();
+      epd.driver()._config.row_extra_us_normal = us;
+      epd.driver()._config.row_extra_us_high   = us;
+      Serial.printf("[tuneup] row charge override: %d us per row (16-grey)\n", us);
+    } break;
+    case 'v': {
+      // v [3] — photo + staircase, serial-driven; 3 selects HIGH, anything
+      // else NORMAL. The third leg of the context probe ('w'/'b' are the
+      // others): same patches, same place, with the photograph above them
+      // instead of a flat field. This is the measurement that decides
+      // whether a staircase the tuner verified MONOTONIC ON ITS OWN stays
+      // monotonic once real content shares the frame — i.e. whether the
+      // card-vs-staircase drift the verdict prints is a rendering-context
+      // effect rather than a defect in the table.
+      const int q = Serial.parseInt();
+      epd.setQuality(q == 3 ? EPD_Painter::Quality::QUALITY_HIGH
+                            : EPD_Painter::Quality::QUALITY_NORMAL);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      const int W = epd.width(), H = epd.height();
+      const int barH = 64;
+      epd.fillRect(0, H - barH - 2, W, 2, 15);
+      for (int i = 0; i < 16; i++) {
+        const int x0 = (i * W) / 16, x1 = ((i + 1) * W) / 16;
+        epd.fillRect(x0, H - barH, x1 - x0, barH, (uint8_t)i);
+      }
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      Serial.printf("[tuneup] photo + staircase at %s - held, 'm' for menu\n",
+                    q == 3 ? "HIGH" : "NORMAL");
+    } break;
+    case 'w': case 'b': {
+      // The context-drift probe: the same sixteen native patches the photo
+      // screen draws, in the same place, over nothing but white ('w') or
+      // black ('b'). If the staircase only scrambles with the photo above
+      // it, the drive is content-coupled, not mistuned.
+      const uint8_t bg = (c == 'b') ? 15 : 0;
+      epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      const int W = epd.width(), H = epd.height();
+      memset(epd.getBuffer(), bg, (size_t)W * H);
+      const int barH = 64;
+      for (int i = 0; i < 16; i++) {
+        const int x0 = (i * W) / 16, x1 = ((i + 1) * W) / 16;
+        epd.fillRect(x0, H - barH, x1 - x0, barH, (uint8_t)i);
+      }
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      Serial.printf("[tuneup] staircase over %s at NORMAL - held, 'm' for menu\n",
+                    bg ? "black" : "white");
+    } break;
+    case 'j': {
+      // The splash QUANTISED ONLY — nearest level, no error diffusion.
+      // Clean-but-posterised here convicts the dither; surviving streaks
+      // convict the levels.
+      splashNoDither = true;
+      epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+      epd.driver().setGreyLevels(16);
+      epd.clear();
+      while (!epd.driver().paintIdle()) delay(10);
+      tuneupSplashDraw(epd.getBuffer(), epd.width(), epd.height());
+      epd.paint();
+      while (!epd.driver().paintIdle()) delay(10);
+      splashNoDither = false;
+      Serial.println("[tuneup] splash painted at NORMAL, quantise-only (no dither)");
     } break;
     case 'h': {
       // The splash at NORMAL, dithered from every OTHER grey — 8 of 16.

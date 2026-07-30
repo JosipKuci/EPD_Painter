@@ -34,11 +34,21 @@ inline const EPD_Painter::Waveforms EPD_WF_M5PAPERS3 = {
     // own black+white to within ~3 scanner grey levels, i.e. the
     // levels are linear-reflectance spaced. Each
     // darker+lighter row pair is DC balanced (#1s == #2s).
-    .normal_lighter = { { 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3 },
+    // 4-grey NORMAL re-tuned 30 July 2026 by pair-evolution (cube ghost
+    // weighting, tuner_evo4.h): levels worst 2.0 scan units, erase residual
+    // 2.4, five of six direct pairs converged. Replaces the 21 July optical
+    // set, whose L1 measured 19 units LIGHTER than its one-third-density
+    // dither reference — it looked good, but the dither had no curve to know
+    // that by. Each pair is exactly DC balanced (nets +5/-5, +6/-6, +13/-13).
+    //
+    // The inherited code-3 slots are left verbatim as measured. Code 3 now
+    // emits FLOAT (see EPD_Painter.cpp), so they contribute no charge and sit
+    // outside the ledger — the tune was measured with that already true.
+    .normal_lighter = { { 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 2 },
                         { 3, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2 },
                         { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2 } },
-    .normal_darker  = { { 1, 1, 1, 3, 1, 1, 1, 1, 2, 1, 2, 2, 2 },
-                        { 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3 },
+    .normal_darker  = { { 1, 1, 1, 3, 1, 1, 1, 0, 0, 1, 2, 3, 2 },
+                        { 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3 },
                         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
     .high_lighter   = { { 1, 3, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 2 },
                         { 1, 3, 3, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2 },
@@ -47,6 +57,17 @@ inline const EPD_Painter::Waveforms EPD_WF_M5PAPERS3 = {
                         { 3, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 2 },
                         { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } },
 };
+
+// Measured landing of the four 4-grey NORMAL levels, 255 = paper white,
+// 30 July 2026 — the same run that produced the waveform pair above, so the
+// curve describes THESE levels rather than a different set's.
+//
+// This is what drawGray8() dithers photographs against. Before it existed the
+// board fell back to an assumed even ramp (255/170/85/0); level 1 actually
+// lands at 189 and level 2 at 99, so the assumption was out by 19 and 14
+// respectively. Config carries ONE level_lum4 pointer shared by FAST and
+// 4-grey NORMAL; NORMAL's is wired because that is the tier apps render at.
+inline const uint8_t LEVEL_LUM4_M5PAPERS3[4] = { 255, 189, 99, 0 };
 
 // ---- 16-grey decision-engine tables ----------------------------------------
 // Tuned 21 July 2026, seeded from the LilyGo T5 S3 GPS set — the two
@@ -98,35 +119,33 @@ inline const uint8_t TUNED16_M5PAPERS3_NORMAL_REMOVE[16][13] = {
 };
 
 // ---- direct grey-to-grey trains --------------------------------------------
-// Tuned 21 July 2026 with the transition-card method (testcard 'D'): each
-// pair painted from its FROM level in one paint and matched against a
-// reference patch painted from white; all six landed within +3.5/-1.8
-// scan units. Shape lessons: trailing whitens poison a landing (darkening
-// directs put their charge-balancing whitens FIRST); darkens after deep
-// whitening hit the fresh-response boost; a d,w pair survives at ~1/3
-// strength (the d,w,d,w,d tail on 3>1 is a fine-trim knob). 3>2 cannot
-// fit its -7 net AND its optical target in 13 passes; its 17-pass train
-// needs the pass-count extension — frames only pay the extra passes when
-// the train is in play.
-// NORMAL potentials Q=(4,6,13).
+// NORMAL set re-tuned 30 July 2026 against the waveform pair above, FIVE of
+// six pairs converged (errors 0.5 to 2.7 scan units against a 4.0 tolerance).
+// Both directions use the overshoot-and-return shape: leading whitens, then
+// darkens that walk the landing back to target.
+//
+// 2->1 did NOT converge (best 10.0) and is deliberately absent, so that pair
+// falls back to the DC-correct two-step. Depth search drove it to 0 and could
+// get no closer — a ~90 lum lightening between two levels that the new
+// calibration placed far apart. Everything else lands tightly.
 inline const uint8_t DIRECT_M5PAPERS3_NORMAL[4][4][26] = {
   { {0}, {0}, {0}, {0} },
   { /* from 1 */
     {0},
     {0},
-    /* 1->2 net +2 (13) */ {2,2,2,1,1,1,1,1},
-    /* 1->3 net +9 (13) */ {2,2,1,1,1,1,1,1,1,1,1,1,1},
+    /* 1->2 net +1  (7)  err 2.7 */ {2,2,2,1,1,1,1},
+    /* 1->3 net +8  (14) err 0.5 */ {2,2,2,1,1,1,1,1,1,1,1,1,1,1},
   },
   { /* from 2 */
     {0},
-    /* 2->1 net -2 (4)  */ {1,2,2,2},
+    {0},                                  /* 2->1 not converged: two-step */
     {0},
-    /* 2->3 net +7 (11) */ {2,2,1,1,1,1,1,1,1,1,1},
+    /* 2->3 net +7  (13) err 1.5 */ {2,2,2,1,1,1,1,1,1,1,1,1,1},
   },
   { /* from 3 */
     {0},
-    /* 3->1 net -9 (15) */ {2,2,2,2,2,2,2,2,2,2,1,2,1,2,1},
-    /* 3->2 net -7 (17) */ {2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1},
+    /* 3->1 net -8  (14) err 1.2 */ {2,2,2,2,2,2,2,2,2,2,2,1,1,1},
+    /* 3->2 net -7  (17) err 0.9 */ {2,2,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1},
     {0},
   },
 };
