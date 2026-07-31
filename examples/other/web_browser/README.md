@@ -43,6 +43,17 @@ changed, because clipping the image alters which rows the error propagates
 through. The two images are generated procedurally, so the example carries no
 assets.
 
+## The photograph
+
+`hero_photo.h` is an AI-generated image (ChatGPT), not a photograph of anyone
+real — as is the article around it: an invented head of state of an invented
+country, which is what the seal on the lectern says too. It is here because a
+face with a bright subject against a dark backdrop is a hard case for a
+one-bit halftone, not to depict anybody.
+
+Stored as 8bpp luminance and halftoned at startup, so the source is reusable
+if you want to try a different dither.
+
 ## Honest limits
 
 The panel cannot follow a fast flick the way glass can; it settles a beat
