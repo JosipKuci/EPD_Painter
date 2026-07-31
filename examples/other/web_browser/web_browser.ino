@@ -57,6 +57,7 @@
 #include "EPD_Painter_Adafruit.h"
 #include <gt911_lite.h>
 #include "hero_photo.h"                  // 8bpp greyscale, generated
+#include "browser_img.h"                 // struct Img (see the note there)
 
 // Portrait: 540 wide x 960 tall.
 EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_CW));
@@ -65,7 +66,28 @@ EPD_PainterAdafruit epd(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::R
 // The canvas holds LEVEL CODES, not luminance: 0 = paper white, 3 = black.
 // The 4-level packer masks each byte with 0x03, so a code above 3 wraps to
 // white rather than clamping — never write 4..15 here.
-static const uint8_t WHITE = 0, LIGHT = 1, MID = 2, INK = 3;
+static const uint8_t WHITE = 0, INK = 3;
+
+// ONE BIT. Ink or paper, nothing between — this sketch never uses levels 1
+// and 2 at all.
+//
+// The engine is still 4-level; there is no 2bpp mode to switch to. What this
+// buys is that no pixel ever makes a grey-to-grey transition, and grey-to-grey
+// is what costs: without direct trains it is erased to white and redrawn (the
+// white flash you can see through a moving photograph), and with them it
+// extends the frame to the longest direct train in play. Black and white are
+// an apply on the dark plane or a remove on the light plane — one cycle each.
+//
+// It also lets the inter-pass gap come down. The 4-level tables are
+// calibrated at 4 ms, and levels 1 and 2 sit on the responsive part of the
+// dose curve, so shortening it moves them. Level 3 is a full darken run and
+// level 0 a full whiten run: both saturated, both indifferent to a shorter
+// settle. Measured on breakout, 4 ms -> 1 ms took a cycle from 125 ms to
+// 86 ms with no visible change.
+static const uint8_t LIGHT = WHITE, MID = INK;
+
+// Inter-pass gap, microseconds. Only safe this short because of the above.
+static const int PASS_GAP_US = 2000;
 
 static GT911_Lite touch;
 static bool     touch_ok = false;
@@ -94,17 +116,18 @@ static uint32_t framesSubmitted = 0, paintsAtStart = 0, renderMs = 0;
 // round on real content rather than reasoning about it.
 static bool wantDirect = false;
 
-// Photographs are hidden WHILE THE PAGE MOVES and drawn when it stops.
+// Photographs stay on screen while the page moves.
 //
-// A dithered photograph is the only thing on this page made of mid-greys, and
-// mid-greys are what cost a moving frame: every one of them is a grey-to-grey
-// transition, which either two-steps through white (direct off) or pays the
-// longest direct train (direct on). Text is black on white — one transition,
-// the cheapest there is.
+// They were hidden during motion at first, and the reason was real: a 4-level
+// dithered photograph is the only mid-grey content on the page, and every
+// mid-grey pixel is a grey-to-grey transition that either two-steps through
+// white or pays the longest direct train. Text is ink on paper — the cheapest
+// transition there is — so a moving page of text alone was much quicker.
 //
-// So the moving frames carry text only, and the settle frame — the one you
-// actually look at — carries the photographs. The space is still reserved, so
-// nothing reflows when they appear; the gap simply fills in.
+// In TWO-COLOUR mode that argument disappears: the halftone is pure ink and
+// paper, so a photograph costs no more per pixel than the text does. In
+// 4-grey mode showing them while scrolling does still cost, and you can feel
+// the difference by toggling 'c' mid-drag.
 static bool showPhotos = true;
 static bool needSettle = false;
 
@@ -125,7 +148,6 @@ static int scrollY = 0;
 // Each is a block of level codes, ready to blit. Dithered once at startup
 // against the panel's MEASURED level curve (Config::level_lum) via
 // drawGray8(), so the greys land where the tuner says they land.
-struct Img { int w, h; uint8_t *lv; };
 static Img heroImg  = {0, 0, nullptr};
 static Img inlineImg = {0, 0, nullptr};
 
@@ -137,11 +159,43 @@ static Img inlineImg = {0, 0, nullptr};
 // the four greys land where the glass actually puts them. Quantising against
 // an assumed even ramp is what makes dithered photographs band.
 static bool makePhoto(Img &img, const uint8_t *grey, int w, int h) {
-  uint8_t *lv = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
-  if (!lv) return false;
-  memset(lv, WHITE, (size_t)w * h);
-  epd.driver().drawGray8(lv, w, h, grey, w, h, 0, 0, 0, 0);
-  img.w = w; img.h = h; img.lv = lv;
+  uint8_t *bw = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
+  int16_t *cur = (int16_t *)calloc(w + 2, sizeof(int16_t));
+  int16_t *nxt = (int16_t *)calloc(w + 2, sizeof(int16_t));
+  if (!bw || !cur || !nxt) {
+    Serial.println("[browser] no PSRAM for the halftone plane");
+    heap_caps_free(bw); free(cur); free(nxt);
+    return false;
+  }
+
+  // Floyd-Steinberg to pure ink or paper. drawGray8() is not used here
+  // because it targets whatever level count is LIVE, which is four.
+  // Serpentine, with the error shared exactly — truncating toward zero and
+  // giving the remainder to the pixel ahead — the same discipline the
+  // library's GrayDither uses. A fixed scan direction organises the
+  // diffusion bias into column-aligned worms; alternating it breaks them up.
+  for (int y = 0; y < h; y++) {
+    memset(nxt, 0, (size_t)(w + 2) * sizeof(int16_t));
+    const bool rtl = (y & 1);
+    for (int i = 0; i < w; i++) {
+      const int x = rtl ? (w - 1 - i) : i;
+      const int fwd = rtl ? -1 : 1;
+      int v = (int)grey[(size_t)y * w + x] + cur[x + 1];
+      if (v < 0) v = 0; else if (v > 255) v = 255;
+      const bool ink = (v < 128);
+      bw[(size_t)y * w + x] = ink ? INK : WHITE;
+      const int e = v - (ink ? 0 : 255);
+      const int e3 = (e * 3) / 16, e5 = (e * 5) / 16, e1 = (e * 1) / 16;
+      const int e7 = e - e3 - e5 - e1;      // ahead: share + remainder
+      cur[x + 1 + fwd] += e7;
+      nxt[x + 1 - fwd] += e3;
+      nxt[x + 1]       += e5;
+      nxt[x + 1 + fwd] += e1;
+    }
+    memcpy(cur, nxt, (size_t)(w + 2) * sizeof(int16_t));
+  }
+  free(cur); free(nxt);
+  img.w = w; img.h = h; img.bw = bw;
   return true;
 }
 
@@ -150,8 +204,7 @@ static bool makePhoto(Img &img, const uint8_t *grey, int w, int h) {
 // gradient and hills. Procedural so the example carries no image assets.
 static bool makeImage(Img &img, int w, int h, int kind) {
   uint8_t *grey = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
-  uint8_t *lv   = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
-  if (!grey || !lv) { free(grey); free(lv); return false; }
+  if (!grey) return false;
 
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
@@ -183,22 +236,21 @@ static bool makeImage(Img &img, int w, int h, int kind) {
 
   // drawGray8 quantises against the measured curve for the LIVE level count
   // and error-diffuses. Destination is the level block itself.
-  memset(lv, WHITE, (size_t)w * h);
-  epd.driver().drawGray8(lv, w, h, grey, w, h, 0, 0, 0, 0);
+  const bool ok = makePhoto(img, grey, w, h);
   heap_caps_free(grey);
-  img.w = w; img.h = h; img.lv = lv;
-  return true;
+  return ok;
 }
 
 // Blit a level block at (dx, dy) in canvas space, clipped to the content area.
 static void blitImg(const Img &img, int dx, int dy) {
-  if (!img.lv) return;
+  if (!img.bw) return;
   if (dy >= VH || dy + img.h <= CHROME_H) return;   // fully off-screen: free
   uint8_t *fb = epd.getBuffer();
+  const uint8_t *plane = img.bw;
   for (int sy = 0; sy < img.h; sy++) {
     const int y = dy + sy;
     if (y < CHROME_H || y >= VH) continue;              // never over the chrome
-    const uint8_t *src = img.lv + (size_t)sy * img.w;
+    const uint8_t *src = plane + (size_t)sy * img.w;
     uint8_t *dst = fb + (size_t)y * VW + dx;
     int n = img.w;
     int x0 = dx;
@@ -309,7 +361,7 @@ static int renderPage(int sy) {
   y += 12;
 
   // Hero image
-  if (heroImg.lv) {
+  if (heroImg.bw) {
     if (showPhotos) blitImg(heroImg, M, y);
     y += heroImg.h + 6;
     y = drawWrapped("The President addresses the nation, Thursday.", M, y, W, 2, MID);
@@ -347,7 +399,7 @@ static int renderPage(int sy) {
   y = drawWrapped(BODY3, M, y, W, 3, INK);  y += 16;
 
   // Inline image, centred
-  if (inlineImg.lv) {
+  if (inlineImg.bw) {
     if (showPhotos) blitImg(inlineImg, M + (W - inlineImg.w) / 2, y);
     y += inlineImg.h + 6;
     y = drawWrapped("The northern provinces, where funding would land first.", M, y, W, 2, MID);
@@ -421,8 +473,13 @@ static void settlePage() {
   showPhotos = true;                      // the photographs arrive here
   needSettle = false;
   renderAll();
-  epd.paint();                            // block: this is the frame to read
-  while (!epd.driver().paintIdle()) delay(10);
+  // paintLater(), NOT paint(): submit and return. A blocking settle held the
+  // loop for the whole drive — around 200 ms — during which touch was not
+  // read at all, so a drag started right after the page stopped was simply
+  // dropped. Submitting asynchronously means the finger is picked up
+  // immediately; if it moves, the next frame replaces this one and the
+  // photographs come off again, which is exactly the right behaviour.
+  epd.paintLater();
   shownScroll = scrollY;
 }
 
@@ -515,6 +572,8 @@ void setup() {
     wantDirect = false;
   }
 
+  epd.driver()._config.pass_gap_us_normal = PASS_GAP_US;
+  epd.driver().setPaintProfile(true);   // one line per drive cycle
   epd.driver().setIdleTimeout(120);       // keep the rails up between scrolls
 
   VW = epd.width();
@@ -526,6 +585,11 @@ void setup() {
     Serial.println("[browser] no PSRAM for the hero photo");
   if (!makeImage(inlineImg, 240, 170, 1))
     Serial.println("[browser] no PSRAM for the inline image");
+
+  Serial.printf("[browser] one bit; halftones: hero %s, inline %s; "
+                "inter-pass gap %d us\n",
+                heroImg.bw ? "ok" : "MISSING", inlineImg.bw ? "ok" : "MISSING",
+                PASS_GAP_US);
 
   touchInit();
 
@@ -546,7 +610,7 @@ void setup() {
   Serial.printf("[browser] direct grey-to-grey: %s ('d' toggles)\n",
                 wantDirect ? "ON" : "off");
   Serial.println("[browser] drag to scroll; serial: j/k = page down/up, "
-                 "t = top, r = redraw, d = direct on/off");
+                 "t = top, r = redraw, d = direct");
 }
 
 void loop() {
@@ -565,7 +629,6 @@ void loop() {
     grabScroll = scrollY;
     velocity = 0;
     lastMoveMs = millis();
-    showPhotos = false;                   // text only while it moves
   } else if (down && dragging) {
     // Content follows the thumb: dragging DOWN reveals earlier content.
     const int want = grabScroll - (ty - grabY);
@@ -611,7 +674,6 @@ void loop() {
   // time the panel is free. This is the whole latency story: the newest
   // possible content, rendered once, submitted immediately.
   if (scrollY != shownScroll && epd.driver().paintIdle()) {
-    if (dragging || fabsf(velocity) >= MIN_GLIDE_PX) showPhotos = false;
     const uint32_t r0 = millis();
     renderAll();
     renderMs = millis() - r0;
@@ -623,11 +685,10 @@ void loop() {
 
   // Stopped moving: put the readable frame up, in NORMAL.
   if (!dragging && fabsf(velocity) < MIN_GLIDE_PX && needSettle) {
-    while (!epd.driver().paintIdle()) delay(5);   // let the last FAST frame land
     const uint32_t s0 = millis();
     settlePage();
     Serial.printf("[browser] scroll %d/%d | moving frames %lu, panel %lu, "
-                  "render %lu ms | settle %lu ms\n",
+                  "render %lu ms | settle submit %lu ms\n",
                   scrollY, maxScroll(), (unsigned long)framesSubmitted,
                   (unsigned long)(epd.driver().paintsCompleted() - paintsAtStart),
                   (unsigned long)renderMs, (unsigned long)(millis() - s0));
@@ -664,8 +725,7 @@ void loop() {
       showPhotos = true;                  // a keyboard jump is not motion
       needSettle = false;
       renderAll();
-      epd.paint();
-      while (!epd.driver().paintIdle()) delay(10);
+      epd.paintLater();                   // non-blocking, same as the settle
       shownScroll = scrollY;              // else the loop repaints it again
       Serial.printf("[browser] scroll %d / %d\n", scrollY, maxScroll());
     }

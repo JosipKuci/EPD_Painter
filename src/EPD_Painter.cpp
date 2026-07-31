@@ -1175,6 +1175,10 @@ void EPD_Painter::_paint_task_body() {
 #ifdef EPD_ASM_TIMING
     const int64_t _ink_t0 = esp_timer_get_time();
 #endif
+    if (_profile) {
+      _prof_rows = 0; _prof_rowloop_us = 0; _prof_cycle_t0 = esp_timer_get_time();
+      _prof_merged = 0;
+    }
     uint32_t any_work = 0;
     const LineSweep *sweep_list = dec_sweeps;
     int sweep_stride = DEC_MAX_SWEEPS;
@@ -1403,6 +1407,7 @@ void EPD_Painter::_paint_task_body() {
       }
 
       for (int row = 0; row < _config.height; row++) {
+        if (_profile && pass == 0 && (bitmask[row] & bitmask_light[row])) _prof_merged++;
 #ifdef EPD_ASM_TIMING
         const int64_t _conv_t0 = esp_timer_get_time();
         if (pass == 0 && (bitmask[row] & bitmask_light[row])) _dbl_rows++;
@@ -1431,7 +1436,9 @@ void EPD_Painter::_paint_task_body() {
         _conv_total += esp_timer_get_time() - _conv_t0;
 #endif
         sendRow(row == 0, false, false);
+        if (_profile) _prof_rows++;
       }
+      if (_profile) _prof_rowloop_us += esp_timer_get_time() - pass_t0;
 
      if (_grey16) {
         // Constant pass period: dose = time between a row's latches = the
@@ -1481,9 +1488,9 @@ void EPD_Painter::_paint_task_body() {
         // has no constant-period model and its tables are calibrated to
         // that - but the wait itself is now honest to the microsecond
         // rather than to a tick.
-        epd_wait_until_us(esp_timer_get_time() + 8000);
+        epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_high);
       } else if (_config.quality == Quality::QUALITY_NORMAL) {
-        epd_wait_until_us(esp_timer_get_time() + 4000);
+        epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_normal);
       }
       // QUALITY_FAST = No delay.
     }
@@ -1511,6 +1518,24 @@ void EPD_Painter::_paint_task_body() {
                (double)g_rp_wait_us / g_rp_rows,
                (long long)g_rp_pins_us, (double)g_rp_pins_us / g_rp_rows); }
 #endif
+
+    if (_profile) {
+      // One line per DRIVE CYCLE. "passes" is the waveform length actually
+      // run (extended by the longest direct train in play); "rows" is
+      // row-sends, which should be exactly passes x height — anything more
+      // means a row was driven twice. "merged" counts lines carrying BOTH
+      // darkening and lightening work: those are erase-and-paint happening
+      // together in the SAME transmission, not a second cycle.
+      const int64_t total = esp_timer_get_time() - _prof_cycle_t0;
+      printf("[paintprof] cycle: %d passes, %lu rows (%lu expected), "
+             "rowloop %lld ms, settle %lld ms, total %lld ms, merged %lu/%d\n",
+             (int)wf_len, (unsigned long)_prof_rows,
+             (unsigned long)((uint32_t)wf_len * _config.height),
+             (long long)(_prof_rowloop_us / 1000),
+             (long long)((total - _prof_rowloop_us) / 1000),
+             (long long)(total / 1000),
+             (unsigned long)_prof_merged, _config.height);
+    }
 
     vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
 

@@ -167,6 +167,23 @@ struct PowerCtlConfig {
       // after 7 passes, at 15 ms it was still resolving at 10. A longer
       // pass therefore costs accuracy AND wastes slots AND takes longer,
       // which is not a trade.
+      // 4-LEVEL inter-pass gap (microseconds). Not used by 16-grey, which
+      // pads to a constant period instead (g16_pass_us_* below).
+      //
+      // This is the single largest term in a 4-level frame that is not row
+      // sending: at NORMAL it is 13 x 4 ms = 52 ms of a ~125 ms cycle,
+      // measured with setPaintProfile(). It is time the panel spends
+      // settling between passes, and the 4-level waveform tables are
+      // CALIBRATED AT IT — shortening it shortens the dose each pass
+      // delivers, so levels 1 and 2 will move and want re-tuning.
+      //
+      // Black and white are far less sensitive: level 3 is a full darken run
+      // and level 0 a full whiten run, both well into saturation, so a
+      // two-colour sketch can usually shorten this freely. A 4-grey one
+      // cannot without re-measuring.
+      int pass_gap_us_normal = 4000;
+      int pass_gap_us_high   = 8000;
+
       int g16_pass_us_normal = 15000;
       int g16_pass_us_high   = 15000;
 
@@ -422,6 +439,22 @@ struct PowerCtlConfig {
   // dual-plane ink engine drives both directions per pixel in one cycle,
   // so there is nothing left to interlace.
   void setInterlaceMode(bool) {}
+
+  // Per-drive-cycle profiling, off by default and free when off.
+  //
+  // Prints one line per cycle: the number of PASSES actually run, the number
+  // of ROW-SENDS against how many the pass count implies, how the time split
+  // between the row loops and the inter-pass settle, and how many lines
+  // carried darkening AND lightening together.
+  //
+  // It answers three questions that are easy to guess wrong about:
+  //   - is a frame one drive cycle, or secretly two?  (compare
+  //     paintsCompleted() across frames — each cycle prints once)
+  //   - is a row ever driven twice?  (rows vs expected)
+  //   - is erase-and-paint happening in ONE pass?  ("merged" lines carry
+  //     both directions in the same transmission; a nonzero count with rows
+  //     == expected is proof that it is)
+  void setPaintProfile(bool on) { _profile = on; }
 
   void setQuality(Quality quality);
 
@@ -806,6 +839,11 @@ private:
                                   uint32_t *maskL_out, uint32_t *todo_out);
   void _decision_batch_compat();
   bool _decision_engine = false;   // C discovery path off until phase C needs it
+
+  // ---- per-cycle paint profiling (see setPaintProfile) ------------------
+  bool     _profile = false;
+  uint32_t _prof_rows = 0, _prof_merged = 0;
+  int64_t  _prof_rowloop_us = 0, _prof_cycle_t0 = 0;
 
   // ---- direct grey-to-grey transitions (4-level; DECISION_ENGINE.md) ----
   // key = (from << 2) | to, decision id = 16 | key. _dir_loaded gates

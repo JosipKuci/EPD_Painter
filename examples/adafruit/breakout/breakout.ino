@@ -41,6 +41,13 @@ struct Ball {
   uint8_t color;
 };
 
+// Two levels only: paper and ink. In 4-level NORMAL a white<->black change
+// is a single drive cycle — an apply on the dark plane or a remove on the
+// light plane — whereas any grey-to-grey pixel needs either a two-step
+// through white or a direct train. Restricting the palette to the endpoints
+// removes that case entirely rather than optimising it.
+static const uint8_t PAPER = 0, INK = 3;
+
 struct Brick {
   bool alive;
   uint8_t color;
@@ -59,7 +66,15 @@ void initBricks() {
       // One grey per row, light at the top down to near-black: the whole
       // tuned ramp on screen at once, and every ball crossing exercises a
       // different grey-to-grey pair.
-      bricks[r][c].color = (uint8_t)(2 + r * 2);   // rows: 2,4,6,8,10,12
+      // TWO COLOUR: ink or paper, nothing between.
+      //
+      // These were 2,4,6,8,10,12 — SIXTEEN-grey codes in a sketch that runs
+      // at FOUR levels, where the packer masks every byte with 0x03. They
+      // wrapped to 2,0,2,0,2,0, so rows 1, 3 and 5 were being drawn in
+      // white on white and never appeared at all. A level code authored for
+      // 16 greys does not degrade in 4-level mode, it wraps — always
+      // quantise against greyLevels(), never against a fixed 16.
+      bricks[r][c].color = INK;
     }
   }
 }
@@ -152,7 +167,7 @@ void drawBricks() {
 }
 
 void drawBall(const Ball &ball) {
-  epd.fillCircle((int)ball.x + BALL_SIZE / 2, (int)ball.y + BALL_SIZE / 2, BALL_SIZE / 2, 15);
+  epd.fillCircle((int)ball.x + BALL_SIZE / 2, (int)ball.y + BALL_SIZE / 2, BALL_SIZE / 2, INK);
 }
 
 void setup() {
@@ -170,14 +185,23 @@ void setup() {
   // blob a tuneup session stored, or the per-board *_Trains.h defaults.
   // ~2.5 fps: 20 passes at the constant 20 ms period is the price of
   // sixteen calibrated greys at their best.
-  epd.setQuality(EPD_Painter::Quality::QUALITY_FAST);
+  epd.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
  // if (!epd.driver().setGreyLevels(16))
   //  Serial.println("16-grey unavailable - staying at 4 levels");
+  // Inter-pass gap: 4 ms -> 1 ms. Worth 13 x 3 ms = 39 ms off a ~125 ms
+  // frame. Safe HERE because this sketch is two-colour — level 3 is a full
+  // darken run and level 0 a full whiten run, both saturated, so a shorter
+  // settle barely moves them. A 4-grey sketch would need its levels
+  // re-measured after this.
+  epd.driver()._config.pass_gap_us_normal = 1000;
+
+  epd.driver().setPaintProfile(true);   // one line per drive cycle
+
   epd.clear();
 
-  epd.fillScreen(15);
+  epd.fillScreen(INK);
   epd.paint();
-  epd.fillScreen(0);
+  epd.fillScreen(PAPER);
   epd.paint();
 
   const auto& cfg = epd.getConfig();
@@ -202,7 +226,7 @@ void loop() {
 
   long time = esp_timer_get_time();
 
-  epd.fillScreen(0);
+  epd.fillScreen(PAPER);
 
 
   for (int i = 0; i < NUM_BALLS; i++) {
@@ -230,7 +254,17 @@ void loop() {
   //epd.print("Turn off by pressing Boot button.");
 
   epd.paint();
- Serial.println(1000000.0/(esp_timer_get_time()-time));
+ // Frame rate, plus the drive-cycle count so a frame that quietly costs two
+ // cycles is visible rather than just "slow".
+ {
+   static uint32_t lastPaints = 0;
+   const uint32_t done = epd.driver().paintsCompleted();
+   Serial.printf("[breakout] %.1f fps  (%lu cycle%s this frame)\n",
+                 1000000.0f / (float)(esp_timer_get_time() - time),
+                 (unsigned long)(done - lastPaints),
+                 (done - lastPaints) == 1 ? "" : "s");
+   lastPaints = done;
+ }
 
 
 }
