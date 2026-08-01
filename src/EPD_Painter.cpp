@@ -178,11 +178,21 @@ static uint32_t s_epd_cpu_mhz = 240;
 
 static inline uint32_t epd_cpu_mhz() { return s_epd_cpu_mhz; }
 
+// The CPU cycle-counter read was renamed between ESP-IDF majors:
+// esp_cpu_get_ccount() (IDF 4.x / Arduino core 2.x) became
+// esp_cpu_get_cycle_count() (IDF 5.x / Arduino core 3.x).
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  #define EPD_CCOUNT() esp_cpu_get_cycle_count()
+#else
+  #define EPD_CCOUNT() esp_cpu_get_ccount()
+#endif
+
 static inline void IRAM_ATTR epd_hold_ns(uint32_t ns) {
   if (!ns) return;
   const uint32_t cycles = (uint32_t)(((uint64_t)ns * epd_cpu_mhz()) / 1000ULL);
-  const uint32_t t0 = esp_cpu_get_cycle_count();
-  while ((esp_cpu_get_cycle_count() - t0) < cycles) { /* spin */ }
+  const uint32_t t0 = EPD_CCOUNT();
+  while ((EPD_CCOUNT() - t0) < cycles) { /* spin */ }
 }
 
 extern "C" uint32_t epd_painter_ink_dual(const uint8_t *packed_paintbuffer, uint8_t *packed_fastbuffer, uint8_t *packed_lightbuffer, uint8_t *packed_screenbuffer, uint32_t length, uint32_t *maskL_out);
