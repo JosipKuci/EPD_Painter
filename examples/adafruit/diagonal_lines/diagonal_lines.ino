@@ -7,11 +7,6 @@
 // at the right edge: ghost lines appear interleaved with the real ones.
 // See How_It_Works.md §7 "Row-End Padding".
 
-// Choose your board.
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-
 #include <Arduino.h>
 #include "EPD_Painter_Adafruit.h"
 
@@ -25,8 +20,8 @@ void setup() {
   }
   epd.clear();
 
-  const int w = epd.width();    // 960
-  const int h = epd.height();   // 540
+  const int w = epd.width();    // 1200
+  const int h = epd.height();   // 825
 
   epd.fillScreen(0);
 

@@ -17,26 +17,23 @@
 //   K                     -> paint all-black (panel exercise / cold wake-up)
 //   C                     -> hard clear
 //   B                     -> clearBuffers (reset DC-balance baseline)
-//   X                     -> TPS65185 diag: reg dump + traced conversion
-//   J                     -> BQ27220 fuel-gauge temperature (independent
-//                            cross-check; the battery chills with the panel)
-
-// Board under calibration — switch the define to move the rig between boards.
-#define EPD_PAINTER_PRESET_LILYGO_EPD47_H716
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
+//   X                     -> TPS65186 diag: reg dump + traced conversion
+//   J                     -> (fuel-gauge temperature on the LilyGo rig; the
+//                            Inkplate 10 has no fuel gauge, answers ERR)
 
 #include <Arduino.h>
 #include "EPD_Painter_Adafruit.h"
 
 EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
 
-// Patch chart geometry (landscape 960x540, 8bpp values: low 2 bits are the
+// Patch chart geometry (landscape 1200x825 — the 960x540 chart scaled by
+// 1.25 so patches keep their proportions; 8bpp values: low 2 bits are the
 // level — 0=white 1=light grey 2=dark grey 3=black).
-static const int FID = 40;                    // fiducial square size
-static const int FID_INSET = 20;
-static const int PATCH_W = 160, PATCH_H = 280, PATCH_Y = 130;
-static const int PATCH_X[4] = { 100, 300, 500, 700 };
+static const int W = 1200, H = 825;
+static const int FID = 50;                    // fiducial square size
+static const int FID_INSET = 25;
+static const int PATCH_W = 200, PATCH_H = 350, PATCH_Y = 238;
+static const int PATCH_X[4] = { 125, 375, 625, 875 };
 static const uint8_t PATCH_VAL[4] = { 3, 2, 1, 0 };  // black,dk,lt,white L->R
 
 // Match chart: driven greys beside dithered references made of the panel's
@@ -47,9 +44,9 @@ static const uint8_t PATCH_VAL[4] = { 3, 2, 1, 0 };  // black,dk,lt,white L->R
 static void drawMatchChart() {
   epd.fillScreen(0);
   epd.fillRect(FID_INSET, FID_INSET, FID, FID, 3);
-  epd.fillRect(960 - FID_INSET - FID, FID_INSET, FID, FID, 3);
-  epd.fillRect(FID_INSET, 540 - FID_INSET - FID, FID, FID, 3);
-  epd.fillRect(960 - FID_INSET - FID, 540 - FID_INSET - FID, FID, FID, 3);
+  epd.fillRect(W - FID_INSET - FID, FID_INSET, FID, FID, 3);
+  epd.fillRect(FID_INSET, H - FID_INSET - FID, FID, FID, 3);
+  epd.fillRect(W - FID_INSET - FID, H - FID_INSET - FID, FID, FID, 3);
 
   epd.fillRect(PATCH_X[0], PATCH_Y, PATCH_W, PATCH_H, 3);           // black rail
   epd.fillRect(PATCH_X[3], PATCH_Y, PATCH_W, PATCH_H, 0);           // white rail
@@ -61,8 +58,8 @@ static void drawMatchChart() {
     for (int x = 0; x < PATCH_W / 2; x++) {
       // Period-3 diagonal dither: exact 1/3 and 2/3 black coverage
       bool third = ((x + 2 * y) % 3) == 0;
-      buf[y * 960 + PATCH_X[1] + x] = third ? 0 : 3;  // 66% black
-      buf[y * 960 + PATCH_X[2] + x] = third ? 3 : 0;  // 33% black
+      buf[y * W + PATCH_X[1] + x] = third ? 0 : 3;  // 66% black
+      buf[y * W + PATCH_X[2] + x] = third ? 3 : 0;  // 33% black
     }
   }
 }
@@ -71,9 +68,9 @@ static void drawChart() {
   epd.fillScreen(0);  // white
   // Corner fiducials
   epd.fillRect(FID_INSET, FID_INSET, FID, FID, 3);
-  epd.fillRect(960 - FID_INSET - FID, FID_INSET, FID, FID, 3);
-  epd.fillRect(FID_INSET, 540 - FID_INSET - FID, FID, FID, 3);
-  epd.fillRect(960 - FID_INSET - FID, 540 - FID_INSET - FID, FID, FID, 3);
+  epd.fillRect(W - FID_INSET - FID, FID_INSET, FID, FID, 3);
+  epd.fillRect(FID_INSET, H - FID_INSET - FID, FID, FID, 3);
+  epd.fillRect(W - FID_INSET - FID, H - FID_INSET - FID, FID, FID, 3);
   for (int i = 0; i < 4; i++)
     epd.fillRect(PATCH_X[i], PATCH_Y, PATCH_W, PATCH_H, PATCH_VAL[i]);
 }
@@ -117,13 +114,16 @@ static bool i2cRegWrite(uint8_t addr, uint8_t reg, uint8_t val) {
 }
 
 static void tpsDiag() {
-  const uint8_t TPS = 0x68, PCA = 0x20;
-  // Wake the TPS via PCA9555 port-1 WAKEUP (bit5) and remember prior state.
+  const auto &pw = epd.driver()._config.power;
+  const uint8_t TPS = pw.tps_addr, EXP = pw.expander_addr;
+  // Wake the TPS via the PCAL6416A WAKEUP pin and remember prior state.
+  const uint8_t oreg = 0x02 + (pw.pin_wakeup >> 3);
+  const uint8_t wbit = 1u << (pw.pin_wakeup & 7);
   uint8_t out1 = 0;
-  if (!i2cRegRead(PCA, 0x03, &out1, 1)) { Serial.println("ERR pca read"); return; }
-  bool wasAwake = out1 & 0x20;
+  if (!i2cRegRead(EXP, oreg, &out1, 1)) { Serial.println("ERR expander read"); return; }
+  bool wasAwake = out1 & wbit;
   if (!wasAwake) {
-    i2cRegWrite(PCA, 0x03, out1 | 0x20);
+    i2cRegWrite(EXP, oreg, out1 | wbit);
     delay(5);
   }
   Serial.print("REGS");
@@ -145,18 +145,20 @@ static void tpsDiag() {
     if (v & 0x20) break;
     delay(1);
   }
-  if (!wasAwake) i2cRegWrite(PCA, 0x03, out1);
+  if (!wasAwake) i2cRegWrite(EXP, oreg, out1);
   Serial.println("DONE");
 }
 
 static void bqTemp() {
-  uint8_t b[2];
-  if (i2cRegRead(0x55, 0x06, b, 2)) {  // Temperature(), 0.1 K units, LE
-    int raw = b[0] | (b[1] << 8);
-    Serial.printf("BQTEMP %.1f C (raw %d)\n", raw / 10.0 - 273.15, raw);
-  } else {
-    Serial.println("ERR bq27220 read");
-  }
+  Serial.println("ERR no fuel gauge on this board");
+}
+
+// paint() returns once the paint task has the frame; the passes run after.
+// A fixed delay sized for the 960x540 boards is far too short at 825 rows
+// and 4 MHz, so wait for the engine instead.
+static void waitPaint() {
+  delay(50);
+  while (!epd.driver().paintIdle()) delay(5);
 }
 
 static char line[160];
@@ -207,7 +209,7 @@ static void handle(char* cmd) {
     epd.clear();  // hard clear -> known white state
     drawChart();
     epd.paint();
-    delay(2500);  // paint() returns before the sweeps finish — let them
+    waitPaint();
     setCpuFrequencyMhz(80);   // low idle heat for cold-session accuracy
     Serial.println("DONE");
 
@@ -216,7 +218,7 @@ static void handle(char* cmd) {
     epd.clear();
     drawMatchChart();
     epd.paint();
-    delay(2500);
+    waitPaint();
     setCpuFrequencyMhz(80);
     Serial.println("DONE");
 
@@ -224,7 +226,7 @@ static void handle(char* cmd) {
     setCpuFrequencyMhz(240);
     epd.fillScreen(0);
     epd.paint();
-    delay(2500);
+    waitPaint();
     setCpuFrequencyMhz(80);
     Serial.println("DONE");
 
@@ -232,7 +234,7 @@ static void handle(char* cmd) {
     setCpuFrequencyMhz(240);
     epd.fillScreen(3);
     epd.paint();
-    delay(2500);
+    waitPaint();
     setCpuFrequencyMhz(80);
     Serial.println("DONE");
 
@@ -257,9 +259,8 @@ static void handle(char* cmd) {
 
 void setup() {
   Serial.begin(115200);
-  // The M5PaperS3 self-holds power via a latch pin; the library's boot-time
-  // shutdown check can power the board off before we ever get a prompt.
-  // The rig needs the board up unconditionally.
+  // The rig needs the board up unconditionally (auto-shutdown is off by
+  // default on the Inkplate 10; keep it explicit).
   epd.setAutoShutdown(false);
   if (!epd.begin()) {
     while (1) { Serial.println("ERR begin failed"); delay(2000); }

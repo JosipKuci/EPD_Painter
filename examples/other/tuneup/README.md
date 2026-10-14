@@ -6,19 +6,31 @@ itself**: lay it face-down on any eSCL/AirScan network scanner and it tunes
 its own 16-grey waveform trains, saves them to flash, and uses them from
 then on. No PC in the loop.
 
+**Board:** Soldered Inkplate 10 (9.7", 1200x825, ED097TC2) on an ESP32-S3.
+It has no touch panel, so the whole rig is driven over the serial console
+(115200; flash with `USBMode=hwcdc,CDCOnBoot=cdc`). The on-screen buttons
+are still drawn, each labelled with the serial key that presses it.
+
+**Placement:** the active area is 203 x 140 mm, so the board must lie
+*landscape across the platen's short side* (216 mm on an A4/Letter
+flatbed), pushed into the origin corner. The tuner corrects for the
+face-down mirroring but not for a 90-degree turn, and 216 mm leaves almost
+no slack — if the bezel stops the active area fitting inside the platen
+width, the registration scan will clip the panel and the run will fail.
+
 ## The flow
 
 1. **WiFi** — credentials are compiled in. Set `WIFI_SSID` / `WIFI_PASS` at
    the top of the sketch; if they're still blank, the panel shows
    instructions to edit the file and reflash.
 2. **Scanner** — discovers eSCL scanners via mDNS (`_uscan._tcp`), draws
-   them as buttons; tap yours (or type its number over serial). The choice
-   is remembered in NVS, so later boots need no interaction.
+   them as numbered buttons; type yours' number over serial (`r` rescans).
+   The choice is remembered in NVS, so later boots need no interaction.
 3. **DEMO SCAN** — scans the bed and shows the image on the panel in 16
    native greys. Proves the plumbing.
-4. **TUNE ME** — pick which quality to tune, then instructions and a 30 s
-   countdown to lay the board face-down and close the lid. Or send `T`
-   over serial for the same choice.
+4. **TUNE ME** — send `t`: pick which quality to tune (`f`/`n`/`h`), then
+   instructions and a 30 s countdown to lay the board face-down and close
+   the lid. `T` makes the same choice and starts with no countdown.
 
 ## Three qualities, three tunes, three blobs
 
@@ -30,15 +42,22 @@ that already works.
 | | levels | passes | period | what gets tuned | roughly |
 |---|---|---|---|---|---|
 | **FAST** | 4 | 7 | none | `fast_darker`/`fast_lighter` + the six grey-to-grey direct trains | ~10 min |
-| **NORMAL** | 16 | 13 | 15 ms | 16-grey applies + charge-matched removes | ~10–15 min |
-| **HIGH** | 16 | 20 | 15 ms | the same, at 20 passes | ~20 min |
+| **NORMAL** | 16 | 13 | preset | 16-grey applies + charge-matched removes | ~10–15 min |
+| **HIGH** | 16 | 20 | preset | the same, at 20 passes | ~20 min |
 
-**HIGH is NORMAL's timing with more slots** — same 15 ms pass period, 20
-passes instead of 13, so a 300 ms full-screen paint against NORMAL's
-195 ms. It is emphatically *not* "the same trains, driven slower".
+The period is the preset's `g16_pass_us_normal` / `g16_pass_us_high`. On
+the Inkplate 10 that is 75 ms (an 825-row loop at the 4 MHz pixel clock
+takes ~64 ms by itself), against the 15 ms of the 960x540 boards the
+numbers below were measured on — so each paint, and each tune, takes
+longer here. The times in the table are from those boards.
+
+**HIGH is NORMAL's timing with more slots** — same pass period, 20
+passes instead of 13 (at 15 ms, a 300 ms full-screen paint against
+NORMAL's 195 ms). It is emphatically *not* "the same trains, driven slower".
 
 That was measured, not assumed. A dose-ladder sweep at 19 / 15 / 13 ms
-(LilyGo, 26 July 2026) found a longer pass buys **no extra depth at all**
+(on a LilyGo T5 S3, 26 July 2026 — the history this rig was built on)
+found a longer pass buys **no extra depth at all**
 — all three periods bottomed out at the identical black — while making
 every slot coarser *and* wasting most of them: at 19 ms the response
 stopped moving after 7 passes, at 15 ms it was still resolving at 10. So
@@ -123,8 +142,8 @@ which renders sixteen monotonic greys but not accurate ones.
 
 ## Requirements
 
-- **Adafruit GFX Library**, **gt911-arduino** (touch),
-  **JPEGDEC** (image analysis — required for tuning)
+- **Adafruit GFX Library**, **JPEGDEC** (image analysis — required for
+  tuning). No touch library: the Inkplate 10 has no touch controller.
 - A scanner speaking plain-HTTP eSCL (`GET /eSCL/ScannerCapabilities`).
   Nearly every network scanner/MFP since ~2015 does; older USB scanners
   can be bridged with `sane-airscan`.
@@ -133,14 +152,18 @@ which renders sixteen monotonic greys but not accurate ones.
 
 | Key | Action |
 |-----|--------|
-| `s` | demo scan |
+| `s` | demo scan (the DEMO SCAN button) |
+| `t` | self-tune with the 30 s lid countdown (the TUNE ME button) |
 | `T` | self-tune: offers the quality choice, then starts (no countdown) |
+| `o` | show the photo through each tier (the SHOW PHOTO button; `m` cycles the mode) |
 | `f` / `n` / `h` | at that choice: FAST / NORMAL / HIGH |
 | `q` | back out of the choice, or abort a running tune (between cycles) |
+| `s` / `k` | on the results screen: SAVE / SKIP |
+| any key | dismiss an OK / "scanner not responding" screen (`q` aborts the latter) |
 | `P <us>` | override the tuning pass period (0 = preset) |
 | `L` | which blobs are present, and the 16-grey periods and lengths |
 | `X` | erase **all** tuned blobs (reboot to fall back to presets) |
-| `n` | re-pick the scanner (from the menu) |
+| `n` | re-pick the scanner (from the menu; the CHANGE SCANNER button) |
 | `m` | reprint the menu |
 | `r` | reboot |
 

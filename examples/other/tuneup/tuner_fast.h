@@ -533,8 +533,8 @@ static bool fastResultsScreen(float worst, float erase, int npairs, float worstD
             ? "All transitions go direct - no two-step through white."
             : "Untuned pairs keep the two-step: correct, but they flash white.");
 
-  Btn save = { 60, H - 130, 360, 110 };
-  Btn skip = { 540, H - 130, 360, 110 };
+  Btn save = { W / 2 - 420, H - 130, 360, 110 };
+  Btn skip = { W / 2 + 60,  H - 130, 360, 110 };
   drawBtn(save, "SAVE", "use on every boot");
   drawBtn(skip, "SKIP", "keep built-in");
   tuneClear();

@@ -4,6 +4,7 @@
 #include "esp_sleep.h"
 #include "esp_heap_caps.h"
 #include <stdio.h>
+#include <string.h>
 
 // Static default fractal instance.
 EPD_BootCtl::FractalImage EPD_BootCtl::fractal;
@@ -79,16 +80,18 @@ uint8_t* EPD_BootCtl::_getImage() const {
 // =============================================================================
 
 uint8_t* EPD_BootCtl::FractalImage::getBootImage(uint16_t W, uint16_t H) {
-    const size_t packed_size = (size_t)W * H / 4;
+    const int    stride      = EPD_Painter::packedRowBytesFor(W);
+    const size_t packed_size = (size_t)stride * H;
 
     uint8_t* packed = (uint8_t*)heap_caps_malloc(packed_size, MALLOC_CAP_SPIRAM);
     if (!packed) {
         printf("[BOOT] fractal: PSRAM alloc failed (%u bytes)\n", (unsigned)packed_size);
         return nullptr;
     }
+    memset(packed, 0, packed_size);   // row padding stays white
 
     for (int py = 0; py < H; py++) {
-        uint8_t* row   = packed + py * (W / 4);
+        uint8_t* row   = packed + (size_t)py * stride;
         uint8_t  yterm = (uint8_t)((py >> 2) ^ (py >> 4) ^ (py >> 6));
         for (int px = 0; px < W; px += 4) {
             auto pixel = [yterm](int x) -> uint8_t {
@@ -110,34 +113,9 @@ uint8_t* EPD_BootCtl::FractalImage::getBootImage(uint16_t W, uint16_t H) {
 // =============================================================================
 
 void EPD_BootCtl::_powerOff() {
-//    return;  // TEMP (Tony): rig work — never power the board down
-    const EPD_Painter::Config& cfg = _epd.getConfig();
-
-    if (cfg.pin_syspwr >= 0) {
-        pinMode(cfg.pin_syspwr, OUTPUT);
-        digitalWrite(cfg.pin_syspwr, HIGH);
-        delay(100);
-        digitalWrite(cfg.pin_syspwr, LOW);
-        printf("[BOOT] pin_syspwr pulsed. If still running, USB is keeping device alive.\n");
-    } else {
-#ifdef ARDUINO
-        TwoWire* wire = cfg.i2c.wire;
-        if (wire) {
-            const uint8_t BQ_ADDR = 0x6B;
-            wire->beginTransmission(BQ_ADDR);
-            wire->write(0x09);
-            wire->endTransmission();
-            wire->requestFrom(BQ_ADDR, (uint8_t)1);
-            uint8_t reg = wire->available() ? wire->read() : 0;
-            wire->beginTransmission(BQ_ADDR);
-            wire->write(0x09);
-            wire->write(reg | (1 << 5));  // BATFET_DIS
-            wire->endTransmission();
-            printf("[BOOT] BQ25896 BATFET disabled. If still running, USB is keeping device alive.\n");
-        }
-#endif
-    }
-
+    // The Inkplate 10 has no power latch or charger on the panel's I2C bus,
+    // so "off" is deep sleep with no wake source: a reset or power cycle
+    // brings it back.
     esp_deep_sleep_start();
     while (true) {}
 }
@@ -146,21 +124,10 @@ void EPD_BootCtl::_powerOff() {
 // USB detection
 // =============================================================================
 
+// No charger IC to ask, so the board cannot tell a USB boot from a battery
+// one; every boot counts as battery. That is why auto-shutdown defaults off.
 bool EPD_BootCtl::_isUsbConnected() const {
-#ifdef ARDUINO
-    const EPD_Painter::Config& cfg = _epd.getConfig();
-    TwoWire* wire = cfg.i2c.wire;
-    if (!wire) return false;
-    const uint8_t BQ_ADDR = 0x6B;
-    wire->beginTransmission(BQ_ADDR);
-    wire->write(0x0B);
-    if (wire->endTransmission(false) != 0) return false;
-    if (wire->requestFrom(BQ_ADDR, (uint8_t)1) == 0) return false;
-    uint8_t reg = wire->read();
-    return (reg & 0xF8) != 0;
-#else
     return false;
-#endif
 }
 
 // =============================================================================

@@ -14,10 +14,6 @@
 // back down through the gears to a stop (hazards on).
 // ============================================================================
 
-// Choose your board (or leave all commented for auto-probe).
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-
 #include <Arduino.h>
 #include <math.h>
 #include "EPD_Painter.h"
@@ -32,6 +28,16 @@ static uint8_t *fb;
 static int W, H;
 
 // ---- geometry -------------------------------------------------------------
+// The layout is drawn in a 960x540 design space and mapped onto the panel
+// by a uniform scale K and centring offset (OX, OY), set in setup() from
+// the runtime size: 1.25x, letterboxed vertically, on the 1200x825 panel.
+// rect/disc/ringBand/radial take design units; px() takes panel pixels.
+static const int DESIGN_W = 960, DESIGN_H = 540;
+static float K = 1.0f;
+static int   OX = 0, OY = 0;
+static inline int sx(float x) { return OX + (int)lroundf(x * K); }
+static inline int sy(float y) { return OY + (int)lroundf(y * K); }
+
 static const int LCX = 215, RCX = 745, CY = 270;   // dial centres
 static const int R_RING0 = 190, R_RING1 = 200;     // outer ring band
 static const int R_TICK1 = 186, R_TICKMAJ = 168, R_TICKMIN = 177;
@@ -47,9 +53,15 @@ static inline float angOf(float v, float vmax) { return 135.0f + v * 270.0f / vm
 static inline void px(int x, int y, uint8_t c) {
   if (x >= 0 && x < W && y >= 0 && y < H) fb[(size_t)y * W + x] = c;
 }
-static void rect(int x, int y, int w, int h, uint8_t c) {
+// panel-pixel rectangle
+static void srect(int x, int y, int w, int h, uint8_t c) {
   for (int yy = y; yy < y + h; yy++)
     for (int xx = x; xx < x + w; xx++) px(xx, yy, c);
+}
+// design-unit rectangle: edges are mapped, so abutting rects stay abutting
+static void rect(int x, int y, int w, int h, uint8_t c) {
+  const int x0 = sx(x), y0 = sy(y);
+  srect(x0, y0, sx(x + w) - x0, sy(y + h) - y0, c);
 }
 static void frameRect(int x, int y, int w, int h, int t, uint8_t c) {
   rect(x, y, w, t, c); rect(x, y + h - t, w, t, c);
@@ -72,17 +84,22 @@ static void textCentred(const char *s, int cx, int y, int sc, uint8_t col) {
 static void radial(int cx, int cy, float deg, int r0, int r1, int thick, uint8_t c) {
   const float a = deg * (float)M_PI / 180.0f;
   const float dx = cosf(a), dy = sinf(a);
-  for (int r = r0; r <= r1; r++) {
-    const int x = cx + (int)lroundf(dx * r), y = cy + (int)lroundf(dy * r);
-    rect(x - thick / 2, y - thick / 2, thick, thick, c);
+  const int scx = sx(cx), scy = sy(cy);
+  const int t = max(1, (int)lroundf(thick * K));
+  for (int r = (int)lroundf(r0 * K); r <= (int)lroundf(r1 * K); r++) {
+    const int x = scx + (int)lroundf(dx * r), y = scy + (int)lroundf(dy * r);
+    srect(x - t / 2, y - t / 2, t, t, c);
   }
 }
-static void disc(int cx, int cy, int r, uint8_t c) {
+static void disc(int dcx, int dcy, int dr, uint8_t c) {
+  const int cx = sx(dcx), cy = sy(dcy), r = (int)lroundf(dr * K);
   for (int y = -r; y <= r; y++)
     for (int x = -r; x <= r; x++)
       if (x * x + y * y <= r * r) px(cx + x, cy + y, c);
 }
-static void ringBand(int cx, int cy, int r0, int r1, bool gap, uint8_t c) {
+static void ringBand(int dcx, int dcy, int dr0, int dr1, bool gap, uint8_t c) {
+  const int cx = sx(dcx), cy = sy(dcy);
+  const int r0 = (int)lroundf(dr0 * K), r1 = (int)lroundf(dr1 * K);
   for (int y = -r1; y <= r1; y++)
     for (int x = -r1; x <= r1; x++) {
       const int d2 = x * x + y * y;
@@ -265,6 +282,9 @@ void setup() {
   H = epd.getConfig().height;
   fb = (uint8_t *)heap_caps_malloc((size_t)W * H, MALLOC_CAP_SPIRAM);
   if (!fb) { Serial.println("fb alloc failed"); while (1) delay(1000); }
+  K  = min((float)W / DESIGN_W, (float)H / DESIGN_H);
+  OX = (W - (int)lroundf(DESIGN_W * K)) / 2;
+  OY = (H - (int)lroundf(DESIGN_H * K)) / 2;
 
   pinMode(PIN_THROTTLE, INPUT_PULLUP);
 

@@ -26,9 +26,9 @@
 // The provider is re-constructed on every boot, so nothing needs to survive
 // a reset — NVS only stores the running/sleeping flag.
 //
-// Board-specific power-off:
-//   pin_syspwr >= 0  (M5PaperS3)    — HIGH→LOW pulse on that GPIO.
-//   pin_syspwr == -1 (LilyGo T5 S3) — BQ25896 BATFET disable over I2C.
+// Power-off is deep sleep with no wake source (the Inkplate 10 has no power
+// latch); a reset brings the board back. The image is packed 2bpp at
+// EPD_Painter::packedRowBytesFor(w) bytes per row, padding zero.
 // =============================================================================
 
 class EPD_BootCtl {
@@ -38,7 +38,8 @@ public:
     // Implement this interface to supply a shutdown image.
     // getBootImage() is called on shutdown (to paint) and on startup (to unpaint
     // the same image for DC balance).
-    // Return a PSRAM-allocated packed 2bpp buffer; EPD_BootCtl frees it.
+    // Return a PSRAM-allocated packed 2bpp buffer (rows of
+    // EPD_Painter::packedRowBytesFor(w) bytes); EPD_BootCtl frees it.
     // -------------------------------------------------------------------------
     class IImageProvider {
     public:

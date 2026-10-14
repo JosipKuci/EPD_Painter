@@ -1,27 +1,11 @@
 // Breakout Demo — autonomous multi-ball brick basher, no paddle required.
 // Balls bounce forever; bricks reset when all cleared.
-// Power off via Boot button (battery only — does not work when plugged in via USB).
-
-
-// Pick a board...
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include <Arduino.h>
 #include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_presets.h"
 
-#define XPOWERS_CHIP_BQ25896
-#include <XPowersLib.h>
-
 EPD_PainterAdafruit epd(EPD_PAINTER_PRESET);
-
-
-// Power off only works with LILYGO T5
-#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-XPowersPPM PPM;
-#endif
 
 // --- Game constants ---
 #define BALL_SIZE    23
@@ -204,20 +188,6 @@ void setup() {
   epd.fillScreen(PAPER);
   epd.paint();
 
-  const auto& cfg = epd.getConfig();
-
-#ifdef EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
- bool result = PPM.init(*cfg.i2c.wire, cfg.i2c.sda, cfg.i2c.scl, BQ25896_SLAVE_ADDRESS);
- if (!result) {
-   while (1) {
-     Serial.println("PPM is not online...");
-     delay(1000);
-   }
- }
- #endif
-
-  //pinMode(0, INPUT);
-
   epd.setTextSize(3);
   initGame();
 }
@@ -249,9 +219,6 @@ void loop() {
 //  long time = esp_timer_get_time();
  // long time = esp_timer_get_time();
 
-
-  //epd.setCursor(30,500);
-  //epd.print("Turn off by pressing Boot button.");
 
   epd.paint();
  // Frame rate, plus the drive-cycle count so a frame that quietly costs two

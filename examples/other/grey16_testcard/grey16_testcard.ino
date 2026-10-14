@@ -25,11 +25,6 @@
 // board without a tuned set the formula library runs instead: levels will
 // be distinguishable and monotonic but not evenly spaced.
 
-// Choose your board (or leave all commented for auto-probe).
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-
 #include <Arduino.h>
 #include "EPD_Painter.h"
 #include "EPD_Painter_presets.h"
@@ -117,8 +112,8 @@ void setup() {
   Serial.printf("[grey16] boot, reset reason %d\n", (int)esp_reset_reason());
 
   // Calibration rig: never shutdown-on-reset — the flasher's hard reset
-  // would power the board off after every upload (on the M5PaperS3 the
-  // USB check can't see USB: it reads the LilyGo's BQ25896).
+  // would deep-sleep the board after every upload. (false is the default;
+  // kept explicit because the rig depends on it.)
   epd.setAutoShutdown(false);
 
   if (!epd.begin()) {

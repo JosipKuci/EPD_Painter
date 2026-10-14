@@ -69,13 +69,12 @@ extern "C" void epd_painter_compact_pixels(
 // stays warm in cache across all src_w column iterations within each block,
 // avoiding repeated PSRAM fetches for the strided column access pattern.
 //
-// src_h must be a multiple of 16. src_w must be a multiple of 4.
+// src_h must be a multiple of 16. out_stride is the packed row stride
+// (>= src_h / 4); bytes past src_h / 4 in each output row are left alone.
 // =============================================================================
 static IRAM_ATTR void compact_pixels_rotated_cw(
-    const uint8_t* src, uint8_t* dst, int src_w, int src_h)
+    const uint8_t* src, uint8_t* dst, int src_w, int src_h, int out_stride)
 {
-
-    const int out_stride = src_h / 4;   // packed bytes per output row (e.g. 240)
 
     for (int rb = 0; rb < src_h; rb += 16) {
         for (int cx = 0; cx < src_w; cx++) {
@@ -99,29 +98,11 @@ static IRAM_ATTR void compact_pixels_rotated_cw(
 
 }
 
-// =============================================================================
-// compact_pixels_180
-//
-// 180° rotation + 8bpp→2bpp compaction for a landscape (ROTATION_0) buffer.
-// A 180° turn of a row-major image is just a full reversal of the pixel order
-// (pixel (x,y) → (W-1-x, H-1-y) == linear index i → N-1-i).  So we read the
-// source backwards in groups of 4 and pack forward, using the same MSB-first
-// nibble layout as the linear pack — keeping panel coordinates correct.
-//
-// size must be a multiple of 4.
-// =============================================================================
-static void compact_pixels16(const uint8_t *src, uint8_t *dst, uint32_t n);
-
-static IRAM_ATTR void compact_pixels_180(
-    const uint8_t* src, uint8_t* dst, uint32_t size)
-{
-    const uint32_t nbytes = size / 4;
-    const uint8_t* s = src + size - 1;        // last source pixel
-    for (uint32_t b = 0; b < nbytes; b++) {
-        dst[b] = ((s[ 0] & 3) << 6) | ((s[-1] & 3) << 4)
-               | ((s[-2] & 3) << 2) |  (s[-3] & 3);
-        s -= 4;
-    }
+// 16-grey pack of one unrotated run: 8bpp level codes (0..15) → 4bpp, first
+// pixel in the high nibble. _pack() handles rows, stride and rotation.
+static void compact_pixels16(const uint8_t *src, uint8_t *dst, uint32_t n) {
+  for (uint32_t i = 0; i < n; i += 2)
+    *dst++ = (uint8_t)(((src[i] & 15) << 4) | (src[i + 1] & 15));
 }
 
 extern "C" void epd_painter_convert_packed_fb_to_ink(
@@ -204,17 +185,38 @@ static inline void epd_gpio_func_sel(int pin) {
 
 #define PASS_COUNT 13
 
+// LCD_CAM pixel clock from the 160 MHz PLL: pclk = 160 MHz / div_num / pre,
+// div_num 2..255 (integer group divider, fractional part unused), pre 2..64
+// (clkcnt_n + 1). Picks the pair closest to the request; ties keep the
+// smallest prescale, i.e. the lowest lcd_clk (4 MHz -> 160 / 20 / 2).
+static uint32_t epd_pick_pclk(uint32_t hz, int &div_num, int &pre) {
+  const uint32_t src = 160000000u;
+  if (hz == 0) hz = 1;
+  uint32_t best_err = UINT32_MAX, best_hz = 0;
+  div_num = 2; pre = 2;
+  for (int b = 2; b <= 64; b++) {
+    uint32_t a = (src + (hz * (uint32_t)b) / 2) / (hz * (uint32_t)b);
+    if (a < 2) a = 2;
+    if (a > 255) a = 255;
+    const uint32_t got = src / (a * (uint32_t)b);
+    const uint32_t err = got > hz ? got - hz : hz - got;
+    if (err < best_err) { best_err = err; best_hz = got; div_num = (int)a; pre = b; }
+  }
+  return best_hz;
+}
+
 
 EPD_Painter::EPD_Painter(const Config &config, bool portrait) {
   _config = config;
   _preset = &config;
   if (portrait) _config.rotation = Rotation::ROTATION_CW;
+  packed_row_bytes = packedRowBytesFor(_config.width);
 }
 
 
 void EPD_Painter::setQuality(Quality quality) {
-  if (_grey16 && quality == Quality::QUALITY_FAST) {
-    printf("[EPD_Painter] QUALITY_FAST cannot express 16 greys — call setGreyLevels(4) first\n");
+  if (_grey16 && (quality == Quality::QUALITY_FAST || quality == Quality::QUALITY_BW)) {
+    printf("[EPD_Painter] QUALITY_FAST/BW cannot express 16 greys — call setGreyLevels(4) first\n");
     return;
   }
   const bool changed = (_config.quality != quality);
@@ -274,14 +276,15 @@ bool EPD_Painter::setGreyLevels(int levels) {
     return false;
   }
 
-  if (on && _config.quality == Quality::QUALITY_FAST) {
+  if (on && (_config.quality == Quality::QUALITY_FAST ||
+             _config.quality == Quality::QUALITY_BW)) {
     printf("[EPD_Painter] 16-grey needs QUALITY_NORMAL or QUALITY_HIGH\n");
     return false;
   }
 
   if (on && !packed4_screenbuffer) {
-    const size_t p4_bytes    = (size_t)_config.width * _config.height / 2;
-    const size_t plane_bytes = (size_t)_config.width * _config.height / 4;
+    const size_t p4_bytes    = packedSize() * 2;
+    const size_t plane_bytes = packedSize();
     packed4_paintbuffer  = (uint8_t *)heap_caps_aligned_alloc(16, p4_bytes, MALLOC_CAP_SPIRAM);
     packed4_screenbuffer = (uint8_t *)heap_caps_aligned_alloc(16, p4_bytes, MALLOC_CAP_SPIRAM);
     dec_spill = (uint8_t *)heap_caps_aligned_alloc(
@@ -310,7 +313,7 @@ bool EPD_Painter::setGreyLevels(int levels) {
   // Carry the physical screen state across the switch so ghost tracking
   // survives: 2bpp levels 0..3 <-> 4bpp levels {0, 5, 10, 15}.
   xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
-  const size_t packed_bytes = (size_t)_config.width * _config.height / 4;
+  const size_t packed_bytes = packedSize();
   if (on) {
     static const uint8_t lv[4] = { 0, 5, 10, 15 };
     for (size_t i = 0; i < packed_bytes; i++) {
@@ -365,7 +368,7 @@ void EPD_Painter::releaseUnusedBuffers() {
 bool EPD_Painter::setDirectTransitions(bool on) {
   if (!on) { _decision_direct = false; return true; }
   if (!dec_spill_dir) {
-    const size_t plane_bytes = (size_t)_config.width * _config.height / 4;
+    const size_t plane_bytes = packedSize();
     dec_spill_dir = (uint8_t *)heap_caps_aligned_alloc(
         16, plane_bytes * (DEC_MAX_SWEEPS_DIR - 2), MALLOC_CAP_SPIRAM);
     const size_t sweep_bytes =
@@ -419,8 +422,8 @@ bool EPD_Painter::setDirectTransitions(bool on) {
 
 bool EPD_Painter::setTemplate(const uint8_t *fb, Quality quality) {
   if (!fb) return false;
-  if (_grey16 && quality == Quality::QUALITY_FAST) {
-    printf("[EPD_Painter] template: FAST cannot express 16 greys\n");
+  if (_grey16 && (quality == Quality::QUALITY_FAST || quality == Quality::QUALITY_BW)) {
+    printf("[EPD_Painter] template: FAST/BW cannot express 16 greys\n");
     return false;
   }
   if (_has_template) releaseTemplate();
@@ -438,8 +441,7 @@ bool EPD_Painter::setTemplate(const uint8_t *fb, Quality quality) {
   // land between the template paint and a screenbuffer copy, baking its
   // dynamic content into the protected layer as un-erasable ghosts (seen
   // in the field: magitrac's tracker glyphs stamped into its GUI chrome).
-  const size_t bytes =
-      (size_t)_config.width * _config.height / (_grey16 ? 2 : 4);
+  const size_t bytes = packedSize() * (_grey16 ? 2 : 1);
   tpl_data = (uint8_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM);
   tpl_mask = (uint8_t *)heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM);
   if (!(tpl_data && tpl_mask)) {
@@ -449,18 +451,7 @@ bool EPD_Painter::setTemplate(const uint8_t *fb, Quality quality) {
     tpl_data = tpl_mask = nullptr;
     return false;
   }
-  if (_grey16)
-    compact_pixels16((uint8_t *)fb, tpl_data,
-                     (uint32_t)_config.width * _config.height);
-  else if (_config.rotation == Rotation::ROTATION_CW)
-    compact_pixels_rotated_cw((uint8_t *)fb, tpl_data,
-                              _config.height, _config.width);
-  else if (_config.rotation == Rotation::ROTATION_180)
-    compact_pixels_180((uint8_t *)fb, tpl_data,
-                       _config.width * _config.height);
-  else
-    epd_painter_compact_pixels((uint8_t *)fb, tpl_data,
-                               _config.width * _config.height);
+  _pack(fb, tpl_data, _grey16);
   for (size_t i = 0; i < bytes; i++) {
     const uint8_t b = tpl_data[i];
     uint8_t m = 0;
@@ -492,10 +483,10 @@ void EPD_Painter::releaseTemplate() {
   _has_template = false;              // stop the overlay for this paint
 
   xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
-  const size_t bytes =
-      (size_t)_config.width * _config.height / (_tpl_grey16 ? 2 : 4);
+  const size_t bytes = packedSize() * (_tpl_grey16 ? 2 : 1);
   uint8_t *pb = _tpl_grey16 ? packed4_paintbuffer : packed_paintbuffer;
   for (size_t i = 0; i < bytes; i++) pb[i] &= (uint8_t)~tpl_mask[i];
+  _pr_lo = 0; _pr_hi = _config.height - 1;
   paintStage = 1;                     // clear()'s submission pattern
   xSemaphoreGive(_paint_buffer_sem);
   while (!paintIdle()) EPD_DELAY_MS(2);
@@ -556,17 +547,14 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
   // How_It_Works.md §7).  GDMA underflow flags confirmed the FIFO never
   // starved with this ordering.
   LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
   gdma_start(dma_chan, (intptr_t)desc);
 
 #ifdef EPD_ROW_PHASE_TIMING
   const int64_t _rp_t2 = esp_timer_get_time();
 #endif
   if (firstLine) {
-    _pin_spv->set(false);
-    _pin_ckv->set(false);
-    EPD_DELAY_US(1);
-    _pin_ckv->set(true);
-    _pin_spv->set(true);
+    _vscanStart();
   } else if (noAdvance) {
     // Latch the previously transmitted data onto the source outputs without
     // advancing the gate: the current row drives this data for one more slot.
@@ -574,11 +562,17 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
     if (_grey16) epd_hold_ns(_config.le_hold_ns);
     _pin_le->set(false);
   } else {
+    // Gate OFF before the latch, as Inkplate's vscan_end()/hscan_start().
+    // A gate line's pixels keep the LAST source voltage they saw while it
+    // was on, so latching with CKV still high let the previous line's
+    // pixels pick up this row's drive codes before the gate dropped: a
+    // one-row vertical bleed (white seeping into the row above).
+    _pin_ckv->set(false);
+    if (_config.gate_off_us) EPD_DELAY_US(_config.gate_off_us);
     _pin_le->set(true);
     if (_grey16) epd_hold_ns(_config.le_hold_ns);
     _pin_le->set(false);
-    _pin_ckv->set(false);
-    EPD_DELAY_US(1);
+    if (_config.gate_on_us) EPD_DELAY_US(_config.gate_on_us);
     _pin_ckv->set(true);
   }
   // Optional extra charging time per row (see Config::row_extra_us). Held
@@ -616,39 +610,111 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
 }
 
 // =============================================================================
+// _vscanStart() / _skipRow()
+// =============================================================================
+// Vertical start: SPV low across one CKV rising edge puts the start token on
+// the first gate line, then vscan_skip_lines more clocks step it past the
+// panel's invisible lead-in lines — the Inkplate driver's vscan_start().
+//
+// While CKV is low (every gate output off) it also latches whatever is in
+// the source chain. Every pass, sweep and flush ends by transmitting an
+// unlatched float row (_endPass(), the closing sweep, _pushRow()), so this
+// puts float on the source outputs before the token starts moving. Without
+// it the outputs would still carry the previous pass's last row, which a
+// skipped row (_skipRow) would then be driven with. Latching with the gates
+// off leaves the previous pass's last line holding its full drive.
+// The bus must be idle: callers wait on lcd_start first.
+void EPD_Painter::_vscanStart() {
+  const int hold = _config.vscan_hold_us;
+  _pin_spv->set(false);
+  EPD_DELAY_US(hold);
+  _pin_ckv->set(false);
+  _pin_le->set(true);
+  _pin_le->set(false);
+  EPD_DELAY_US(1);
+  _pin_ckv->set(true);
+  EPD_DELAY_US(hold);
+  _pin_spv->set(true);
+  for (int i = 0; i < _config.vscan_skip_lines; i++) {
+    _pin_ckv->set(false);
+    EPD_DELAY_US(1);
+    _pin_ckv->set(true);
+    EPD_DELAY_US(hold);
+  }
+}
+
+// Step the gate past a row that has nothing to drive: CKV only — no data
+// transfer and no latch, so the row sees the float data _vscanStart()
+// latched. ~1 us against a full row transfer (31 us at 10 MHz). Only valid
+// for rows BEFORE the first sendRow() of a pass; after that the latch holds
+// real data.
+void EPD_Painter::_skipRow(bool firstLine) {
+  while (LCD_CAM.lcd_user.lcd_start) {}
+  if (firstLine) {
+    _vscanStart();
+  } else {
+    _gateStep();
+  }
+}
+
+// One gate clock with no row behind it: CKV low 1 us, then high for
+// gate_step_us so the next falling edge is never closer than that.
+void EPD_Painter::_gateStep() {
+  _pin_ckv->set(false);
+  EPD_DELAY_US(1);
+  _pin_ckv->set(true);
+  if (_config.gate_step_us) EPD_DELAY_US(_config.gate_step_us);
+}
+
+// The gate driver is a shift register: a pass that stops at row lastRow
+// leaves its token on that row's line, and the next SPV would start a second
+// one — both would then walk down together, the stale one driving a copy of
+// every row onto a line further down. A full pass never has this problem
+// (its token leaves the bottom on the next pass's lead-in clocks). So after
+// a pass or sweep that stops early, take the gates off, latch the float row
+// that was just transmitted, and clock the token off the bottom of the panel.
+// Lines it crosses are driven with float, which is what they already hold.
+// ~2 us per remaining row, against a full transfer each.
+void EPD_Painter::_flushGate(int lastRow) {
+  while (LCD_CAM.lcd_user.lcd_start) {}
+  _pin_ckv->set(false);
+  _pin_le->set(true);
+  _pin_le->set(false);
+  EPD_DELAY_US(1);
+  _pin_ckv->set(true);
+  if (_config.gate_step_us) EPD_DELAY_US(_config.gate_step_us);
+  for (int i = lastRow; i <= _config.height; i++) _gateStep();   // + 1 spare clock
+}
+
+// =============================================================================
 // begin()
 // =============================================================================
 bool EPD_Painter::begin() {
 
-  #ifdef EPD_PAINTER_PRESET_AUTO
-    if (!autoDetectBoard()) return false;
-  #endif
-
-  // -- Start I2C if needed.
-#ifdef ARDUINO
-  if (_config.i2c.scl != -1 && _config.i2c.wire == nullptr) {
-    TwoWire *w = new TwoWire(0);
-    w->begin(_config.i2c.sda, _config.i2c.scl, _config.i2c.freq);
-    _config.i2c.wire = w;
-    EPD_DELAY_MS(50);
+  // Every SIMD path works in 16-pixel input groups and 64-pixel chunks, and
+  // a row's chunk mask is one 32-bit word.
+  packed_row_bytes = packedRowBytesFor(_config.width);
+  if (_config.width % 16 != 0 || packed_row_bytes / 16 > 32) {
+    printf("[EPD_Painter] width %u unsupported: must be a multiple of 16, at most 2048\n",
+           (unsigned)_config.width);
+    return false;
   }
+
+  // -- Start I2C. The global Wire unless the sketch supplied a bus: a second
+  // TwoWire on controller 0 would fight Wire for the same peripheral.
+#ifdef ARDUINO
+  if (_config.i2c.wire == nullptr) _config.i2c.wire = &Wire;
+  _config.i2c.wire->begin(_config.i2c.sda, _config.i2c.scl, _config.i2c.freq);
+  EPD_DELAY_MS(10);
 #else
   // I2C not used in ESP-IDF builds
 #endif
 
-  // ---- Configure EPD control pins ----
-  // Pins managed by powerctl (PCA9555) or encoded as EPD_SR_PIN() (shift register)
-  // are skipped here — their hardware is initialised elsewhere.
-  if (_config.pin_pwr >= 0 && !epd_pin_is_sr(_config.pin_pwr)) EPD_PIN_OUTPUT(_config.pin_pwr);
-  if (_config.pin_spv >= 0 && !epd_pin_is_sr(_config.pin_spv)) EPD_PIN_OUTPUT(_config.pin_spv);
-  EPD_PIN_OUTPUT(_config.pin_ckv);
-  EPD_PIN_OUTPUT(_config.pin_sph);
-  if (_config.pin_oe  >= 0 && !epd_pin_is_sr(_config.pin_oe))  EPD_PIN_OUTPUT(_config.pin_oe);
-  if (_config.pin_le  >= 0 && !epd_pin_is_sr(_config.pin_le))  EPD_PIN_OUTPUT(_config.pin_le);
-  EPD_PIN_OUTPUT(_config.pin_cl);
-
-
-  packed_row_bytes = _config.width / 4;
+  // ---- Configure EPD control pins (all low: the panel is unpowered) ----
+  // GMOD and OE belong to the power driver.
+  const int16_t ctl_pins[] = { _config.pin_spv, _config.pin_ckv, _config.pin_sph,
+                               _config.pin_le, _config.pin_cl };
+  for (int16_t p : ctl_pins) { EPD_PIN_OUTPUT(p); EPD_PIN_LOW(p); }
 
   // Each row is sent with row_pad_bytes of trailing zeros: the panel's
   // source-driver shift chain has more stages than visible columns, so the
@@ -664,16 +730,22 @@ bool EPD_Painter::begin() {
   LCD_CAM.lcd_user.lcd_reset = 1;
   EPD_DELAY_US(100);
 
-  // ---- Configure LCD_CAM pixel clock ----
+  // ---- Configure LCD_CAM pixel clock (Config::pclk_hz) ----
+  int clk_div = 2, clk_pre = 2;
+  const uint32_t pclk = epd_pick_pclk(_config.pclk_hz, clk_div, clk_pre);
   LCD_CAM.lcd_clock.clk_en = 1;
-  LCD_CAM.lcd_clock.lcd_clk_sel = 2;
+  LCD_CAM.lcd_clock.lcd_clk_sel = 3;              // PLL_F160M
   LCD_CAM.lcd_clock.lcd_ck_out_edge = 0;
   LCD_CAM.lcd_clock.lcd_ck_idle_edge = 0;
   LCD_CAM.lcd_clock.lcd_clk_equ_sysclk = 0;
-  LCD_CAM.lcd_clock.lcd_clkm_div_num = 1;
+  LCD_CAM.lcd_clock.lcd_clkm_div_num = clk_div;
   LCD_CAM.lcd_clock.lcd_clkm_div_a = 0;
   LCD_CAM.lcd_clock.lcd_clkm_div_b = 0;
-  LCD_CAM.lcd_clock.lcd_clkcnt_n = 1;
+  LCD_CAM.lcd_clock.lcd_clkcnt_n = clk_pre - 1;
+  printf("[EPD_Painter] CL %lu Hz (asked %lu): %u x %u px, %d bus bytes/row, ~%lu us/pass\n",
+         (unsigned long)pclk, (unsigned long)_config.pclk_hz,
+         (unsigned)_config.width, (unsigned)_config.height, dma_row_bytes,
+         (unsigned long)((uint64_t)dma_row_bytes * _config.height * 1000000ULL / pclk));
 
   // ---- Configure LCD_CAM for i8080 8-bit parallel mode ----
   LCD_CAM.lcd_ctrl.lcd_rgb_mode_en = 0;
@@ -686,23 +758,50 @@ bool EPD_Painter::begin() {
   LCD_CAM.lcd_user.lcd_2byte_en = 0;
   LCD_CAM.lcd_user.lcd_dummy = 0;
   LCD_CAM.lcd_user.lcd_dummy_cyclelen = 0;
-  LCD_CAM.lcd_user.lcd_cmd = 0;
-  LCD_CAM.lcd_user.lcd_dout_cyclelen = dma_row_bytes - 1;
+  // SPH is a per-row start pulse: low for the row's FIRST byte only, then
+  // high. The source drivers are two cascaded 600-column chips; held low
+  // for the whole row (the old scheme), chip 1 restarts when it fills and
+  // swallows the right half of the row, and chip 2 never starts — the left
+  // half of the panel shows the right half of the image.
+  //
+  // LCD_CAM produces the pulse in hardware: SPH is routed to the i80 DC
+  // line, each row is a 1-cycle CMD phase carrying the row's first byte
+  // (DC low) followed by a DOUT phase DMA'd from byte 1 on (DC high), and
+  // DC idles high between rows. Exactly the Inkplate driver's
+  // hscan_start(), at bus speed.
+  LCD_CAM.lcd_misc.lcd_cd_idle_edge = 1;   // SPH idles high
+  LCD_CAM.lcd_misc.lcd_cd_cmd_set   = 1;   // low during CMD (first byte)
+  LCD_CAM.lcd_misc.lcd_cd_dummy_set = 0;
+  LCD_CAM.lcd_misc.lcd_cd_data_set  = 0;   // high for the rest of the row
+  LCD_CAM.lcd_user.lcd_cmd = 1;
+  LCD_CAM.lcd_user.lcd_cmd_2_cycle_en = 0;
+  LCD_CAM.lcd_user.lcd_dout_cyclelen = dma_row_bytes - 2;
   LCD_CAM.lcd_user.lcd_dout = 1;
   LCD_CAM.lcd_user.lcd_update = 1;
 
   // ---- Route 8-bit data bus pins using config ----
   for (int i = 0; i < 8; i++) {
     int8_t pin = _config.data_pins[i];
+    // Output enable + matrix route + IO_MUX to GPIO function, the esp_lcd
+    // i80 order. GPIO39-42 power up as the JTAG pads, so the IO_MUX select
+    // is not optional on this wiring.
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
     esp_rom_gpio_connect_out_signal(pin, kDataSignals[i], false, false);
-    epd_gpio_func_sel(GPIO_PIN_MUX_REG[pin]);
+    epd_gpio_func_sel(pin);
     gpio_set_drive_capability((gpio_num_t)pin, (gpio_drive_cap_t)3);
   }
 
   // ---- Route pixel clock to CL pin ----
+  gpio_set_direction((gpio_num_t)_config.pin_cl, GPIO_MODE_OUTPUT);
   esp_rom_gpio_connect_out_signal(_config.pin_cl, LCD_PCLK_IDX, false, false);
-  epd_gpio_func_sel(GPIO_PIN_MUX_REG[_config.pin_cl]);
+  epd_gpio_func_sel(_config.pin_cl);
   gpio_set_drive_capability((gpio_num_t)_config.pin_cl, (gpio_drive_cap_t)3);
+
+  // ---- SPH: LCD_CAM's DC line while powered (see lcd_cd_* above). The
+  // panel is off here and DC idles high, so it stays a low GPIO until
+  // powerOn() hands it over. ----
+  _sphToLcd(false);
+  gpio_set_drive_capability((gpio_num_t)_config.pin_sph, (gpio_drive_cap_t)3);
 
   // ---- Allocate GDMA channel ----
   gdma_channel_alloc_config_t dma_chan_config = {
@@ -731,6 +830,9 @@ bool EPD_Painter::begin() {
     heap_caps_aligned_alloc(16, dma_row_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
   dma_buffer2 = static_cast<uint8_t *>(
     heap_caps_aligned_alloc(16, dma_row_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+  dma_buffer0 = static_cast<uint8_t *>(
+    heap_caps_aligned_alloc(16, dma_row_bytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+  if (dma_buffer0) memset(dma_buffer0, 0x00, dma_row_bytes);
 
   // Zero both buffers once so the pad region stays neutral forever —
   // pixel converts only ever write the first packed_row_bytes.
@@ -740,29 +842,46 @@ bool EPD_Painter::begin() {
   dma_buffer = dma_buffer1;
 
   // ---- Set up DMA descriptors (one per buffer, stopped after each row) ----
+  // Byte 0 of each row is sent by the CMD phase (lcd_cmd_value, with SPH
+  // low), so the DMA starts at byte 1. GDMA TX from internal RAM has no
+  // alignment requirement on the buffer address.
   dma_desc2.dw0.suc_eof = 1;
-  dma_desc2.dw0.size = dma_row_bytes;
-  dma_desc2.dw0.length = dma_row_bytes;
-  dma_desc2.buffer = const_cast<uint8_t *>(dma_buffer2);
+  dma_desc2.dw0.size = dma_row_bytes - 1;
+  dma_desc2.dw0.length = dma_row_bytes - 1;
+  dma_desc2.buffer = const_cast<uint8_t *>(dma_buffer2 + 1);
   dma_desc2.next = nullptr;
 
   dma_desc1.dw0.suc_eof = 1;
-  dma_desc1.dw0.size = dma_row_bytes;
-  dma_desc1.dw0.length = dma_row_bytes;
-  dma_desc1.buffer = const_cast<uint8_t *>(dma_buffer1);
+  dma_desc1.dw0.size = dma_row_bytes - 1;
+  dma_desc1.dw0.length = dma_row_bytes - 1;
+  dma_desc1.buffer = const_cast<uint8_t *>(dma_buffer1 + 1);
   dma_desc1.next = nullptr;
 
+  dma_desc0.dw0.suc_eof = 1;
+  dma_desc0.dw0.size = dma_row_bytes - 1;
+  dma_desc0.dw0.length = dma_row_bytes - 1;
+  dma_desc0.buffer = const_cast<uint8_t *>(dma_buffer0 + 1);
+  dma_desc0.next = nullptr;
+
   // ---- Allocate packed 2bpp framebuffers ----
-  const size_t packed_size = (_config.width * _config.height) / 4;
+  const size_t packed_size = packedSize();
 
   // Prefer internal RAM for speed, fall back to PSRAM if the contiguous
   // internal-heap block isn't available (e.g. after WiFi has been brought
   // up first — leaves the heap fragmented).  PSRAM-backed fastbuffer is
   // slower for the per-pixel ops in epd_painter_ink_dual() but boots cleanly.
-  packed_fastbuffer = static_cast<uint8_t *>(
-    heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_INTERNAL));
+  //
+  // At 1200x825 the plane is 245 KB — most of the S3's internal heap. Only
+  // take it there if that still leaves room for the sweep lists below, the
+  // paint task's stack and whatever the sketch brings up afterwards (WiFi
+  // alone wants ~50 KB).
+  static constexpr size_t kInternalHeadroom = 96 * 1024;
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= packed_size + kInternalHeadroom)
+    packed_fastbuffer = static_cast<uint8_t *>(
+      heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_INTERNAL));
   if (!packed_fastbuffer) {
-    log_w("[EPD] packed_fastbuffer: internal alloc failed, retrying in PSRAM");
+    printf("[EPD_Painter] packed_fastbuffer in PSRAM (internal heap: %u largest block)\n",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     packed_fastbuffer = static_cast<uint8_t *>(
       heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
   }
@@ -795,41 +914,26 @@ bool EPD_Painter::begin() {
   memset(dec_train, 0, sizeof(dec_train));
   if (!(dec_todo && dec_sweeps && dec_nsweeps)) return false;
 
-  // ── Create the power driver for this board ──
-  if (_config.power.tps_addr != -1) {
-    printf("\n── PowerCtl Init ──\n");
-    auto* pc = new epd_painter_powerctl();
-    if (!pc->begin(_config)) {
-      printf("FATAL: powerctl init failed!\n");
-      while (1) EPD_DELAY_MS(1000);
-    }
-    _powerDriver = pc;
-  } else if (_config.shift.data >= 0) {
-    if (_config.shift.driver == Shift::H716) {
-      auto* h716 = new EPD_H716PowerDriver();
-      h716->begin(_config.shift);
-      _powerDriver = h716;
-    } else {
-      auto* h752 = new epd_painter_powerctl_74HCT4094D();
-      h752->begin(_config);
-      _powerDriver = h752;
-    }
-    _shiftReg = _powerDriver->isrController();
-  } else {
-    _powerDriver = new EPD_GpioPowerDriver(_config.pin_oe, _config.pin_pwr);
+  if (!(dma_buffer1 && dma_buffer2 && dma_buffer0 && packed_fastbuffer && packed_screenbuffer &&
+        packed_paintbuffer && packed_lightbuffer && bitmask && bitmask_light)) {
+    printf("[EPD_Painter] buffer allocation failed\n");
+    return false;
+  }
+  memset(packed_screenbuffer, 0, packed_size);
+  memset(packed_paintbuffer,  0, packed_size);
+
+  // ── TPS65186 + PCAL6416A power driver ──
+  _powerDriver = new epd_painter_powerctl();
+  if (!_powerDriver->begin(_config)) {
+    printf("[EPD_Painter] power driver init failed — check I2C SDA=%d SCL=%d\n",
+           _config.i2c.sda, _config.i2c.scl);
+    return false;
   }
 
-  // ── Create per-pin drivers (GPIO or SR, determined by preset encoding) ──
-  auto make_pin = [this](int16_t p) -> EPD_PinDriver* {
-    if (epd_pin_is_sr(p)) return new EPD_SRPin(_shiftReg, epd_pin_sr_bit(p));
-    return new EPD_GpioPin(uint8_t(p));
-  };
-  _pin_spv = make_pin(_config.pin_spv);
-  _pin_ckv = make_pin(uint8_t(_config.pin_ckv));
-  _pin_le  = make_pin(_config.pin_le);
-  _pin_sph = make_pin(uint8_t(_config.pin_sph));
-
-  if (!(dma_buffer && packed_fastbuffer && packed_screenbuffer)) return false;
+  _pin_spv = new EPD_GpioPin(uint8_t(_config.pin_spv));
+  _pin_ckv = new EPD_GpioPin(uint8_t(_config.pin_ckv));
+  _pin_le  = new EPD_GpioPin(uint8_t(_config.pin_le));
+  _pin_sph = new EPD_GpioPin(uint8_t(_config.pin_sph));
 
   _paint_active_sem = xSemaphoreCreateBinary();
   xSemaphoreGive(_paint_active_sem); 
@@ -934,6 +1038,7 @@ void EPD_Painter::_pushRow() {
   if (dma_buffer == dma_buffer1) { desc = &dma_desc1; dma_buffer = dma_buffer2; }
   else                           { desc = &dma_desc2; dma_buffer = dma_buffer1; }
   LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
   gdma_start(dma_chan, (intptr_t)desc);
   LCD_CAM.lcd_user.lcd_start = 1;
   spin = 0;
@@ -974,14 +1079,9 @@ void EPD_Painter::powerOn() {
     EPD_DELAY_MS(5);
     memset(dma_buffer1, 0x00, packed_row_bytes);
     memset(dma_buffer2, 0x00, packed_row_bytes);
-    // Re-arm the source driver's line-start logic. SPH is held asserted
-    // (low) for the panel's whole powered life, so its position state
-    // machine is never re-synchronised after a rail ramp — the one thing
-    // a data flush can't fix. Deassert for a full row of clocks to sweep
-    // the start token out, then reassert so it re-enters at column 0.
-    _pin_sph->set(true);   // deassert: no start token while we clock
-    _pushRow();
-    _pin_sph->set(false);  // reassert: token re-enters at column 0
+    // SPH back to LCD_CAM: every pushed row now carries its own start
+    // pulse, so the flush also re-synchronises the source drivers.
+    _sphToLcd(true);
     _pushRow();
     _pushRow();
   }
@@ -997,7 +1097,163 @@ void EPD_Painter::powerOff() {
 #ifdef EPD_DEBUG_REGISTERS
   printf("[EPD] panel power OFF\n");
 #endif
+  // Every scan line low before V3P3 goes: a line left high back-powers the
+  // unpowered source and gate drivers through their protection diodes. The
+  // data bus and CL already idle low (row pads are zero, CL idles low).
+  _pin_le->set(false);
+  _pin_ckv->set(false);
+  _sphToLcd(false);       // LCD_CAM's DC idles HIGH — take SPH back first
+  _pin_sph->set(false);
+  _pin_spv->set(false);
   _powerDriver->powerOff();
+}
+
+// SPH between LCD_CAM's DC output (panel powered: per-row start pulse) and
+// a plain GPIO (panel off: must sit low, DC would idle it high).
+void EPD_Painter::_sphToLcd(bool lcd) {
+  const int pin = _config.pin_sph;
+  if (lcd) {
+    esp_rom_gpio_connect_out_signal(pin, LCD_DC_IDX, false, false);
+  } else {
+    esp_rom_gpio_connect_out_signal(pin, SIG_GPIO_OUT_IDX, false, false);
+  }
+}
+
+int8_t EPD_Painter::readTemperature() {
+  return _powerDriver ? _powerDriver->readTemperature() : 0;
+}
+
+int EPD_Painter::readVcomMv() {
+  return _powerDriver ? _powerDriver->readVcomMv() : 0;
+}
+
+bool EPD_Painter::setVcomMv(int mv, bool persist) {
+  return _powerDriver ? _powerDriver->setVcomMv(mv, persist) : false;
+}
+
+// =============================================================================
+// _endPass()
+// =============================================================================
+// sendRow() latches the row transmitted BEFORE it, so the last row of a pass
+// is still sitting in the source chain when the pass loop ends — and the
+// next pass's first row overwrites it unlatched. One more (float) row send
+// latches it and clocks the gate onto its line, where it holds through the
+// inter-pass settle like every other row holds through the pass.
+void EPD_Painter::_endPass() {
+  memset(dma_buffer, 0x00, packed_row_bytes);
+  sendRow(false);
+}
+
+// =============================================================================
+// _dischargeColumns() — Config::discharge_rows
+// =============================================================================
+// Called just before sendRow(n). The source outputs carry row n-2's drive
+// on its gate line, the chain holds row n-1 (the buffer dma_buffer is NOT
+// pointing at), and dma_buffer holds row n. Gates off, shift and latch a
+// float row so every column is pulled back to neutral with no line open,
+// then shift row n-1 back in; that transfer is the discharge time.
+// sendRow(n) then latches row n-1 and opens its line as usual.
+void EPD_Painter::_txRow(dma_descriptor_t *desc) {
+  while (LCD_CAM.lcd_user.lcd_start) {}
+  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
+  gdma_start(dma_chan, (intptr_t)desc);
+  EPD_DELAY_US(1);                       // let GDMA prime the FIFO
+  LCD_CAM.lcd_user.lcd_start = 1;
+  while (LCD_CAM.lcd_user.lcd_start) {}
+}
+
+void EPD_Painter::_dischargeColumns() {
+  dma_descriptor_t *reload = (dma_buffer == dma_buffer1) ? &dma_desc2 : &dma_desc1;
+  while (LCD_CAM.lcd_user.lcd_start) {}
+  _pin_ckv->set(false);
+  _txRow(&dma_desc0);
+  _pin_le->set(true);
+  _pin_le->set(false);
+  _txRow(reload);
+}
+
+// =============================================================================
+// _setBusRowBytes()
+// =============================================================================
+// Bytes clocked per row: byte 0 rides the CMD phase, the rest the DMA'd
+// DOUT phase. begin() sets the full row; skip_idle_cols shortens it for a
+// frame's passes and the pass loop restores it before the closing sweep.
+void EPD_Painter::_setBusRowBytes(int n) {
+  const int full = packed_row_bytes + _config.row_pad_bytes;
+  if (n > full) n = full;
+  if (n < 2) n = 2;
+  while (LCD_CAM.lcd_user.lcd_start) {}
+  dma_desc1.dw0.size = dma_desc1.dw0.length = n - 1;
+  dma_desc2.dw0.size = dma_desc2.dw0.length = n - 1;
+  dma_desc0.dw0.size = dma_desc0.dw0.length = n - 1;
+  LCD_CAM.lcd_user.lcd_dout_cyclelen = n - 2;
+  LCD_CAM.lcd_user.lcd_update = 1;
+}
+
+// =============================================================================
+// _pack()
+// =============================================================================
+void EPD_Painter::_pack(const uint8_t *fb, uint8_t *dst, bool grey16, int r0, int r1) const {
+  const int W = _config.width, H = _config.height;
+  const int prb = packed_row_bytes;
+  if (r1 < 0 || r1 >= H) r1 = H - 1;
+  if (r0 < 0) r0 = 0;
+  if (_config.rotation == Rotation::ROTATION_CW) { r0 = 0; r1 = H - 1; }
+
+  if (!grey16) {
+    const int used = W / 4;
+    if (_config.rotation == Rotation::ROTATION_CW) {
+      compact_pixels_rotated_cw(fb, dst, H, W, prb);
+    } else if (_config.rotation == Rotation::ROTATION_180) {
+      // Pack the source row forward with the SIMD packer, then reverse it a
+      // byte at a time through a table that also reverses the four 2-bit
+      // fields inside each byte. Replaces a per-pixel C walk that read the
+      // PSRAM canvas backwards one byte at a time.
+      static const struct Rev2 {
+        uint8_t t[256];
+        Rev2() {
+          for (int x = 0; x < 256; x++)
+            t[x] = (uint8_t)(((x & 3) << 6) | (((x >> 2) & 3) << 4) |
+                             (((x >> 4) & 3) << 2) | ((x >> 6) & 3));
+        }
+      } rev2;
+      alignas(16) uint8_t tmp[512];          // >= packed_row_bytes (begin() caps at 512)
+      for (int r = r0; r <= r1; r++) {
+        epd_painter_compact_pixels(fb + (size_t)(H - 1 - r) * W, tmp, W);
+        uint8_t *d = dst + (size_t)r * prb;
+        for (int b = 0; b < used; b++) d[b] = rev2.t[tmp[used - 1 - b]];
+      }
+    } else if (used == prb) {
+      epd_painter_compact_pixels(fb + (size_t)r0 * W, dst + (size_t)r0 * prb,
+                                 (uint32_t)W * (r1 - r0 + 1));
+    } else {
+      for (int r = r0; r <= r1; r++)
+        epd_painter_compact_pixels(fb + (size_t)r * W, dst + (size_t)r * prb, W);
+    }
+    if (used != prb)
+      for (int r = r0; r <= r1; r++) memset(dst + (size_t)r * prb + used, 0, prb - used);
+    return;
+  }
+
+  // 16-grey: 8bpp level codes (0..15) -> 4bpp, first pixel in the high nibble.
+  const int prb4 = prb * 2, used4 = W / 2;
+  for (int r = r0; r <= r1; r++) {
+    uint8_t *d = dst + (size_t)r * prb4;
+    if (_config.rotation == Rotation::ROTATION_CW) {
+      // panel (col c, row r) = canvas (x = H-1-r, y = c); canvas is H wide.
+      const uint8_t *s = fb + (H - 1 - r);
+      for (int c = 0; c < W; c += 2)
+        d[c >> 1] = (uint8_t)(((s[(size_t)c * H] & 15) << 4) | (s[(size_t)(c + 1) * H] & 15));
+    } else if (_config.rotation == Rotation::ROTATION_180) {
+      const uint8_t *s = fb + (size_t)(H - r) * W - 1;
+      for (int b = 0; b < used4; b++, s -= 2)
+        d[b] = (uint8_t)(((s[0] & 15) << 4) | (s[-1] & 15));
+    } else {
+      compact_pixels16(fb + (size_t)r * W, d, W);
+    }
+    memset(d + used4, 0, prb4 - used4);
+  }
 }
 
 
@@ -1008,12 +1264,6 @@ void EPD_Painter::powerOff() {
 // =============================================================================
 // paint()
 // =============================================================================
-// 16-grey pack: 8bpp level codes (0..15) → 4bpp, first pixel in the high
-// nibble. Phase C supports ROTATION_0 only.
-static void compact_pixels16(const uint8_t *src, uint8_t *dst, uint32_t n) {
-  for (uint32_t i = 0; i < n; i += 2)
-    *dst++ = (uint8_t)(((src[i] & 15) << 4) | (src[i + 1] & 15));
-}
 
 void EPD_Painter::paint(uint8_t *framebuffer) {
   xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
@@ -1021,19 +1271,8 @@ void EPD_Painter::paint(uint8_t *framebuffer) {
 #ifdef EPD_ASM_TIMING
   const int64_t _cp_t0 = esp_timer_get_time();
 #endif
-  if (_grey16) {
-    if (_config.rotation != Rotation::ROTATION_0) {
-      static bool warned = false;
-      if (!warned) { warned = true; printf("[EPD_Painter] 16-grey paint(): only ROTATION_0 is supported (phase C)\n"); }
-    }
-    compact_pixels16(framebuffer, packed4_paintbuffer, (uint32_t)_config.width * _config.height);
-  }
-  else if (_config.rotation == Rotation::ROTATION_CW)
-    compact_pixels_rotated_cw(framebuffer, packed_paintbuffer, _config.height, _config.width);
-  else if (_config.rotation == Rotation::ROTATION_180)
-    compact_pixels_180(framebuffer, packed_paintbuffer, _config.width * _config.height);
-  else
-    epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+  _pr_lo = 0; _pr_hi = _config.height - 1;
+  _pack(framebuffer, _grey16 ? packed4_paintbuffer : packed_paintbuffer, _grey16);
 #ifdef EPD_ASM_TIMING
   printf("[paint] compact_pixels: %lld us\n", esp_timer_get_time() - _cp_t0);
 #endif
@@ -1048,6 +1287,36 @@ void EPD_Painter::paint(uint8_t *framebuffer) {
 }
 
 // =============================================================================
+// paintRows() — paint() limited to the canvas rows that changed
+// =============================================================================
+void EPD_Painter::paintRows(uint8_t *framebuffer, int y0, int y1) {
+  const int H = _config.height;
+  if (y0 > y1) { const int t = y0; y0 = y1; y1 = t; }
+  if (y0 < 0) y0 = 0;
+  if (y1 > H - 1) y1 = H - 1;
+  // Canvas rows -> physical rows. CW turns canvas rows into panel columns,
+  // so it (and the engines without a row-limited discovery) takes it all.
+  int lo = y0, hi = y1;
+  if (_config.rotation == Rotation::ROTATION_180) { lo = H - 1 - y1; hi = H - 1 - y0; }
+  if (_config.rotation == Rotation::ROTATION_CW || _grey16 ||
+      _decision_engine || _decision_direct || _has_template) { lo = 0; hi = H - 1; }
+
+  // Wait for the PREVIOUS submission to be picked up, not this one: the
+  // frame is packed out of the canvas before returning, so the caller can
+  // draw the next one while the paint task compares and drives this one.
+  // paint() waits after instead, which puts the compare on the caller's
+  // critical path.
+  while (paintStage == 2) {
+    vTaskDelay(1);
+  }
+  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  _pr_lo = lo; _pr_hi = hi;
+  _pack(framebuffer, _grey16 ? packed4_paintbuffer : packed_paintbuffer, _grey16, lo, hi);
+  paintStage = 2;
+  xSemaphoreGive(_paint_buffer_sem);
+}
+
+// =============================================================================
 // paintPacked() — like paint() but skips compaction; buffer is already 2bpp.
 // line_repeat > 1: `packed` holds height/line_repeat rows, each driven
 // line_repeat times (vertical pixel doubling for reduced-bandwidth streams).
@@ -1058,8 +1327,9 @@ void EPD_Painter::paintPacked(const uint8_t* packed, int line_repeat) {
     return;
   }
   xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  _pr_lo = 0; _pr_hi = _config.height - 1;
   if (line_repeat <= 1) {
-    memcpy(packed_paintbuffer, packed, (_config.width * _config.height) / 4);
+    memcpy(packed_paintbuffer, packed, packedSize());
   } else {
     uint8_t* dst = packed_paintbuffer;
     const int src_rows = _config.height / line_repeat;
@@ -1089,6 +1359,7 @@ void EPD_Painter::unpaintPacked(const uint8_t* packed) {
     return;
   }
   xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  _pr_lo = 0; _pr_hi = _config.height - 1;
   memcpy(packed_screenbuffer, packed, packed_row_bytes * _config.height);
   memset(packed_paintbuffer,  0x00,  packed_row_bytes * _config.height);
   paintStage = 2;
@@ -1107,14 +1378,8 @@ void EPD_Painter::paintLater(uint8_t *framebuffer) {
 #ifdef EPD_ASM_TIMING
     const int64_t _cpl_t0 = esp_timer_get_time();
 #endif
-    if (_grey16)
-      compact_pixels16(framebuffer, packed4_paintbuffer, (uint32_t)_config.width * _config.height);
-    else if (_config.rotation == Rotation::ROTATION_CW)
-      compact_pixels_rotated_cw(framebuffer, packed_paintbuffer, _config.height, _config.width);
-    else if (_config.rotation == Rotation::ROTATION_180)
-      compact_pixels_180(framebuffer, packed_paintbuffer, _config.width * _config.height);
-    else
-      epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    _pr_lo = 0; _pr_hi = _config.height - 1;
+    _pack(framebuffer, _grey16 ? packed4_paintbuffer : packed_paintbuffer, _grey16);
 #ifdef EPD_ASM_TIMING
     printf("[paintLater] compact_pixels: %lld us\n", esp_timer_get_time() - _cpl_t0);
 #endif
@@ -1132,7 +1397,9 @@ void EPD_Painter::_paint_task_entry(void *arg) {
 }
 
 void EPD_Painter::_paint_task_body() {
+  int64_t prof_last_t0 = 0;
   for (;;) {
+    const int64_t prof_wait_t0 = esp_timer_get_time();
     if (paintStage==0){
       xSemaphoreGive(_paint_active_sem);
       while(paintStage==0){
@@ -1173,8 +1440,7 @@ void EPD_Painter::_paint_task_body() {
         printf("[EPD_Painter] template overlay ACTIVE (data=%p mask=%p)\n",
                tpl_data, tpl_mask);
       }
-      const size_t words =
-          (size_t)_config.width * _config.height / (_grey16 ? 2 : 4) / 4;
+      const size_t words = packedSize() * (_grey16 ? 2 : 1) / 4;
       uint32_t *p = (uint32_t *)(_grey16 ? packed4_paintbuffer
                                          : packed_paintbuffer);
       const uint32_t *t = (const uint32_t *)tpl_data;
@@ -1185,10 +1451,30 @@ void EPD_Painter::_paint_task_body() {
 #ifdef EPD_ASM_TIMING
     const int64_t _ink_t0 = esp_timer_get_time();
 #endif
+    int64_t prof_idle_us = 0, prof_disc_us = 0;
     if (_profile) {
       _prof_rows = 0; _prof_rowloop_us = 0; _prof_cycle_t0 = esp_timer_get_time();
       _prof_merged = 0;
+      prof_idle_us = _prof_cycle_t0 - prof_wait_t0;
     }
+    // Black and white mode: snap the new frame to levels 0 and 3 by copying
+    // each pixel's high bit over its low bit (0,1 -> 0; 2,3 -> 3). Done here
+    // so paint(), paintLater() and paintPacked() all get it, and so the
+    // screen state only ever records what the glass actually shows.
+    // Rows this submission may have changed (paintRows(); else all). The
+    // rest are known identical to the screen and skipped by the BW snap
+    // and the 4-level discovery below.
+    const int pr_lo = _pr_lo < 0 ? 0 : _pr_lo;
+    const int pr_hi = _pr_hi >= _config.height ? _config.height - 1 : _pr_hi;
+    if (!_grey16 && _config.quality == Quality::QUALITY_BW) {
+      uint32_t *p = (uint32_t *)(packed_paintbuffer + (size_t)pr_lo * packed_row_bytes);
+      const size_t words = (size_t)(pr_hi - pr_lo + 1) * packed_row_bytes / 4;
+      for (size_t i = 0; i < words; i++) {
+        const uint32_t hi = p[i] & 0xAAAAAAAAu;
+        p[i] = hi | (hi >> 1);
+      }
+    }
+
     uint32_t any_work = 0;
     const LineSweep *sweep_list = dec_sweeps;
     int sweep_stride = DEC_MAX_SWEEPS;
@@ -1210,7 +1496,9 @@ void EPD_Painter::_paint_task_body() {
       any_work = _decision_discover();
       _decision_batch_compat();
     } else {
-      for (int row = 0; row < _config.height; row++) {
+      for (int row = 0; row < pr_lo; row++) bitmask[row] = bitmask_light[row] = 0;
+      for (int row = pr_hi + 1; row < _config.height; row++) bitmask[row] = bitmask_light[row] = 0;
+      for (int row = pr_lo; row <= pr_hi; row++) {
         const uint8_t *pb_row = packed_paintbuffer + row * packed_row_bytes;
         uint8_t *fbD_row = packed_fastbuffer  + row * packed_row_bytes;
         uint8_t *fbL_row = packed_lightbuffer + row * packed_row_bytes;
@@ -1228,6 +1516,7 @@ void EPD_Painter::_paint_task_body() {
     printf("[paint_task] ink discovery (all rows): %lld us\n", esp_timer_get_time() - _ink_t0);
 #endif
     xSemaphoreGive(_paint_buffer_sem);
+    if (_profile) prof_disc_us = esp_timer_get_time() - _prof_cycle_t0;
 
     paintStage-=1;
 
@@ -1246,8 +1535,18 @@ void EPD_Painter::_paint_task_body() {
     int wf_len;
 
     const Waveforms &wf = _config.waveforms;
+    // QUALITY_BW trains: a plain darken (1) or whiten (2) run per level.
+    // Levels 1 and 2 only reach the glass from a frame painted in another
+    // quality (or unpaintPacked()); full runs settle those to black/white.
+    uint8_t bw_dk[3 * 32], bw_lt[3 * 32];
 
-    if (_config.quality == Quality::QUALITY_FAST) {
+    if (_config.quality == Quality::QUALITY_BW) {
+      wf_len = _config.bw_passes < 1 ? 1 : _config.bw_passes > 32 ? 32 : _config.bw_passes;
+      memset(bw_dk, 1, 3 * wf_len);
+      memset(bw_lt, 2, 3 * wf_len);
+      lt_wf = bw_lt;
+      dk_wf = bw_dk;
+    } else if (_config.quality == Quality::QUALITY_FAST) {
       lt_wf = &wf.fast_lighter[0][0];
       dk_wf = &wf.fast_darker[0][0];
       wf_len = 7;
@@ -1382,6 +1681,36 @@ void EPD_Painter::_paint_task_body() {
     { extern int64_t g_rp_wait_us, g_rp_pins_us; extern uint32_t g_rp_rows;
       g_rp_wait_us = g_rp_pins_us = 0; g_rp_rows = 0; }
 #endif
+    // Row window: only rows r0..r1 carry work this frame. Rows above r0 are
+    // stepped past with bare gate clocks, and the pass ends at r1 — the next
+    // pass restarts the gate at the top anyway. Rows outside the window are
+    // never latched, so they keep the float the last closing sweep left.
+    int r0 = 0, r1 = _config.height - 1;
+    if (_config.skip_idle_rows) {
+      while (r0 < r1 && !dec_nsweeps[r0]) r0++;
+      while (r1 > r0 && !dec_nsweeps[r1]) r1--;
+    }
+
+    // Column cut-off: the last chunk with work in any row of the window
+    // (mask bit 31 = chunk 0). One length for the whole frame.
+    const int full_row_bytes = packed_row_bytes + _config.row_pad_bytes;
+    int row_bytes = full_row_bytes;
+    if (_config.skip_idle_cols) {
+      uint32_t cols = 0;
+      for (int row = r0; row <= r1; row++) {
+        const LineSweep *ls = &sweep_list[row * sweep_stride];
+        for (int s = 0; s < dec_nsweeps[row]; s++) cols |= ls[s].mask;
+      }
+      if (cols) row_bytes = (32 - __builtin_ctz(cols)) * 16 + _config.row_pad_bytes;
+      if (row_bytes < full_row_bytes) _setBusRowBytes(row_bytes);
+    }
+
+    // bw_hold_black: every visible chunk (mask bit 31 = chunk 0).
+    const bool bw_hold = _config.bw_hold_black && !_grey16 &&
+                         _config.quality == Quality::QUALITY_BW;
+    const int hold_chunks = packed_row_bytes / 16;
+    const uint32_t hold_mask = hold_chunks >= 32 ? 0xFFFFFFFFu : ~(0xFFFFFFFFu >> hold_chunks);
+
     for (uint8_t pass = 0; pass < wf_len; pass++) {
       const int64_t pass_t0 = esp_timer_get_time();
       // Per-decision broadcast bytes for this pass: code * 0x55 replicates
@@ -1416,7 +1745,10 @@ void EPD_Painter::_paint_task_body() {
         bcast[id] = (uint8_t)(code * 0x55);
       }
 
-      for (int row = 0; row < _config.height; row++) {
+      for (int row = 0; row < r0; row++) _skipRow(row == 0);
+      // discharge_rows: does the data of row-1 / row-2 drive anything?
+      bool drv1 = false, drv2 = false;
+      for (int row = r0; row <= r1; row++) {
         if (_profile && pass == 0 && (bitmask[row] & bitmask_light[row])) _prof_merged++;
 #ifdef EPD_ASM_TIMING
         const int64_t _conv_t0 = esp_timer_get_time();
@@ -1442,12 +1774,37 @@ void EPD_Painter::_paint_task_body() {
           else
             epd_painter_convert_packed_fb_to_ink_or(ls[s].plane_row, dma_buffer, packed_row_bytes, tbl, ls[s].mask);
         }
+        // bw_hold_black: unchanged blacks (screen 3; pixels whitening this
+        // frame are already recorded as 0) get darken too. OR onto a
+        // darkening pixel leaves it 01.
+        if (bw_hold) {
+          static const uint8_t hold_tbl[3] = { 0x55, 0x00, 0x00 };   // slot 3, 2, 1
+          epd_painter_convert_packed_fb_to_ink_or(packed_screenbuffer + (size_t)row * packed_row_bytes,
+                                                  dma_buffer, packed_row_bytes, hold_tbl, hold_mask);
+        }
 #ifdef EPD_ASM_TIMING
         _conv_total += esp_timer_get_time() - _conv_t0;
 #endif
+        bool drv0 = false;
+        if (_config.discharge_rows) {
+          const uint32_t *w = (const uint32_t *)dma_buffer;
+          uint32_t acc = 0;
+          if (_config.discharge_rows == 1) {
+            for (int i = 0; i < packed_row_bytes / 4; i++)
+              acc |= w[i] & 0xAAAAAAAAu & ~(w[i] << 1);    // code 10 = whiten
+          } else {
+            for (int i = 0; i < packed_row_bytes / 4; i++) acc |= w[i];
+          }
+          drv0 = acc != 0;
+          if (drv2 && row != 0) _dischargeColumns();
+        }
         sendRow(row == 0, false, false);
+        drv2 = drv1; drv1 = drv0;
         if (_profile) _prof_rows++;
       }
+      if (drv2) _dischargeColumns();
+      _endPass();
+      if (r1 < _config.height - 1) _flushGate(r1);
       if (_profile) _prof_rowloop_us += esp_timer_get_time() - pass_t0;
 
      if (_grey16) {
@@ -1493,16 +1850,22 @@ void EPD_Painter::_paint_task_body() {
           if (actual > _g16_period_max) _g16_period_max = actual;
         }
 #endif
-      } else if (_config.quality == Quality::QUALITY_HIGH) {
+      } else {
+        // A pass over a small row window is short, and pass length IS the
+        // dose each drive code delivers. Pad to min_pass_us so a few changed
+        // lines are not driven by a fraction of what the tables assume.
+        if (_config.min_pass_us > 0)
+          epd_wait_until_us(pass_t0 + _config.min_pass_us);
+
         // 4-level keeps its "fixed wait after the row loop" semantics - it
         // has no constant-period model and its tables are calibrated to
         // that - but the wait itself is now honest to the microsecond
-        // rather than to a tick.
-        epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_high);
-      } else if (_config.quality == Quality::QUALITY_NORMAL) {
-        epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_normal);
+        // rather than to a tick. QUALITY_FAST and QUALITY_BW = no wait.
+        if (_config.quality == Quality::QUALITY_HIGH)
+          epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_high);
+        else if (_config.quality == Quality::QUALITY_NORMAL)
+          epd_wait_until_us(esp_timer_get_time() + _config.pass_gap_us_normal);
       }
-      // QUALITY_FAST = No delay.
     }
 #ifdef EPD_GREY16_PASS_TIMING
     if (_grey16) {
@@ -1529,30 +1892,40 @@ void EPD_Painter::_paint_task_body() {
                (long long)g_rp_pins_us, (double)g_rp_pins_us / g_rp_rows); }
 #endif
 
-    if (_profile) {
-      // One line per DRIVE CYCLE. "passes" is the waveform length actually
-      // run (extended by the longest direct train in play); "rows" is
-      // row-sends, which should be exactly passes x height — anything more
-      // means a row was driven twice. "merged" counts lines carrying BOTH
-      // darkening and lightening work: those are erase-and-paint happening
-      // together in the SAME transmission, not a second cycle.
-      const int64_t total = esp_timer_get_time() - _prof_cycle_t0;
-      printf("[paintprof] cycle: %d passes, %lu rows (%lu expected), "
-             "rowloop %lld ms, settle %lld ms, total %lld ms, merged %lu/%d\n",
-             (int)wf_len, (unsigned long)_prof_rows,
-             (unsigned long)((uint32_t)wf_len * _config.height),
-             (long long)(_prof_rowloop_us / 1000),
-             (long long)((total - _prof_rowloop_us) / 1000),
-             (long long)(total / 1000),
-             (unsigned long)_prof_merged, _config.height);
-    }
-
     vTaskDelay(1);  // yield once per frame: feeds WDT and lets application task run
+    const int64_t _prof_close_t0 = esp_timer_get_time();
 
+    // Closing sweep: float every row the passes drove, so none is left
+    // holding its last drive code. Only the window needs it. Always full
+    // width: it also zeroes the source positions a column cut-off skipped.
+    if (row_bytes < full_row_bytes) _setBusRowBytes(full_row_bytes);
     memset(dma_buffer1, 0x00, packed_row_bytes);
     memset(dma_buffer2, 0x00, packed_row_bytes);
-    for (int row = 0; row < _config.height; ++row) {
-      sendRow(row == 0, row == _config.height - 1);
+    for (int row = 0; row < r0; ++row) _skipRow(row == 0);
+    for (int row = r0; row <= r1; ++row) {
+      sendRow(row == 0, row == r1);
+    }
+    if (r1 < _config.height - 1) _flushGate(r1);
+
+    if (_profile) {
+      // One line per DRIVE CYCLE, from picking the frame up to the end of
+      // the closing sweep. rows = row sends in the passes (passes x window).
+      // wait = idle before this frame arrived; compare = discovery (pack is
+      // on the caller's side); passes = row loops incl. skips and flushes;
+      // gaps = pass padding and settle; close = closing sweep. period = start
+      // to start of consecutive cycles, i.e. the real frame interval here.
+      const int64_t now = esp_timer_get_time();
+      const int64_t total = now - _prof_cycle_t0;
+      const int64_t close = now - _prof_close_t0;
+      const int64_t gaps = total - prof_disc_us - _prof_rowloop_us - close;
+      printf("[paintprof] %d passes, %lu rows, %d/%d B/row | wait %lld  compare %lld  "
+             "passes %lld  gaps %lld  close %lld  = %lld ms | period %lld ms\n",
+             (int)wf_len, (unsigned long)_prof_rows, row_bytes, full_row_bytes,
+             (long long)(prof_idle_us / 1000), (long long)(prof_disc_us / 1000),
+             (long long)(_prof_rowloop_us / 1000), (long long)(gaps / 1000),
+             (long long)(close / 1000), (long long)(total / 1000),
+             (long long)(prof_last_t0 ? (_prof_cycle_t0 - prof_last_t0) / 1000 : 0));
+      prof_last_t0 = _prof_cycle_t0;
     }
 
     _sb_guard_update();
@@ -1584,11 +1957,9 @@ void EPD_Painter::_sb_guard_update() {
   if (!_sb_guard_on) return;
   const uint8_t *sb = _grey16 ? packed4_screenbuffer : packed_screenbuffer;
   if (!sb) return;
-  const size_t bytes =
-      (size_t)_config.width * _config.height / (_grey16 ? 2 : 4);
+  const size_t bytes = packedSize() * (_grey16 ? 2 : 1);
   if (!_sb_shadow)
-    _sb_shadow = (uint8_t *)heap_caps_malloc(
-        (size_t)_config.width * _config.height / 2, MALLOC_CAP_SPIRAM);
+    _sb_shadow = (uint8_t *)heap_caps_malloc(packedSize() * 2, MALLOC_CAP_SPIRAM);
   if (!_sb_shadow) { _sb_guard_on = false; return; }
   memcpy(_sb_shadow, sb, bytes);
   _sb_guard_valid = true;
@@ -1598,8 +1969,7 @@ void EPD_Painter::_sb_guard_check() {
   if (!_sb_guard_on || !_sb_guard_valid || !_sb_shadow) return;
   const uint8_t *sb = _grey16 ? packed4_screenbuffer : packed_screenbuffer;
   if (!sb) return;
-  const size_t bytes =
-      (size_t)_config.width * _config.height / (_grey16 ? 2 : 4);
+  const size_t bytes = packedSize() * (_grey16 ? 2 : 1);
   if (memcmp(_sb_shadow, sb, bytes) == 0) return;
 
   _sb_guard_hits++;
@@ -1631,7 +2001,7 @@ void EPD_Painter::_sb_guard_check() {
 }
 
 void EPD_Painter::clearBuffers() {
-  const size_t packed_bytes = (size_t)_config.width * _config.height / 4;
+  const size_t packed_bytes = packedSize();
   if (packed_fastbuffer)   memset(packed_fastbuffer,   0, packed_bytes);
   if (packed_screenbuffer) memset(packed_screenbuffer, 0, packed_bytes);
   if (packed_paintbuffer)  memset(packed_paintbuffer,  0, packed_bytes);
@@ -1657,7 +2027,7 @@ void EPD_Painter::clearBuffers() {
 int EPD_Painter::computeDirtyRects(Rect* out_rects, int max_rects, int tolerance) const {
     if (!packed_screenbuffer || !packed_paintbuffer || max_rects <= 0) return 0;
 
-    const int prb = _config.width / 4;
+    const int prb = packed_row_bytes;
     const int H   = _config.height;
 
     int  count   = 0;
@@ -1726,12 +2096,7 @@ int EPD_Painter::computeDirtyRects(Rect* out_rects, int max_rects, int tolerance
 void EPD_Painter::clearDirtyAreas(uint8_t* framebuffer, int tolerance, ClearMode mode) {
     // Compact 8bpp framebuffer into packed_paintbuffer (same as paint()).
     xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
-    if (_config.rotation == Rotation::ROTATION_CW)
-        compact_pixels_rotated_cw(framebuffer, packed_paintbuffer, _config.height, _config.width);
-    else if (_config.rotation == Rotation::ROTATION_180)
-        compact_pixels_180(framebuffer, packed_paintbuffer, _config.width * _config.height);
-    else
-        epd_painter_compact_pixels(framebuffer, packed_paintbuffer, _config.width * _config.height);
+    _pack(framebuffer, packed_paintbuffer, false);
     xSemaphoreGive(_paint_buffer_sem);
 
     Rect rects[32];
@@ -1754,7 +2119,7 @@ void EPD_Painter::clear(const Rect* rects, int num_rects, ClearMode mode) {
 
   PanelPowerGuard guard(*this);
 
-  const int prb = _config.width / 4;  // packed row bytes
+  const int prb = packed_row_bytes;
 
   // Paint white into the affected area of the paint buffer. In 16-grey
   // mode the paint task reads the 4bpp paintbuffer, so whiten that too.
@@ -1777,6 +2142,7 @@ void EPD_Painter::clear(const Rect* rects, int num_rects, ClearMode mode) {
       }
     }
   }
+  _pr_lo = 0; _pr_hi = _config.height - 1;
   paintStage = 1;
   xSemaphoreGive(_paint_buffer_sem);
 
@@ -1839,6 +2205,7 @@ void EPD_Painter::clear(const Rect* rects, int num_rects, ClearMode mode) {
         }
         sendRow(row == 0);
       }
+      _endPass();
       EPD_DELAY_MS(5);
     }
   }
@@ -1867,7 +2234,7 @@ void EPD_Painter::clear(const Rect* rects, int num_rects, ClearMode mode) {
 //   NPASSES — render passes per step (more = slower but better clearing)
 // =============================================================================
 void EPD_Painter::fxClear() {
-  const int prb = _config.width / 4;   // packed row bytes
+  const int prb = packed_row_bytes;
 
   // Wait for any in-progress paint to finish, then take exclusive control.
   // Unlike clear(), we do NOT issue a white frame first — the screenbuffer
@@ -1917,6 +2284,7 @@ void EPD_Painter::fxClear() {
       }
       sendRow(row == 0, false);
     }
+    _endPass();
   }
 
 
@@ -2058,67 +2426,9 @@ void EPD_Painter::drawGray8(uint8_t *dst, int dstW, int dstH,
 // packBuffer()
 // =============================================================================
 uint8_t* EPD_Painter::packBuffer(const uint8_t* fb) const {
-    const size_t packed_size = (size_t)_config.width * _config.height / 4;
     uint8_t* buf = static_cast<uint8_t*>(
-        heap_caps_aligned_alloc(16, packed_size, MALLOC_CAP_SPIRAM));
+        heap_caps_aligned_alloc(16, packedSize(), MALLOC_CAP_SPIRAM));
     if (!buf) return nullptr;
-    if (_config.rotation == Rotation::ROTATION_CW)
-        compact_pixels_rotated_cw(fb, buf, _config.height, _config.width);
-    else if (_config.rotation == Rotation::ROTATION_180)
-        compact_pixels_180(fb, buf, (uint32_t)_config.width * _config.height);
-    else
-        epd_painter_compact_pixels(fb, buf, (uint32_t)_config.width * _config.height);
+    _pack(fb, buf, false);
     return buf;
-}
-
-// =============================================================================
-// autoDetectBoard()
-//
-// AUTO preset fallback used by begin().
-//
-// If the user did not select a board explicitly, EPD_PAINTER_PRESET is built
-// with placeholder pins and this function probes the known board I2C buses to
-// find a matching preset at runtime.
-//
-// Returns true when a supported board is detected and _config has been replaced
-// with the matching preset. Returns false when no known board responds, so
-// begin() can fail cleanly instead of continuing with an invalid configuration.
-// =============================================================================
-bool EPD_Painter::autoDetectBoard() {
-  #ifdef ARDUINO
-    if (_config.data_pins[0] >= 0) return true;
-
-    Rotation _rotation = _config.rotation;
-    int i = 1;
-    for (const auto& probe : Probe) {
-      printf("[EPD] Probing board %d on SDA=%d, SCL=%d, addr=0x%x\n", i, probe.i2c_sda, probe.i2c_scl, probe.i2c_addr);
-      TwoWire _w(1);   // use bus 1 just for the probe; will be deleted
-      _w.begin(probe.i2c_sda, probe.i2c_scl, 100000);
-      // Suppress ESP-IDF i2c_master NACK error logs — a NACK simply means
-      // this board isn't here, which is expected for every non-matching probe.
-      esp_log_level_set("i2c.master", ESP_LOG_NONE);
-      _w.beginTransmission(probe.i2c_addr);
-      bool found = (_w.endTransmission() == 0);
-      esp_log_level_set("i2c.master", ESP_LOG_WARN);
-      _w.end();
-      // Reset Pins to output
-      EPD_PIN_OUTPUT(probe.i2c_sda);
-      EPD_PIN_OUTPUT(probe.i2c_scl);
-      if(found) {
-        printf("[EPD] Board %d found\n", i);
-        _config = *probe.preset;
-        _preset = probe.preset;
-        _config.rotation = _rotation;  // preserve user-specified rotation across auto-detect
-        printf("[EPD] Detected panel details: \n - I2C SDA: %d\n - I2C SCL: %d\n", _config.i2c.sda, _config.i2c.scl);
-        return true;
-      }
-      ++i;
-    }
-
-    printf("[EPD] No known board found; begin() will fail\n");
-    return false;
-  
-  #else
-    return false;
-  #endif
 }

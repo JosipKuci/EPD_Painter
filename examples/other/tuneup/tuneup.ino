@@ -10,8 +10,8 @@
 //               they're still blank the panel tells you to set them and
 //               reflash.
 //   2. Scanner — discovers eSCL/AirScan scanners via mDNS (_uscan._tcp)
-//               and lists them on the panel; tap one to pick it (the
-//               choice is remembered).
+//               and lists them on the panel; type its number over serial
+//               to pick it (the choice is remembered).
 //   3. Demo scan — requests a grayscale eSCL scan and shows it on the
 //               panel in 16 native greys.
 //   4. SELF-TUNE — put the board face-down on the glass and it tunes its
@@ -23,10 +23,11 @@
 // every network scanner made since ~2015, and by sane-airscan bridges for
 // older ones. No drivers, just HTTP + XML — well within an ESP32.
 //
-// Touch: GT911 via https://github.com/tonywestonuk/gt911-arduino
-// (same pattern as the maze_3d example). While the board is face-down the
-// touchscreen is against the glass, so tuning is driven over serial or by
-// the TUNE button's countdown.
+// Board: Soldered Inkplate 10 (1200x825, ED097TC2) on an ESP32-S3. It has
+// NO touch controller, so the whole rig is driven over serial (115200).
+// The panel still draws the on-screen buttons as labels; every one of them
+// has a serial key (shown on the screen and in the log). The touch hooks
+// below are kept as no-op stubs so the shared tuner code needs no changes.
 //
 // Serial commands (115200):
 //   Tuning     T self-tune (pick quality) · 4 4-grey tune (then f/n/N) ·
@@ -40,9 +41,10 @@
 //              J timing benches · Q paint quadrant mark
 //   Knobs      P <us> tune-period override · W <us> row charge ·
 //              A/R/F evo toggles (settle mask / shuffle / ref ladder)
-//   Rig        s demo scan · n re-pick scanner · m menu · r reboot
+//   Rig        s demo scan · t tune with lid countdown · o show photo ·
+//              n re-pick scanner · m menu · r reboot
 //
-// Libraries: Adafruit GFX (required), gt911-arduino (required),
+// Libraries: Adafruit GFX (required),
 // JPEGDEC (required for tuning and the scan preview).
 // ============================================================================
 
@@ -72,12 +74,8 @@
 // Name this board gets in exported tables (`e` at the menu): "H716" prints
 // TUNED16_H716_HIGH and so on, ready to paste into src/EPD_Painter_trains.h.
 #ifndef TUNED_EXPORT_PREFIX
-  #define TUNED_EXPORT_PREFIX "LILYGO_T5S3"
+  #define TUNED_EXPORT_PREFIX "INKPLATE10"
 #endif
-
-// Choose your board (or leave all commented for auto-probe).
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
 
 // Set to 0 if you don't want to install the JPEGDEC library — the demo scan
 // still runs (reporting the size only) but SELF-TUNE needs it.
@@ -93,7 +91,6 @@
 #include "EPD_Painter_Adafruit.h"
 #include "tuned_storage.h"
 #include "tuneup_splash.h"
-#include <gt911_lite.h>
 
 #if TUNEUP_HAVE_JPEGDEC
 #include <JPEGDEC.h>
@@ -108,10 +105,14 @@ struct Btn { int x, y, w, h; };
 
 // ---- demo scan parameters --------------------------------------------------
 // Region measured from the glass origin (the corner arrow on the scanner
-// bed). 125 x 72 mm comfortably covers a 960x540 panel laid in the corner.
+// bed). The Inkplate 10's active area is 203 x 140 mm (1200x825 at
+// 150 dpi), so the panel must lie LANDSCAPE across the platen's short
+// (216 mm, A4/Letter) side, tucked into the corner: the tuner maps panel
+// x to scan x and handles mirroring only, not a 90-degree turn. 216 mm is
+// the whole platen width — there is no slack, so push it into the corner.
 static const int   SCAN_DPI   = 150;
-static const float SCAN_W_MM  = 125.0f;
-static const float SCAN_H_MM  = 72.0f;
+static const float SCAN_W_MM  = 216.0f;
+static const float SCAN_H_MM  = 165.0f;
 static const size_t SCAN_BUF_MAX = 2u * 1024u * 1024u;  // PSRAM, plenty for a JPEG
 
 // ---- state -----------------------------------------------------------------
@@ -160,83 +161,16 @@ static void uiLine(const char *fmt, ...) {
 }
 
 // ============================================================================
-// Touch — GT911, same probing pattern as maze_3d: the display driver owns
-// the I2C bus; the coordinate range comes from the controller's own config
-// registers (0x8146/8148), swapped axes detected from portrait ranges.
+// Touch — none on the Inkplate 10. The tuner's wait loops all poll serial as
+// well as touch, so these stubs simply make every screen serial-driven:
+// touchTapped() never reports a tap. Kept (rather than deleting every call
+// site) so tuner.h / tuner_fast.h stay shared with touch-equipped forks.
 // ============================================================================
-static GT911_Lite touch;
-static uint16_t tp_xmax = 960, tp_ymax = 540;
-static bool     tp_swap = false, touch_ok = false;
-
 static void touchInit() {
-  TwoWire *bus = epd.getConfig().i2c.wire;
-  if (!bus) return;
-  // Never let a wedged bus hang the UI: a stalled I2C read would block the
-  // wait loops forever, taking the serial console down with it and leaving
-  // the board looking dead.
-  bus->setTimeOut(50);
-  touch_ok = false;
-  touch.begin(bus);
-  for (uint8_t addr : { (uint8_t)0x5D, (uint8_t)0x14 }) {
-    bus->beginTransmission(addr);
-    bus->write(0x81); bus->write(0x46);
-    if (bus->endTransmission(false) != 0) continue;
-    if (bus->requestFrom(addr, (uint8_t)4) != 4) continue;
-    uint16_t xm = bus->read(); xm |= bus->read() << 8;
-    uint16_t ym = bus->read(); ym |= bus->read() << 8;
-    if (xm == 0 || ym == 0 || xm == 0xFFFF) break;
-    tp_xmax = xm; tp_ymax = ym;
-    tp_swap = (xm < ym);
-    touch_ok = true;
-    Serial.printf("[tuneup] touch 0x%02x, range %ux%u%s\n", addr, xm, ym,
-                  tp_swap ? " (swapped)" : "");
-    return;
-  }
-  Serial.println("[tuneup] no touch controller found!");
+  Serial.println("[tuneup] no touch panel on this board - drive it over serial");
 }
-
-// Re-open the touch controller and forget any stuck press state.
-//
-// After a long tuning run — a quarter of an hour of continuous panel
-// driving, with the power controller sharing this same I2C bus — the
-// GT911 stops reporting, so every interactive screen that follows looks
-// dead to the user. Re-running begin() revives it; clearing the edge flag
-// covers the other half of the problem, a press left latched "down" by
-// the board resting face-first on the scanner glass, which would stop any
-// later tap ever registering as a fresh press.
-static bool touch_was_down = false;
-
-// Called before a screen that waits for a tap. It only forgets a stale
-// press edge — the board resting face-down on the glass can leave one
-// latched, and then no later tap counts as a fresh press.
-//
-// It deliberately does NOT re-initialise the controller. The dead buttons
-// this was written to cure turned out to be a polling-rate problem (see
-// the delay() note in tuner.h's wait loops), and re-applying the GT911's
-// config mid-session is a risk for no proven gain.
-static void touchRewake() {
-  touch_was_down = false;
-}
-
-// One rising-edge tap, mapped to panel coordinates. Non-blocking.
-static bool touchTapped(int &px, int &py) {
-  if (!touch_ok) return false;
-  bool &was_down = touch_was_down;
-  touch.read();
-  bool down = touch.isTouched;
-  bool tap = down && !was_down;
-  was_down = down;
-  if (!tap) return false;
-  uint16_t rx = touch.x, ry = touch.y;
-  if (tp_swap) {
-    px = (int)ry * epd.width() / tp_ymax;
-    py = (int)(tp_xmax - rx) * epd.height() / tp_xmax;
-  } else {
-    px = (int)rx * epd.width() / tp_xmax;
-    py = (int)ry * epd.height() / tp_ymax;
-  }
-  return true;
-}
+static void touchRewake() {}
+static bool touchTapped(int &px, int &py) { (void)px; (void)py; return false; }
 
 static void drawBtn(const Btn &b, const char *l1, const char *l2 = nullptr) {
   epd.drawRect(b.x, b.y, b.w, b.h, 15);
@@ -527,6 +461,9 @@ static bool decodeGrayFromScan(size_t len) {
 // finer than the eye resolves at reading distance.
 static uint8_t *splashFb = nullptr;
 static int      splashFbW = 0, splashFbH = 0;
+// The artwork is TUNEUP_SPLASH_W x TUNEUP_SPLASH_H (960x540); on a bigger
+// panel it is centred on white.
+static int      splashOX = 0, splashOY = 0;
 
 static const uint8_t splashBayer8[8][8] = {
   {  0, 32,  8, 40,  2, 34, 10, 42 }, { 48, 16, 56, 24, 50, 18, 58, 26 },
@@ -542,11 +479,11 @@ static uint8_t *splashGray = nullptr;
 static int splashDrawCb(JPEGDRAW *d) {
   const uint8_t *src = (const uint8_t *)d->pPixels;
   for (int y = 0; y < d->iHeight; y++) {
-    const int dy = d->y + y;
+    const int dy = splashOY + d->y + y;
     if (dy < 0 || dy >= splashFbH) continue;
     uint8_t *drow = splashGray + (size_t)dy * splashFbW;
     for (int x = 0; x < d->iWidth; x++) {
-      const int dx = d->x + x;
+      const int dx = splashOX + d->x + x;
       if (dx >= 0 && dx < splashFbW) drow[dx] = src[(size_t)y * d->iWidth + x];
     }
   }
@@ -600,20 +537,25 @@ static void splashDiffuse(uint8_t *fb, int W, int H) {
 
   // PSRAM, not .bss (3.8 KB of internal otherwise — see the lwIP note in
   // httpTxn's failure path).
+  // Sized by the canvas width W, not the artwork's: the artwork is
+  // centred on a canvas that may be wider than it.
   static int16_t *errCur = nullptr, *errNext = nullptr;
-  if (!errCur) {
-    errCur  = (int16_t *)heap_caps_malloc(TUNEUP_SPLASH_W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    errNext = (int16_t *)heap_caps_malloc(TUNEUP_SPLASH_W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (!errCur || !errNext) return;
+  static int errW = 0;
+  if (!errCur || errW < W) {
+    heap_caps_free(errCur); heap_caps_free(errNext);
+    errCur  = (int16_t *)heap_caps_malloc(W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    errNext = (int16_t *)heap_caps_malloc(W * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    errW = W;
+    if (!errCur || !errNext) { errCur = errNext = nullptr; errW = 0; return; }
   }
-  memset(errCur, 0, TUNEUP_SPLASH_W * sizeof(int16_t));
+  memset(errCur, 0, W * sizeof(int16_t));
   for (int y = 0; y < H; y++) {
     // FULL-WIDTH clear and copy. When these rows moved from static arrays
     // to PSRAM pointers, sizeof() silently became sizeof(pointer) = 8
     // bytes: the error rows were never cleared OR carried between rows,
     // error accumulated unbounded down the image, and every dithered
     // photo grew catastrophic full-height streaks within hours.
-    memset(errNext, 0, TUNEUP_SPLASH_W * sizeof(int16_t));
+    memset(errNext, 0, W * sizeof(int16_t));
     const uint8_t *srow = splashGray + (size_t)y * W;
     uint8_t *drow = fb + (size_t)y * W;
     // Serpentine + exact error conservation, matching the library's
@@ -643,12 +585,14 @@ static void splashDiffuse(uint8_t *fb, int W, int H) {
       if (xb >= 0 && xb < W) errNext[xb] += (int16_t)e3;
       errNext[x] += (int16_t)e5;
     }
-    memcpy(errCur, errNext, TUNEUP_SPLASH_W * sizeof(int16_t));
+    memcpy(errCur, errNext, W * sizeof(int16_t));
   }
 }
 
 static void tuneupSplashDraw(uint8_t *fb, int fbW, int fbH) {
   splashFb = fb; splashFbW = fbW; splashFbH = fbH;
+  splashOX = max(0, (fbW - (int)TUNEUP_SPLASH_W) / 2);
+  splashOY = max(0, (fbH - (int)TUNEUP_SPLASH_H) / 2);
   memset(fb, 0, (size_t)fbW * fbH);
 
   // Borrow the scan buffer for the greyscale image — it is only in use
@@ -707,7 +651,7 @@ static void showScan() {
 #endif
 
 // ============================================================================
-// Scanner discovery + selection (touch, with serial fallback), remembered
+// Scanner discovery + selection (over serial), remembered
 // in NVS so a face-down boot needs no interaction.
 // ============================================================================
 static bool esclHello(const String &host, uint16_t port, String *makeModel) {
@@ -738,8 +682,8 @@ static bool scannerTrySaved() {
   return false;
 }
 
-// Draw the discovered scanners as buttons; tap picks one (or type its
-// number over serial), RESCAN repeats the search.
+// Draw the discovered scanners as numbered buttons; type its number over
+// serial to pick one, 'r' repeats the search.
 static void pickScanner() {
   struct Hit { String host; uint16_t port; String label; };
   static Hit hits[5];
@@ -773,7 +717,7 @@ static void pickScanner() {
     epd.setTextSize(3);
     epd.setTextColor(0);
     epd.setCursor(12, 7);
-    epd.print(nh ? "TAP YOUR SCANNER" : "NO SCANNERS FOUND");
+    epd.print(nh ? "PICK YOUR SCANNER (serial: its number)" : "NO SCANNERS FOUND");
     epd.setTextColor(15);
 
     Btn rows[5];
@@ -792,9 +736,9 @@ static void pickScanner() {
       epd.print("Is the scanner awake and on this network?");
     }
     Btn rescan = { 20, H - 84, W - 40, 64 };
-    drawBtn(rescan, "RESCAN");
+    drawBtn(rescan, "RESCAN", "serial: r");
     epd.paint();
-    Serial.println("[tuneup] tap a scanner, or type its number (r = rescan)");
+    Serial.println("[tuneup] type a scanner's number (r = rescan)");
 
     int sel = -1;
     bool rescanNow = false;
@@ -913,9 +857,9 @@ static Set tunePickQuality(bool *cancelled) {
   Btn bFast   = { 20,                by, bw, bh };
   Btn bNormal = { 40 + bw,           by, bw, bh };
   Btn bHigh   = { 60 + bw * 2,       by, bw, bh };
-  drawBtn(bFast,   "FAST",   "4 levels + motion");
-  drawBtn(bNormal, "NORMAL", "16 greys, 13 passes");
-  drawBtn(bHigh,   "HIGH",   "16 greys, 20 passes");
+  drawBtn(bFast,   "FAST",   "serial: f");
+  drawBtn(bNormal, "NORMAL", "serial: n");
+  drawBtn(bHigh,   "HIGH",   "serial: h");
 
   epd.setTextSize(1);
   // Periods from the live config, not literals — they differ per board
@@ -952,9 +896,9 @@ static Set tunePickQuality(bool *cancelled) {
   epd.print(have);
 
   Btn back = { 20, H - 90, W - 40, 70 };
-  drawBtn(back, "BACK");
+  drawBtn(back, "BACK", "serial: q");
   epd.paint();
-  Serial.println("[tuneup] tune which? tap, or serial: f = FAST, n = NORMAL, h = HIGH, q = back");
+  Serial.println("[tuneup] tune which? serial: f = FAST, n = NORMAL, h = HIGH, q = back");
 
   // The finger that tapped TUNE ME is still on the glass, and these
   // buttons have just appeared underneath it: the menu's TUNE ME spans
@@ -990,7 +934,8 @@ static Set tunePickQuality(bool *cancelled) {
   }
 }
 
-// Touch entry: instructions + countdown so the user can close the lid.
+// Serial 't' (the panel's TUNE ME): instructions + countdown so the user can
+// close the lid.
 static void tuneCountdownAndRun() {
   bool cancelled = false;
   const Set which = tunePickQuality(&cancelled);
@@ -1089,7 +1034,7 @@ static void showSplash() {
     snprintf(mb, sizeof(mb), "MODE: %s", qn);
     epd.print(mb);
     epd.setCursor(bMode.x + 12, bMode.y + 36);
-    epd.print("tap here to switch");
+    epd.print("serial m: switch");
 
     epd.paint();
     while (!epd.driver().paintIdle()) delay(10);
@@ -1157,17 +1102,18 @@ static void showMenuCard() {
   btnTune    = { 40 + bw3,          100, bw3, 150 };
   btnSplash  = { 60 + bw3 * 2,      100, bw3, 150 };
   btnScanner = { 20, 270, W - 40, 70 };
-  drawBtn(btnScan, "DEMO SCAN", "scan the bed, show it here");
-  drawBtn(btnTune, "TUNE ME", "pick FAST / NORMAL / HIGH");
-  drawBtn(btnSplash, "SHOW PHOTO", "see the greys on real art");
-  drawBtn(btnScanner, "CHANGE SCANNER");
+  // No touch on this board: the buttons are labels for their serial keys.
+  drawBtn(btnScan, "DEMO SCAN", "serial: s");
+  drawBtn(btnTune, "TUNE ME", "serial: t (T = no countdown)");
+  drawBtn(btnSplash, "SHOW PHOTO", "serial: o");
+  drawBtn(btnScanner, "CHANGE SCANNER", "serial: n");
 
   epd.setCursor(12, H - 130);
-  epd.print("Serial: s scan  T tune  4 4-grey  d directs  e export  D ladder");
+  epd.print("Serial: s scan  t/T tune  o photo  4 4-grey  d directs  e export");
   epd.setCursor(12, H - 110);
-  epd.print("        S staircase  L blobs  X erase  n scanner  r reboot");
+  epd.print("        D ladder  S staircase  L blobs  X erase  n scanner  r reboot");
   epd.paint();
-  Serial.println("[tuneup] menu: s/T/4/d/e/D/S/L/X/n/r (full list in the sketch header)");
+  Serial.println("[tuneup] menu: s/t/T/o/4/d/e/D/S/L/X/n/r (full list in the sketch header)");
 }
 
 // ============================================================================
@@ -1253,47 +1199,16 @@ void setup() {
 }
 
 void loop() {
-  int px, py;
-  if (touchTapped(px, py)) {
-    if (hitBtn(btnScan, px, py)) {
-      while (demoScan()) {
-        // after-scan bar: left = again, right = back
-        const int W = epd.width(), H = epd.height();
-        epd.fillRect(0, H - 30, W, 30, 15);
-        epd.setTextColor(0);
-        epd.setCursor(12, H - 23);
-        epd.print("TAP LEFT: scan again");
-        epd.setCursor(W / 2 + 12, H - 23);
-        epd.print("TAP RIGHT: menu");
-        epd.setTextColor(15);
-        epd.paint();
-        int qx, qy;
-        for (;;) {
-          if (touchTapped(qx, qy)) break;
-          if (Serial.available() && Serial.peek() == 's') { Serial.read(); qx = 0; break; }
-          if (Serial.available()) { Serial.read(); qx = W; break; }
-          delay(20);
-        }
-        if (qx >= W / 2) break;
-      }
-      showMenuCard();
-    } else if (hitBtn(btnTune, px, py)) {
-      tuneCountdownAndRun();
-      showMenuCard();
-    } else if (hitBtn(btnSplash, px, py)) {
-      showSplash();
-      showMenuCard();
-    } else if (hitBtn(btnScanner, px, py)) {
-      pickScanner();
-      showMenuCard();
-    }
-    return;
-  }
-
+  // Menu buttons have no touch to press on this board; the serial keys
+  // below ('s', 't', 'o', 'n') do what the DEMO SCAN / TUNE ME / SHOW PHOTO
+  // / CHANGE SCANNER buttons did.
   if (!Serial.available()) { delay(20); return; }
   const int c = Serial.read();
   switch (c) {
     case 's': demoScan(); Serial.println("[tuneup] (any key for menu)"); break;
+    // The menu buttons' serial equivalents (the panel has no touch).
+    case 't': tuneCountdownAndRun(); showMenuCard(); break;
+    case 'o': showSplash(); showMenuCard(); break;
     case 'T': {
       bool cancelled = false;
       const Set which = tunePickQuality(&cancelled);
@@ -1451,8 +1366,8 @@ void loop() {
     case 'u': {
       // u <us> — live row-charge override, both 16-grey tiers: the extra
       // hold after LE before the next row (Tony's capacitor-recharge
-      // probe, 29 Jul). Survives until reboot or a blob reinstall. At 540
-      // rows every microsecond costs 0.54 ms per pass; past the pass
+      // probe, 29 Jul). Survives until reboot or a blob reinstall. Every
+      // microsecond costs height x 1 us per pass (0.83 ms at 825 rows); past the pass
       // period's slack the period itself stretches (watch the jitter).
       const int us = Serial.parseInt();
       epd.driver()._config.row_extra_us_normal = us;

@@ -2,7 +2,9 @@
 
 # EPD_Painter
 
-A high-performance e-paper display driver for ESP32-S3, targeting the **M5Stack M5PaperS3** and **LilyGo T5 S3 GPS**. Achieves ~20fps equivalent update rates (FAST mode) through a combination of ESP32-S3 vector (SIMD) assembly, a custom LCD_CAM DMA pipeline, and a delta-update pixel system.
+A high-performance e-paper display driver for ESP32-S3, driving the **Soldered Inkplate 10** panel (ED097TC2, 9.7", 1200×825) through a combination of ESP32-S3 vector (SIMD) assembly, a custom LCD_CAM DMA pipeline, and a delta-update pixel system.
+
+> **Port status.** The engine was developed on 960×540 boards (M5PaperS3, LilyGo T5 S3). This branch drives the Inkplate 10 only. The waveform tables are untuned seeds for this panel, so black and white are solid and the two greys need a tuning session (`examples/other/tuneup`). The timing figures in the deeper docs were measured on the 960×540 boards.
 
 ---
 
@@ -23,9 +25,19 @@ On top of that:
 
 | Board | Resolution | Preset |
 |---|---|---|
-| M5Stack M5PaperS3 | 960×540 | `EPD_PAINTER_PRESET_M5PAPER_S3` |
-| LilyGo T5 S3 GPS | 960×540 | `EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS` |
-| LilyGo T5 S3 H752 | 960×540 | `EPD_PAINTER_PRESET_LILYGO_T5_S3_H752` |
+| Soldered Inkplate 10, ESP32-S3 breakout | 1200×825 | `EPD_PAINTER_PRESET` (the only one) |
+
+Wiring is the InkplateLibrary `inkplate10-s3-test` breakout (`INKPLATE10_S3_WIRING.md` there):
+
+| Signal | GPIO | | Signal | GPIO |
+|---|---|---|---|---|
+| D0–D7 | 38, 39, 40, 41, 42, 47, 48, 21 | | CKV | 10 |
+| CL | 4 | | LE | 11 |
+| SPV | 5 | | SPH | 12 |
+| GMOD | 6 | | I2C SDA / SCL | 8 / 9 |
+| OE | 7 | | | |
+
+The I2C bus carries a PCAL6416A expander at 0x20 (TPS65186 WAKEUP/PWRUP/VCOM/INT/PWR_GOOD on A0–A4) and the TPS65186 PMIC at 0x48. LCD_CAM routes the bus through the GPIO matrix, so the data lines being split across two GPIO registers costs nothing. Every pin is in `EPD_Painter_presets.h`.
 
 ---
 
@@ -37,20 +49,17 @@ On top of that:
    ```
 2. Install the **Adafruit GFX Library** (required) via Arduino Library Manager
 3. Install **LVGL v9** (optional — needed for LVGL examples) via Arduino Library Manager
-4. Select your board in Arduino IDE: M5Stack M5PaperS3 or LilyGo T5 S3 GPS (ESP32-S3 with PSRAM)
-5. Choose whether to select a board explicitly with a `#define`, or let the library auto-detect it at runtime
+4. Select **ESP32S3 Dev Module** with **PSRAM: OPI PSRAM**, **USB Mode: Hardware CDC and JTAG** and **USB CDC On Boot: Enabled**, or from the command line:
+   ```
+   arduino-cli compile --fqbn esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=huge_app,USBMode=hwcdc,CDCOnBoot=cdc <sketch>
+   ```
+5. Flash `examples/inkplate10/inkplate10_hello` first. It reports the pixel clock and the PMIC state on Serial and draws an orientation and edge test.
 
 ---
 
 ## Quick start
 
 ```cpp
-// Optional: uncomment the define that matches your board.
-// If none is defined, EPD_Painter falls back to AUTO mode
-// and probes the supported boards at runtime.
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
 #include "EPD_Painter_Adafruit.h"
 
 EPD_PainterAdafruit display(EPD_PAINTER_PRESET);
@@ -72,12 +81,18 @@ void loop() {}
 
 `EPD_Painter_presets.h` is now imported automatically by `EPD_Painter.h`, `EPD_Painter_Adafruit.h`, and `EPD_Painter_LVGL.h`. You only need the binding header you actually use.
 
-### Board selection modes
+### Orientation and timing knobs
 
-- Explicit preset: define `EPD_PAINTER_PRESET_M5PAPER_S3`, `EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS`, or `EPD_PAINTER_PRESET_LILYGO_T5_S3_H752` before including the library
-- AUTO fallback: if no preset `#define` is present, the library enables `EPD_PAINTER_PRESET_AUTO` automatically and probes the known boards during `begin()`
+The preset defaults to `Rotation::ROTATION_180`, which puts (0,0) in the same corner as the Inkplate library. `EPD_PAINTER_PRESET.withRotation(...)` picks another orientation. Board timing lives in the Config:
 
-Use an explicit preset when you know the target hardware at compile time and want fixed configuration. Use AUTO when the same sketch may run on multiple supported boards.
+| Field | Default | Meaning |
+|---|---|---|
+| `pclk_hz` | 4 000 000 | CL pixel clock. 4 MHz gives 125 ns CL-high, the shortest pulse the bit-banged Inkplate driver found working on the breakout. Raise it once the wiring is proven. |
+| `vscan_skip_lines` | 3 | Gate clocks after SPV before the first row latches, matching Inkplate's `vscan_start()`. |
+| `skip_idle_cols` | false | Experimental: end each row after the frame's last changed column (scan order). Saves the cut share of row time; turn off if stray marks appear past the cut-off. |
+| `g16_pass_us_*` | 75 000 | 16-grey pass period. Must exceed one row loop (825 × 308 bytes / `pclk_hz`), so scale it with the clock. |
+
+Every waveform table is only valid at the row timing it was tuned at, so retune after changing `pclk_hz`.
 
 ---
 
@@ -107,7 +122,8 @@ Use an explicit preset when you know the target hardware at compile time and wan
 | `clearBuffers()` | Zero all packed buffers — reset DC-balance baseline before power-off |
 | `drawGray8()` | Draw an 8bpp greyscale image, Floyd-Steinberg dithered against the panel's measured level curve |
 | `drawGray8Fit()` | As above, scaled to fit the canvas and centred — the photo case |
-| `setQuality(q)` | `QUALITY_HIGH` / `QUALITY_NORMAL` / `QUALITY_FAST` — trades refresh speed for black depth |
+| `setVcomMv(mv, persist)` | Set VCOM in mV (e.g. `-1250`). RAM only and re-applied at every power-up, or `persist = true` to program the TPS65186 EEPROM. `Config::power.vcom_mv` sets it from the config. `readVcomMv()` reads it back |
+| `setQuality(q)` | `QUALITY_HIGH` / `QUALITY_NORMAL` / `QUALITY_FAST` — trades refresh speed for black depth. `QUALITY_BW` snaps to black and white and drives `Config::bw_passes` (default 4) passes |
 
 **Ghosting removal:**
 ```cpp
@@ -138,11 +154,11 @@ For the LVGL binding, use the provided colour constants (`EPD_PainterLVGL::WHITE
 
 EPD_Painter provides graceful shutdown via `EPD_BootCtl`, handling the DC-balance and screen-state reconciliation problems that arise from EPD panels retaining their image through power loss.
 
-**Default behaviour (`setAutoShutdown(true)`):** `begin()` handles everything automatically. Pressing reset while running triggers a shutdown sequence — a shutdown image is painted, packed pixel data is stored in NVS, and the device powers off. On the next boot the stored image is undrawn (DC balance), then normal operation resumes.
+**Off by default on the Inkplate 10.** The board has no power latch and no charger to tell a power-button boot from a USB one. With `setAutoShutdown(true)` called before `begin()`, every other reset paints the shutdown image and deep-sleeps, and the next reset undraws it (DC balance) and runs normally.
 
-**Custom behaviour (`setAutoShutdown(false)`):** Create your own `EPD_BootCtl` instance and check `shutdownPending()` in `setup()` or `loop()` to intercept and show a confirmation UI before deciding to call `shutdown()` or `cancelShutdown()`.
+**Custom behaviour:** Create your own `EPD_BootCtl` instance and check `shutdownPending()` in `setup()` or `loop()` to intercept and show a confirmation UI before deciding to call `shutdown()` or `cancelShutdown()`.
 
-The fallback shutdown image is a built-in fractal pattern. To supply your own, implement `EPD_BootCtl::IImageProvider` and return a PSRAM-allocated packed 2bpp buffer.
+The fallback shutdown image is a built-in fractal pattern. To supply your own, implement `EPD_BootCtl::IImageProvider` and return a PSRAM-allocated packed 2bpp buffer with rows of `EPD_Painter::packedRowBytesFor(width)` bytes (304 for this panel).
 
 See [reference_manual.md](reference_manual.md) for full shutdown API documentation and examples.
 
@@ -152,19 +168,23 @@ See [reference_manual.md](reference_manual.md) for full shutdown API documentati
 
 | Example | Binding | Description |
 |---|---|---|
+| `inkplate10/inkplate10_hello` | Adafruit GFX | First light: PMIC status, orientation/edge test, grey bars |
+| `inkplate10/inkplate10_fast_counter` | Adafruit GFX | Centred counter repainted as fast as possible: FAST quality, row window, 10 MHz |
+| `inkplate10/inkplate10_gif_player` | Adafruit GFX | Animated GIF from flash, scaled to fit, 4 flat greys; `gif2h.py` converts your own (needs AnimatedGIF) |
 | `adafruit/bounce` | Adafruit GFX | Bouncing ball animation |
 | `adafruit/breakout` | Adafruit GFX | A breakout game animation |
 | `adafruit/circles` | Adafruit GFX | Animated circles |
+| `adafruit/diagonal_lines` | Adafruit GFX | Line drawing |
 | `adafruit/page_text` | Adafruit GFX | Text rendering |
 | `lvgl/lvgl_hello_world` | LVGL | Minimal LVGL setup |
-| `lvgl/lvgl_gps_clock` | LVGL | GPS-synced clock (LilyGo) |
-| `lvgl/lvgl_gps_receiver` | LVGL | Live GPS data display (LilyGo) |
 | `lvgl/lvgl_lighting_control` | LVGL | UI control panel demo |
+| `other/dashboard` | Raw | Dashboard layout |
 | `other/elevated` | Raw | ESP32 port of the Elevated 4K intro |
 | `other/drift` | Raw | Julia set morphing animation |
-| `other/gps_raw_serial` | Raw | Raw NMEA output from u-blox GPS (LilyGo) |
-| `other/lilygo_t5_shutdown` | Raw | Graceful shutdown with LittleFS image |
-| `map_viewer` | Raw | Live OpenStreetMap tile viewer via GPS |
+| `other/grey16_testcard` | Raw | 16-grey test card |
+| `other/megademo` | Raw | Demo reel of the engine's modes |
+| `other/power_ghost_test` | Raw | Power-cycle ghosting check |
+| `other/tuneup` | Raw | Self-tuning against a scanner rig — the route to real tables for this panel |
 
 ---
 
@@ -184,11 +204,12 @@ See [reference_manual.md](reference_manual.md) for full shutdown API documentati
  └─────────────────────────┘
 ```
 
-Memory usage on a 960×540 display:
+Memory usage on the 1200×825 panel (2bpp rows are padded from 300 to 304 bytes so every row is a whole number of 64-pixel SIMD chunks):
 
 | Buffer | Location | Size |
 |---|---|---|
-| 8bpp GFX canvas | PSRAM | ~518 KB |
-| 2bpp fastbuffer | Internal RAM | ~130 KB |
-| 2bpp screenbuffer | PSRAM | ~130 KB |
-| DMA row buffers | Internal RAM | 480 B (double-buffered) |
+| 8bpp GFX canvas | PSRAM | ~967 KB |
+| 2bpp fastbuffer | Internal RAM if ≥96 KB would remain, else PSRAM | ~245 KB |
+| 2bpp screen / paint / light buffers | PSRAM | 3 × ~245 KB |
+| 16-grey state + spill planes (on first `setGreyLevels(16)`) | PSRAM | ~3.1 MB |
+| DMA row buffers | Internal RAM | 2 × 308 B |

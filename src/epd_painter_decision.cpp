@@ -118,7 +118,7 @@ uint32_t EPD_Painter::_decision_discover() {
 #ifdef EPD_DECISION_VERIFY
   static uint32_t verify_paint = 0;
   uint32_t mm_plane = 0, mm_mask = 0, mm_screen = 0, mm_todo_rows = 0;
-  static uint8_t c_fbD[240], c_fbL[240], c_sb[240];
+  static uint8_t c_fbD[512], c_fbL[512], c_sb[512];  // >= packed_row_bytes
   int64_t t_c = 0, t_asm = 0;
 #endif
 
@@ -248,7 +248,7 @@ void EPD_Painter::_decision_discover16_row(int row) {
   int ndecA = 0, ndecR = 0;
   uint32_t todo = 0;
 
-  const int chunks = _config.width / 64;             // 64 px = 32 bytes at 4bpp
+  const int chunks = packed_row_bytes / 16;          // 64 px = 32 bytes at 4bpp
   for (int c = 0; c < chunks; c++) {
     const uint32_t *pw = (const uint32_t *)(pb + c * 32);
     const uint32_t *sw = (const uint32_t *)(sb + c * 32);
@@ -371,7 +371,7 @@ void EPD_Painter::_decision_discover_direct_row(int row) {
   int ndec = 0, nsweeps = 0;
   uint32_t todo = 0;
 
-  const int chunks = _config.width / 64;             // 64 px = 16 bytes at 2bpp
+  const int chunks = packed_row_bytes / 16;          // 64 px = 16 bytes at 2bpp
   for (int c = 0; c < chunks; c++) {
     const uint32_t *pw = (const uint32_t *)(pb + c * 16);
     const uint32_t *sw = (const uint32_t *)(sb + c * 16);

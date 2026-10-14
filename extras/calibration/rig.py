@@ -2,7 +2,7 @@
 """Scanner calibration rig for EPD_Painter waveforms.
 
 The wavecal sketch renders a patch chart (black / dark grey / light grey /
-white, with 40px black corner fiducials); this script commands it over serial,
+white, with 50px black corner fiducials); this script commands it over serial,
 scans the panel face-down on the Canon MG5200 (SANE pixma backend), locates
 the panel via the fiducials, and measures each patch's reflectance.
 
@@ -25,15 +25,17 @@ except ImportError:
 
 BAUD = 115200
 SCAN_DPI = 300
-PANEL_DPI = 223.0
+# Inkplate 10: 9.7" diagonal over 1200x825 -> 1456 px / 9.7 in ~= 150 DPI.
+# (The 4.7" 960x540 boards this rig was built on were 223.)
+PANEL_DPI = 150.0
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
-# Panel-space geometry — must match wavecal.ino
-FID = 40
-FID_INSET = 20
-FID_CENTERS = [(40.0, 40.0), (920.0, 40.0), (920.0, 500.0), (40.0, 500.0)]  # TL TR BR BL
-PATCH_W, PATCH_H, PATCH_Y = 160, 280, 130
-PATCH_X = [100, 300, 500, 700]
+# Panel-space geometry — must match wavecal.ino (1200x825 chart)
+FID = 50
+FID_INSET = 25
+FID_CENTERS = [(50.0, 50.0), (1150.0, 50.0), (1150.0, 775.0), (50.0, 775.0)]  # TL TR BR BL
+PATCH_W, PATCH_H, PATCH_Y = 200, 350, 238
+PATCH_X = [125, 375, 625, 875]
 PATCH_NAMES = ["black", "dark_grey", "light_grey", "white"]
 
 

@@ -1,8 +1,3 @@
-// Choose your board.
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-#define EPD_PAINTER_PRESET_M5PAPER_S3
-
 #include <Arduino.h>
 #include <lvgl.h>
 #include "EPD_Painter_presets.h"
@@ -48,12 +43,17 @@ static const uint32_t SWITCH_INTERVAL_MS = 2000;
 #define GAP       12
 #define CARD_PAD  14
 
+// Screen size, from the LVGL display begin() created (1200x825 on the
+// Inkplate 10 at the preset's rotation).
+static int scrW() { return lv_display_get_horizontal_resolution(lv_display_get_default()); }
+static int scrH() { return lv_display_get_vertical_resolution(lv_display_get_default()); }
+
 // ── Shared helper: black header bar ──────────────────────────────────────────
 
 static void make_header(lv_obj_t *scr, const char *title, const char *subtitle) {
     lv_obj_t *hdr = lv_obj_create(scr);
     lv_obj_set_pos(hdr, 0, 0);
-    lv_obj_set_size(hdr, 960, HEADER_H);
+    lv_obj_set_size(hdr, scrW(), HEADER_H);
     lv_obj_set_style_bg_color(hdr, EPD_PainterLVGL::BLACK, 0);
     lv_obj_set_style_bg_opa(hdr, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(hdr, 0, 0);
@@ -79,8 +79,8 @@ static void make_header(lv_obj_t *scr, const char *title, const char *subtitle) 
 
 static void build_lighting_screen(lv_obj_t *scr) {
     const int COLS   = 3, ROWS = 2;
-    const int CARD_W = (960 - 2 * MARGIN - (COLS - 1) * GAP) / COLS;
-    const int CARD_H = (540 - HEADER_H - (ROWS + 1) * MARGIN - (ROWS - 1) * GAP) / ROWS;
+    const int CARD_W = (scrW() - 2 * MARGIN - (COLS - 1) * GAP) / COLS;
+    const int CARD_H = (scrH() - HEADER_H - (ROWS + 1) * MARGIN - (ROWS - 1) * GAP) / ROWS;
 
     lv_obj_set_style_bg_color(scr, EPD_PainterLVGL::LT_GREY, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -181,8 +181,8 @@ static void build_lighting_screen(lv_obj_t *scr) {
 
 static void build_climate_screen(lv_obj_t *scr) {
     const int COLS   = 2, ROWS = 2;
-    const int CARD_W = (960 - 2 * MARGIN - (COLS - 1) * GAP) / COLS;
-    const int CARD_H = (540 - HEADER_H - (ROWS + 1) * MARGIN - (ROWS - 1) * GAP) / ROWS;
+    const int CARD_W = (scrW() - 2 * MARGIN - (COLS - 1) * GAP) / COLS;
+    const int CARD_H = (scrH() - HEADER_H - (ROWS + 1) * MARGIN - (ROWS - 1) * GAP) / ROWS;
 
     lv_obj_set_style_bg_color(scr, EPD_PainterLVGL::LT_GREY, 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
@@ -278,13 +278,14 @@ static void build_energy_screen(lv_obj_t *scr) {
     snprintf(sub, sizeof(sub), "Total  %.1f kWh today", total);
     make_header(scr, "Energy Monitor", sub);
 
-    const int ROW_H   = 64;
     const int ROW_GAP = 9;
     const int START_Y = HEADER_H + MARGIN;
+    // Rows share the height below the header.
+    const int ROW_H   = (scrH() - START_Y - MARGIN - (ROOM_COUNT - 1) * ROW_GAP) / ROOM_COUNT;
     const int LABEL_W = 200;
     const int VALUE_W = 130;
     const int BAR_X   = MARGIN + LABEL_W + 10;
-    const int BAR_W   = 960 - BAR_X - VALUE_W - MARGIN;
+    const int BAR_W   = scrW() - BAR_X - VALUE_W - MARGIN;
 
     for (int i = 0; i < ROOM_COUNT; i++) {
         int y = START_Y + i * (ROW_H + ROW_GAP);
@@ -292,7 +293,7 @@ static void build_energy_screen(lv_obj_t *scr) {
         // Alternating row background
         lv_obj_t *row_bg = lv_obj_create(scr);
         lv_obj_set_pos(row_bg, MARGIN, y);
-        lv_obj_set_size(row_bg, 960 - 2 * MARGIN, ROW_H);
+        lv_obj_set_size(row_bg, scrW() - 2 * MARGIN, ROW_H);
         lv_obj_set_style_bg_color(row_bg, (i % 2 == 0) ? EPD_PainterLVGL::WHITE : EPD_PainterLVGL::LT_GREY, 0);
         lv_obj_set_style_bg_opa(row_bg, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row_bg, 0, 0);

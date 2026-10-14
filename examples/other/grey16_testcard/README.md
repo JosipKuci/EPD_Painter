@@ -20,13 +20,14 @@ by batching per-line decisions into OR-merged sweeps.
 ## What to expect
 
 `setGreyLevels(16)` loads the board's scanner-tuned NORMAL train set from
-the preset (`Config::trains`, tables in `src/EPD_Painter_trains.h`): apply
-trains matched against Bayer-dithered black/white references, and
-charge-matched remove trains (unpainting a level returns its net DC charge
-to zero — see the phase D notes in `DECISION_ENGINE.md`). The M5PaperS3,
-LilyGo T5 S3 GPS and H716 are tuned; on an untuned board (H752) the
-formula library runs instead — levels in order but not colour-accurate
-until the match-card loop is run for that panel.
+the preset (`Config::trains`, tables in `src/Inkplate10_Trains.h`) or from
+an NVS blob written by `examples/other/tuneup`: apply trains matched
+against Bayer-dithered black/white references, and charge-matched remove
+trains (unpainting a level returns its net DC charge to zero — see the
+phase D notes in `DECISION_ENGINE.md`). The Inkplate 10 (ED097TC2) preset
+ships untuned, so until a tuneup session has stored a blob the formula
+library runs instead — levels in order but not colour-accurate until the
+match-card loop (or tuneup) is run for the panel.
 
 Quality must be `QUALITY_NORMAL` or `QUALITY_HIGH`; 16-grey mode refuses
 `QUALITY_FAST` (7 undelayed passes cannot resolve 16 doses).

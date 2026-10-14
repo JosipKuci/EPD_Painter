@@ -78,6 +78,8 @@ public:
     // Rendering
     // -------------------------------------------------------------------------
     void paint() { _painter.paint(buffer); }
+    // Only canvas rows y0..y1 changed since the last paint: see EPD_Painter::paintRows().
+    void paintRows(int y0, int y1) { _painter.paintRows(buffer, y0, y1); }
     void paintLater() { _painter.paintLater(buffer); }
 
     void clear(const EPD_Painter::Rect *rects = nullptr, int num_rects = 0, EPD_Painter::ClearMode mode = EPD_Painter::ClearMode::HARD) { _painter.clear(rects, num_rects, mode); }

@@ -80,8 +80,11 @@ static const int   TUNE_DPI        = 150;
 // candidates per scan instead of 15, so it can afford to be far more patient
 // per scan and still finish sooner.
 static int tuneScanGapMs = 4000;
-static const float TUNE_REG_W_MM   = 210.0f;
-static const float TUNE_REG_H_MM   = 148.0f;
+// Wide registration scan. Sized for the Inkplate 10 (active area
+// 203 x 140 mm) lying landscape in the platen corner: the full 216 mm
+// A4/Letter platen width, and enough depth for the bezel offset.
+static const float TUNE_REG_W_MM   = 216.0f;
+static const float TUNE_REG_H_MM   = 185.0f;
 
 static uint32_t tunePeriodUs = 0;  // 0 = tune at the preset period; 'P' overrides
 
@@ -1069,8 +1072,8 @@ static bool tuneResultsScreen(float maxerr, float removeWorst) {
             : "Coarser than the built-in tables.");
 
   // ---- the choice ----
-  Btn save = { 60, 386, 360, 116 };
-  Btn skip = { 540, 386, 360, 116 };
+  Btn save = { W / 2 - 420, 386, 360, 116 };
+  Btn skip = { W / 2 + 60,  386, 360, 116 };
   drawBtn(save, "SAVE", "use on every boot");
   drawBtn(skip, "SKIP", "keep built-in");
   tuneClear();          // activate immediately before the drive

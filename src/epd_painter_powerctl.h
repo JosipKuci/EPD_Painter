@@ -5,151 +5,89 @@
 #include "epd_pin_driver.h"
 
 // =============================================================================
-// epd_painter_powerctl — TPS65185 PMIC + PCA9535 I/O expander (M5PaperS3).
+// epd_painter_powerctl — Inkplate 10 panel power: TPS65186 PMIC behind a
+// PCAL6416A I/O expander, with the panel's GMOD and OE lines on native GPIOs.
+//
+//   expander pin   signal     direction
+//   A0 (0)         WAKEUP     output   TPS65186 only answers on I2C while high
+//   A1 (1)         PWRUP      output   starts the hardware power-up sequencer
+//   A2 (2)         VCOM       output   asserted only once every rail is good
+//   A3 (3)         TPS INT    input    open drain, needs the expander pull-up
+//   A4 (4)         PWR_GOOD   input    open drain, needs the expander pull-up
+//
+// Pin numbers and both I2C addresses come from Config::power, so a board
+// spin that moves them is a preset change, not a driver change.
+//
+// The TPS65186 V3P3 switch (ENABLE bit 5) is what powers the panel's logic,
+// so every panel control line must be low before it goes off — anything
+// left high back-powers the source drivers through their ESD diodes.
+// EPD_Painter::powerOff() drives the scan lines low before calling down
+// here; this driver owns GMOD and OE.
 // =============================================================================
 class epd_painter_powerctl : public EPD_PowerDriver {
 public:
-  epd_painter_powerctl();
+  bool begin(const EPD_Painter::Config &config);
 
-  bool begin(EPD_Painter::Config config);
+  bool powerOn() override;
+  void powerOff() override;
 
-  bool powerOn();
-  void powerOff();
-
-  bool isPwrGood();
-  uint8_t readTpsPg();
-  uint8_t readPcaPort(uint8_t port);
-
-  void setVcomMv(int vcom_mv);
+  // PMIC status register 0x0F; 0xFA = every rail good.
+  uint8_t readPowerGood();
+  // Hardware PWR_GOOD line as seen on the expander.
+  bool isPwrGoodPin();
+  // Panel temperature from the TPS65186 thermistor input, in degrees C.
+  int8_t readTemperature();
+  // VCOM currently held by the PMIC (factory programmed into its EEPROM),
+  // in millivolts, negative.
+  int readVcomMv();
+  // See EPD_Painter::setVcomMv().
+  bool setVcomMv(int mv, bool persist);
 
 private:
-  EPD_Painter::Config config;
+  EPD_Painter::Config _cfg;
 
   // Serializes powerOn/powerOff. The paint task powers the panel on from its
-  // own core while the application task may concurrently power it down;
+  // own core while the idle task may concurrently power it down;
   // unserialized, a power-off can put the TPS back to sleep mid-power-on and
   // the rails never come up.
   SemaphoreHandle_t _mtx = nullptr;
+  bool _on = false;
 
-  // ---- PCA9535 cached state ----
-  uint8_t _pca_out[2];
-  uint8_t _pca_cfg[2];
+  uint8_t _exp_out[2] = { 0x00, 0x00 };
+  uint8_t _exp_cfg[2] = { 0xFF, 0xFF };
 
-  // ---- PCA9535 logical pin mapping ----
-  static constexpr uint8_t PIN_OE      = 8;   // port1 bit0
-  static constexpr uint8_t PIN_MODE    = 9;   // port1 bit1
-  static constexpr uint8_t PIN_PWRUP   = 11;  // port1 bit3
-  static constexpr uint8_t PIN_VCOM    = 12;  // port1 bit4
-  static constexpr uint8_t PIN_WAKEUP  = 13;  // port1 bit5
-  static constexpr uint8_t PIN_PWRGOOD = 14;  // port1 bit6 input
-  static constexpr uint8_t PIN_INT     = 15;  // port1 bit7 input
+  // ---- PCAL6416A registers ----
+  static constexpr uint8_t EXP_INPUT0   = 0x00;
+  static constexpr uint8_t EXP_OUTPUT0  = 0x02;
+  static constexpr uint8_t EXP_CONFIG0  = 0x06;
+  static constexpr uint8_t EXP_PUPDEN0  = 0x46;
+  static constexpr uint8_t EXP_PUPDSEL0 = 0x48;
 
-  // ---- PCA pin direction constants (I2C expander, not real GPIO) ----
-  static constexpr uint8_t PCA_OUTPUT = 0;
-  static constexpr uint8_t PCA_INPUT  = 1;
+  // ---- TPS65186 registers ----
+  static constexpr uint8_t TPS_TEMP    = 0x00;
+  static constexpr uint8_t TPS_ENABLE  = 0x01;
+  static constexpr uint8_t TPS_VCOM1   = 0x03;
+  static constexpr uint8_t TPS_VCOM2   = 0x04;
+  static constexpr uint8_t TPS_INT1    = 0x07;
+  static constexpr uint8_t TPS_UPSEQ0  = 0x09;
+  static constexpr uint8_t TPS_DWNSEQ0 = 0x0B;
+  static constexpr uint8_t TPS_TMST1   = 0x0D;
+  static constexpr uint8_t TPS_PG      = 0x0F;
+  static constexpr uint8_t TPS_PG_OK   = 0xFA;
 
-  // ---- TPS65185 registers ----
-  static constexpr uint8_t TPS_ENABLE = 0x01;
-  static constexpr uint8_t TPS_VCOM1  = 0x03;
-  static constexpr uint8_t TPS_VCOM2  = 0x04;
-  static constexpr uint8_t TPS_UPSEQ0 = 0x09;
-  static constexpr uint8_t TPS_UPSEQ1 = 0x0A;
-  static constexpr uint8_t TPS_PG     = 0x0F;
+  int16_t _vcom_mv = 0;   // 0 = PMIC EEPROM value
+  bool writeVcomLocked(int mv, bool program);
 
-  // ---- Unlocked implementations (call with _mtx held) ----
   bool powerOnLocked();
+  void powerOffLocked();
 
-  // ---- PCA low-level ----
-  bool pcaWriteReg(uint8_t reg, uint8_t val);
-  bool pcaReadReg(uint8_t reg, uint8_t& val);
-  bool pcaPinMode(uint8_t pin, uint8_t mode);
-  bool pcaWrite(uint8_t pin, bool val);
-  bool pcaRead(uint8_t pin, bool& val);
+  bool regWrite(int addr, uint8_t reg, const uint8_t *data, int n);
+  bool regRead(int addr, uint8_t reg, uint8_t &val);
 
-  // ---- TPS low-level ----
-  bool tpsWrite(uint8_t reg, uint8_t val);
-  bool tpsWrite16(uint8_t reg, uint8_t lo, uint8_t hi);
-  bool tpsRead(uint8_t reg, uint8_t& val);
-};
+  bool expWrite(int8_t pin, bool val);
+  bool expRead(int8_t pin, bool &val);
+  bool expPinMode(int8_t pin, bool input, bool pullup);
 
-// =============================================================================
-// EPD_GpioPowerDriver — direct GPIO power control (e.g. M5PaperS3).
-// =============================================================================
-class EPD_GpioPowerDriver : public EPD_PowerDriver {
-public:
-    EPD_GpioPowerDriver(int8_t pin_oe, int8_t pin_pwr)
-        : _pin_oe(pin_oe), _pin_pwr(pin_pwr) {}
-
-    bool powerOn() override {
-        EPD_PIN_HIGH(_pin_oe);
-        EPD_DELAY_US(100);
-        EPD_PIN_HIGH(_pin_pwr);
-        EPD_DELAY_US(100);
-        return true;
-    }
-
-    void powerOff() override {
-        EPD_PIN_LOW(_pin_oe);
-        EPD_DELAY_US(100);
-        EPD_PIN_LOW(_pin_pwr);
-        EPD_DELAY_US(100);
-    }
-
-private:
-    int8_t _pin_oe;
-    int8_t _pin_pwr;
-};
-
-// =============================================================================
-// epd_painter_powerctl_74HCT4094D — shift-register power driver for H752.
-//
-//   QP0 = EP_LE   QP4 = EP_STV   QP5 = PWR_EN   QP6 = EP_MODE   QP7 = EP_OE
-//   QP1-3 unused
-// =============================================================================
-class epd_painter_powerctl_74HCT4094D : public EPD_PowerDriver {
-public:
-  bool begin(EPD_Painter::Config& config);
-  bool powerOn() override;
-  void powerOff() override;
-  EPD_ISRController* isrController() override { return &_sr_hw; }
-
-private:
-  EPD_ShiftReg _sr_hw;
-
-  // Named pins for power sequencing — all route through _sr_hw
-  EPD_SRPin _pin_le   {&_sr_hw, 0};  // QP0 -> EP_LE
-  EPD_SRPin _pin_stv  {&_sr_hw, 4};  // QP4 -> EP_STV
-  EPD_SRPin _pin_pwr  {&_sr_hw, 5};  // QP5 -> PWR_EN
-  EPD_SRPin _pin_mode {&_sr_hw, 6};  // QP6 -> EP_MODE
-  EPD_SRPin _pin_oe   {&_sr_hw, 7};  // QP7 -> EP_OE
-};
-
-// =============================================================================
-// EPD_H716PowerDriver — shift-register power driver for LilyGo EPD47 H716.
-//
-//   QP0 = EP_LE    QP1 = PWR_DIS   QP2 = POS_PWR   QP3 = NEG_PWR
-//   QP4 = EP_STV   QP5 = SCAN_DIR  QP6 = EP_MODE   QP7 = EP_OE
-//
-// Power sequence: clear PWR_DIS → NEG_PWR → POS_PWR
-// (mirrors the epd_poweron() sequence in the upstream epdiy/EPD47 driver).
-// =============================================================================
-class EPD_H716PowerDriver : public EPD_PowerDriver {
-public:
-  bool begin(const EPD_Painter::Shift& shift);
-  bool powerOn() override;
-  void powerOff() override;
-  EPD_ISRController* isrController() override { return &_sr_hw; }
-
-private:
-  EPD_ShiftReg _sr_hw;
-
-  // Named pins for power sequencing — all route through _sr_hw
-  EPD_SRPin _pin_le       {&_sr_hw, 0};  // QP0 -> EP_LE
-  EPD_SRPin _pin_pwr_dis  {&_sr_hw, 1};  // QP1 -> PWR_DIS (active-high)
-  EPD_SRPin _pin_pos_pwr  {&_sr_hw, 2};  // QP2 -> POS_PWR
-  EPD_SRPin _pin_neg_pwr  {&_sr_hw, 3};  // QP3 -> NEG_PWR
-  EPD_SRPin _pin_stv      {&_sr_hw, 4};  // QP4 -> EP_STV
-  EPD_SRPin _pin_scan_dir {&_sr_hw, 5};  // QP5 -> SCAN_DIR
-  EPD_SRPin _pin_mode     {&_sr_hw, 6};  // QP6 -> EP_MODE
-  EPD_SRPin _pin_oe       {&_sr_hw, 7};  // QP7 -> EP_OE
+  bool tpsWrite(uint8_t reg, uint8_t val) { return regWrite(_cfg.power.tps_addr, reg, &val, 1); }
+  bool tpsRead(uint8_t reg, uint8_t &val) { return regRead(_cfg.power.tps_addr, reg, val); }
 };

@@ -7,6 +7,14 @@ two LilyGo boards so the next person does not rediscover it all.
 Read alongside `DECISION_ENGINE.md` (what the trains are) and
 `examples/other/tuneup/README.md` (how to run the rig).
 
+> **Inkplate 10.** Every measurement below was taken on the 960×540 LilyGo
+> and M5PaperS3 boards, which this library no longer supports. The method
+> carries over; the numbers do not. The Inkplate 10 has not been tuned: its
+> tables are seeds (`src/Inkplate10_Trains.h`), and its rows run at a 4 MHz
+> pixel clock over 825 lines. A pass there is several times the dose of a
+> pass on those boards, so pass periods and train lengths need re-deriving
+> on this glass before any table is trusted.
+
 ---
 
 ## 1. The short version

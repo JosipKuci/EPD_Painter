@@ -36,7 +36,9 @@
 // set 1, and band 0 keeps the drive it already received. Four paints, one
 // scan, 60 measurements.
 //
-// THE CARD (960 x 540, sixteen 60 px columns — column g is level g):
+// THE CARD (sixteen W/16 px columns — column g is level g; rows shown for
+// a 540-row panel, scaled by evoRefH()/evoBandH() to the real height —
+// 213 + 4 x 153 on the Inkplate 10's 825):
 //
 //   rows   0..139   dithered reference, density g/15   <- the target
 //   rows 140..239   band 0: the incumbent (elite)
@@ -71,8 +73,11 @@ static const int EVO_BANDS   = 4;               // candidates per level per scan
 // How many times the staircase repair may swap inverted levels to their
 // runner-up before giving up. Each attempt costs one scan pair.
 static const int EVO_REPAIR_TRIES = 2;
-static const int EVO_REF_H   = 140;             // dithered reference band
-static const int EVO_BAND_H  = 100;             // each candidate patch
+// Dithered reference band and each candidate band, scaled to the panel
+// height: 140 + 4 x 100 on a 540-row panel (the layout this was tuned
+// with), 213 + 4 x 153 on the Inkplate 10's 825 rows.
+static inline int evoRefH()  { return epd.height() * 140 / 540; }
+static inline int evoBandH() { return (epd.height() - evoRefH()) / EVO_BANDS; }
 static const int EVO_FIRST_L = 1;               // levels evolved: 1..14
 static const int EVO_LAST_L  = 14;
 // How hard neighbour spacing is weighed against absolute placement. Banding
@@ -373,7 +378,7 @@ static void evoFillCanvas(int upto) {
   const int W = epd.width(), H = epd.height();
   for (int y = 0; y < H; y++) {
     uint8_t *row = fb + (size_t)y * W;
-    if (y < EVO_REF_H) {
+    if (y < evoRefH()) {
       // Reference: Bayer dither of density g/15 built ONLY from level 0 and
       // level 15 pixels, so it is optical truth for level g independent of
       // any train being evolved. This is why level 15 is pinned rather than
@@ -385,7 +390,7 @@ static void evoFillCanvas(int upto) {
       }
       continue;
     }
-    const int band = (y - EVO_REF_H) / EVO_BAND_H;
+    const int band = (y - evoRefH()) / evoBandH();
     if (band > upto) { memset(row, 0, W); continue; }
     for (int x = 0; x < W; x++) row[x] = evoPerm[(x * 16) / W];
   }
@@ -488,11 +493,11 @@ static bool evoMeasure(float ref[16], float nat[EVO_BANDS][16]) {
   for (int g = 0; g < 16; g++) {
     int px0, px1, sx0, sx1, sy0, sy1;
     tuneColSpan(evoColOf(g), &px0, &px1);
-    tunePanelRect(px0, px1, 12, EVO_REF_H - 12, &sx0, &sx1, &sy0, &sy1);
+    tunePanelRect(px0, px1, 12, evoRefH() - 12, &sx0, &sx1, &sy0, &sy1);
     ref[g] = tuneRectMean(sx0, sx1, sy0, sy1);
     for (int b = 0; b < EVO_BANDS; b++) {
-      const int y0 = EVO_REF_H + b * EVO_BAND_H + 12;
-      const int y1 = EVO_REF_H + (b + 1) * EVO_BAND_H - 12;
+      const int y0 = evoRefH() + b * evoBandH() + 12;
+      const int y1 = evoRefH() + (b + 1) * evoBandH() - 12;
       tunePanelRect(px0, px1, y0, y1, &sx0, &sx1, &sy0, &sy1);
       nat[b][g] = tuneRectMean(sx0, sx1, sy0, sy1);
     }
@@ -1019,8 +1024,8 @@ static bool evoReadPatches(float out[EVO_BANDS][16]) {
     int px0, px1, sx0, sx1, sy0, sy1;
     tuneColSpan(c, &px0, &px1);
     for (int b = 0; b < EVO_BANDS; b++) {
-      const int y0 = EVO_REF_H + b * EVO_BAND_H + 12;
-      const int y1 = EVO_REF_H + (b + 1) * EVO_BAND_H - 12;
+      const int y0 = evoRefH() + b * evoBandH() + 12;
+      const int y1 = evoRefH() + (b + 1) * evoBandH() - 12;
       tunePanelRect(px0, px1, y0, y1, &sx0, &sx1, &sy0, &sy1);
       out[b][c] = tuneRectMean(sx0, sx1, sy0, sy1);
     }
@@ -1115,9 +1120,9 @@ static bool runUniformityProbe(EPD_Painter::Quality q, const int *levels, int nl
 // beside it, so lamp falloff, lens vignetting and platen geometry cancel in
 // the difference and what remains is the panel.
 //
-//   band 0  (rows   0..179)  black  background   level 15
-//   band 1  (rows 180..359)  grey   background   level 8
-//   band 2  (rows 360..539)  white  background   level 0
+//   band 0  (top third)     black  background   level 15
+//   band 1  (middle third)  grey   background   level 8
+//   band 2  (bottom third)  white  background   level 0
 //
 //   within a band, nine cells across: level cycles L4, L8, L12, so each
 //   level appears at three separated x positions.
@@ -1128,7 +1133,7 @@ static bool runUniformityProbe(EPD_Painter::Quality q, const int *levels, int nl
 // ---------------------------------------------------------------------------
 static const int STAB_LEVELS[3] = { 4, 8, 12 };
 static const int STAB_BG[3]     = { 15, 8, 0 };     // black, grey, white
-static const int STAB_BANDH     = 180;
+static inline int stabBandH() { return epd.height() / 3; }   // 180 at 540 rows
 static const int STAB_CELLW     = 104;              // 50 native + 50 dither + gap
 static const int STAB_X0        = 20;
 
@@ -1136,11 +1141,11 @@ static void stabPaintCard() {
   uint8_t *fb = epd.getBuffer();
   const int W = epd.width(), H = epd.height();
   for (int y = 0; y < H; y++) {
-    const int band = min(2, y / STAB_BANDH);
+    const int band = min(2, y / stabBandH());
     memset(fb + (size_t)y * W, (uint8_t)STAB_BG[band], W);
   }
   for (int band = 0; band < 3; band++) {
-    const int cy = band * STAB_BANDH + (STAB_BANDH - 100) / 2;
+    const int cy = band * stabBandH() + (stabBandH() - 100) / 2;
     for (int c = 0; c < 9; c++) {
       const int lvl = STAB_LEVELS[c % 3];
       const int cx  = STAB_X0 + c * STAB_CELLW;
@@ -1166,7 +1171,7 @@ static bool stabMeasure(float delta[3][9]) {
   if (!tuneScan(tgeo.x0mm, tgeo.y0mm, tgeo.wmm, tgeo.hmm)) return false;
   int n[3] = { 0, 0, 0 };
   for (int band = 0; band < 3; band++) {
-    const int cy = band * STAB_BANDH + (STAB_BANDH - 100) / 2;
+    const int cy = band * stabBandH() + (stabBandH() - 100) / 2;
     for (int c = 0; c < 9; c++) {
       const int li = c % 3;
       const int cx = STAB_X0 + c * STAB_CELLW;

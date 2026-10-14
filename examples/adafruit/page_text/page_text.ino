@@ -1,9 +1,3 @@
-// Choose your board.
-#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
-
-
 #include <Arduino.h>
 #include "EPD_Painter_Adafruit.h"
 #include "EPD_Painter_presets.h"
@@ -78,8 +72,13 @@ const char* sentences[] = {
 const int sentenceCount = sizeof(sentences) / sizeof(sentences[0]);
 int sentenceIndex = 0;
 
+// Characters per line at TERMINAL_FONT_SIZE, from the runtime panel width.
+int termCols() {
+  return (epd.width() - MARGIN_X * 2) / (CHAR_WIDTH * TERMINAL_FONT_SIZE);
+}
+
 String generateLine() {
-  int cols = 35;
+  int cols = termCols();
   String sentence = sentences[sentenceIndex % sentenceCount];
   sentenceIndex++;
 
@@ -105,8 +104,11 @@ void renderTerminal() {
     epd.print(termBuffer[i]);
   }
 
-  for (int i=0; i<35; i++){
-    epd.fillRect(0, 450, 960, 90, 0);
+  // The bottom line's band, from just above its baseline to the panel edge.
+  const int lastY = MARGIN_Y + (termRows - 1) * LINE_HEIGHT;
+  const int cols  = termCols();
+  for (int i=0; i<cols; i++){
+    epd.fillRect(0, lastY - MARGIN_Y, epd.width(), epd.height() - (lastY - MARGIN_Y), 0);
     epd.setCursor(MARGIN_X, MARGIN_Y + (termRows-1) * LINE_HEIGHT);
     epd.print(termBuffer[(termRows-1)].substring(0,i));
     epd.print("_");
@@ -128,7 +130,7 @@ void setup() {
   if (termRows > MAX_ROWS) termRows = MAX_ROWS;
 
   Serial.print("Terminal size: ");
-  Serial.print((epd.width() - MARGIN_X * 2) / CHAR_WIDTH);
+  Serial.print(termCols());
   Serial.print(" cols x ");
   Serial.print(termRows);
   Serial.println(" rows");

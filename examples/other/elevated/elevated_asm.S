@@ -13,7 +13,7 @@
 // elevated_upscale_row
 //
 // Expand one source row by 4×: each byte is replicated four times in the
-// output.  Used to scale a 240-pixel render row to a 960-pixel display row.
+// output.  Used to scale a 288-pixel render row to a 1152-pixel display row.
 //
 //   src[0]  → dst[0..3]
 //   src[1]  → dst[4..7]

@@ -11,13 +11,12 @@
 //   5 MEGA     giant wave text scroller: the feature list   (FAST again)
 //   6 CREDITS  16-grey radial glow + greetz                 (DC balanced)
 //
-// Works on the M5PaperS3 and LilyGo T5 S3 GPS (auto-probe); the board
-// preset auto-loads its scanner-calibrated trains (16-grey and direct).
+// Runs on the Soldered Inkplate 10 (1200x825); the preset loads its
+// trains automatically (an NVS tuneup blob if one is stored, otherwise the
+// seed tables / formula fallback). Frame rates quoted below were measured
+// on the smaller 960x540 boards at a faster pixel clock — expect fewer
+// fps on this panel.
 // ============================================================================
-
-// Choose your board (or leave all commented for auto-probe).
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include <Arduino.h>
 #include "EPD_Painter.h"
@@ -88,7 +87,7 @@ static void drawTextCentred(const char *s, int y, int sc, uint8_t col) {
 // ---------------------------------------------------------------------------
 static const char SCROLL1[] =
   "   *** EPD_PAINTER MEGADEMO ***   THE E-PAPER ENGINE THAT MOVES   "
-  "...   FULL MOTION ON GLASS AT 17 FPS   ...   NO FLASHING   ...   "
+  "...   FULL MOTION ON GLASS   ...   NO FLASHING   ...   "
   "NO GHOSTS   ...   KEEP WATCHING FOR 16 REAL GREYS   ...      ";
 
 static void screenIntro(uint32_t ms) {
@@ -365,7 +364,7 @@ static void screenStars(uint32_t ms) {
     memset(fb + (size_t)y * W, 3, W);
   drawTextCentred("XTENSA SIMD ASSEMBLY", 58, 4, 0);
   drawTextCentred("LCD_CAM DMA + DOUBLE-BUFFERED ROWS", 118, 2, 0);
-  drawTextCentred("518KB CANVAS COMPACTED EVERY FRAME", 148, 2, 0);
+  drawTextCentred("990KB CANVAS COMPACTED EVERY FRAME", 148, 2, 0);
   epd.setTemplate(fb, EPD_Painter::Quality::QUALITY_NORMAL);
   struct Star { int16_t x, y; uint16_t z; };
   static Star st[220];
@@ -401,7 +400,7 @@ static void screenStars(uint32_t ms) {
 // ---------------------------------------------------------------------------
 static const char SCROLL2[] =
   "      WHY EPD_PAINTER?   ...   ADAFRUIT GFX AND LVGL, READY TO GO   ...   "
-  "BAD APPLE AT 20 FPS   ...   M5PAPERS3 + LILYGO T5S3, AUTO-PROBED   ...   "
+  "DELTA UPDATES, ONE PAINT() CALL   ...   INKPLATE 10, 1200 X 825   ...   "
   "CHARGE-MATCHED INK KEEPS YOUR PANEL YOUNG   ...   "
   "ONE LIBRARY, FOUR SPEEDS, SIXTEEN GREYS   ...   GET IT ON GITHUB      ";
 
@@ -449,19 +448,21 @@ static void screenCredits(uint32_t ms) {
       row[x] = (uint8_t)(v > 15 ? 15 : v);
     }
   }
+  // The credits block was laid out for a 540-row panel: centre it.
+  const int Y0 = (H - 540) / 2;
   // white halo so the black title reads on the dark gradient
   for (int oy = -4; oy <= 4; oy += 4)
     for (int ox = -4; ox <= 4; ox += 4)
       if (ox || oy)
         drawText("EPD_PAINTER", (W - textWidth("EPD_PAINTER", 8)) / 2 + ox,
-                 90 + oy, 8, 0);
-  drawTextCentred("EPD_PAINTER", 90, 8, 15);
-  drawTextCentred("CODE + WAVEFORM PHYSICS: TONY WESTON", 200, 2, 15);
-  drawTextCentred("CALIBRATION RIG: A FLATBED SCANNER", 230, 2, 15);
-  drawTextCentred("AND A VERY PATIENT AI", 260, 2, 15);
-  drawTextCentred("GREETZ: M5STACK * LILYGO * DEMOSCENE ETERNAL", 310, 2, 15);
-  drawTextCentred("EVERY PIXEL DC-BALANCED. YOUR PANEL SAYS THANKS.", 360, 2, 15);
-  drawTextCentred("GITHUB.COM/TONYWESTONUK/EPD_PAINTER", 420, 3, 0);
+                 Y0 + 90 + oy, 8, 0);
+  drawTextCentred("EPD_PAINTER", Y0 + 90, 8, 15);
+  drawTextCentred("CODE + WAVEFORM PHYSICS: TONY WESTON", Y0 + 200, 2, 15);
+  drawTextCentred("CALIBRATION RIG: A FLATBED SCANNER", Y0 + 230, 2, 15);
+  drawTextCentred("AND A VERY PATIENT AI", Y0 + 260, 2, 15);
+  drawTextCentred("GREETZ: M5STACK * LILYGO * SOLDERED * DEMOSCENE ETERNAL", Y0 + 310, 2, 15);
+  drawTextCentred("EVERY PIXEL DC-BALANCED. YOUR PANEL SAYS THANKS.", Y0 + 360, 2, 15);
+  drawTextCentred("GITHUB.COM/TONYWESTONUK/EPD_PAINTER", Y0 + 420, 3, 0);
   epd.paint(fb);
   epd.paint(fb);                    // stills get the two-step mop-up
   const uint32_t t0 = millis();

@@ -3,6 +3,11 @@
 A guide for newcomers to the codebase. This document explains the big picture
 first, then drills into each major subsystem.
 
+> The engine was built and measured on 960×540 panels (M5PaperS3, LilyGo T5
+> S3), and the worked numbers below — row bytes, pass times, 80 MHz PCLK — are
+> theirs. The library now drives the Inkplate 10 (1200×825) only;
+> [§13](#13-the-inkplate-10-port) lists everything that differs there.
+
 ---
 
 ## Table of Contents
@@ -19,6 +24,7 @@ first, then drills into each major subsystem.
 10. [clear() — Full Panel Erase](#10-clear--full-panel-erase)
 11. [Memory Map](#11-memory-map)
 12. [File Overview](#12-file-overview)
+13. [The Inkplate 10 Port](#13-the-inkplate-10-port)
 
 ---
 
@@ -416,13 +422,17 @@ control signals manage the row pointer:
 ### Timing for the First Row
 
 ```
-  SPV  ──┐    ┌─────
-         └────┘
-  CKV  ──┐   ┌─────
-         └───┘
-          ↑
-Row pointer resets to line 0 here
+  SPV  ──┐            ┌──────────────────────
+         └────────────┘
+  CKV  ────────┐ ┌──────────┐ ┌───┐ ┌───┐ ┌──
+               └─┘          └─┘   └─┘   └─┘
+                ↑            └ vscan_skip_lines lead-in clocks ┘
+  Start token enters the gate chain here
 ```
+
+SPV is held low for `vscan_hold_us` across one CKV rising edge, then
+`vscan_skip_lines` more CKV clocks step the token past gate outputs that are
+not visible lines (three on the Inkplate 10, matching its `vscan_start()`).
 
 ### Timing for Subsequent Rows
 
@@ -447,9 +457,15 @@ separate `delayMicroseconds()` call.
   2. Issue timing signals (SPV pulse on row 0, LE+CKV pulse otherwise)
      — gdma_reset() is used as the timing delay between pin transitions
   3. Point DMA at the correct descriptor (alternating desc1/desc2)
-  4. Start DMA transfer (LCD_CAM clocks data onto D0–D7 at 80 MHz)
+  4. Start DMA transfer (LCD_CAM clocks data onto D0–D7 at Config::pclk_hz)
   5. On the last row: wait for DMA to finish, then issue final latch pulse
 ```
+
+Each send latches the row transmitted *before* it. The last row of a pass
+would therefore never be latched (the next pass's first row overwrites it in
+the source chain), so the pass loop, `clear()` and `fxClear()` finish every
+pass with `_endPass()`: one float row send that latches the real last row and
+clocks the gate onto its line.
 
 ---
 
@@ -531,30 +547,36 @@ be redrawn on a fresh white background.
 ## 11. Memory Map
 
 ```
-  ┌─────────────────────────────────────────────────────────┐
-  │  PSRAM (external, slower)                               │
-  │                                                         │
-  │  buffer              960×540 bytes  (GFX canvas, 8bpp)  │
-  │  packed_screenbuffer 129,600 bytes  (screen state, 2bpp)│
-  │  bitmask[]           540 × 4 bytes  (chunk flags/row)   │
-  └─────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │  PSRAM (external, slower)                                │
+  │                                                          │
+  │  buffer              1200×825 bytes (GFX canvas, 8bpp)   │
+  │  packed_screenbuffer 250,800 bytes  (screen state, 2bpp) │
+  │  packed_paintbuffer  250,800 bytes  (desired frame)      │
+  │  packed_lightbuffer  250,800 bytes  (light plane)        │
+  └──────────────────────────────────────────────────────────┘
 
-  ┌─────────────────────────────────────────────────────────┐
-  │  Internal RAM (fast, CPU + DMA accessible)              │
-  │                                                         │
-  │  packed_fastbuffer   129,600 bytes  (working fb, 2bpp)  │
-  │  dma_buffer1         240 bytes      (one packed row)    │
-  │  dma_buffer2         240 bytes      (one packed row)    │
-  └─────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────┐
+  │  Internal RAM (fast, CPU + DMA accessible)               │
+  │                                                          │
+  │  packed_fastbuffer   250,800 bytes  (dark plane; PSRAM   │
+  │                                      if it would leave   │
+  │                                      < 96 KB free)       │
+  │  bitmask[] ×2        825 × 4 bytes  (chunk flags/row)    │
+  │  dma_buffer1/2       308 bytes each (304 row + 4 pad)    │
+  └──────────────────────────────────────────────────────────┘
 
-  packed_row_bytes = width / 4 = 960 / 4 = 240 bytes per row
-  packed_size      = 960 × 540 / 4       = 129,600 bytes
+  packed_row_bytes = packedRowBytesFor(1200) = 304 bytes per row
+                     (300 rounded up to a 16-byte SIMD chunk)
+  packed_size      = 304 × 825          = 250,800 bytes
 ```
 
-`packed_fastbuffer` is kept in internal RAM because it is read once per row
-per pass — at 7 passes × 540 rows = 3,780 sequential reads per frame. PSRAM
-would be a significant bottleneck here. The screen buffer is only read once
-per frame (during `ink_dual`) so PSRAM is fine.
+`packed_fastbuffer` is preferred in internal RAM because it is read once per
+row per pass. At 1200×825 it is most of the S3's internal heap, so `begin()`
+only takes it there when 96 KB would remain for sweep lists, the paint task
+and the sketch's own needs (WiFi). At the default 4 MHz pixel clock a row's
+DMA takes ~77 µs, which hides PSRAM reads entirely, so the fallback costs
+nothing measurable at that clock.
 
 ---
 
@@ -565,8 +587,10 @@ per frame (during `ink_dual`) so PSRAM is fine.
   EPD_Painter.cpp            C++ driver: init, DMA setup, paint(), clear(), sendRow()
   EPD_Painter.S              Xtensa assembly: pixel packing, waveform conversion,
                              ink_dual
-  EPD_Painter_presets.h      Board-specific pin configurations
-  epd_painter_powerctl       TPS65185 power management (for boards with this chip)
+  EPD_Painter_presets.h      The Inkplate 10 preset: pins, PMIC, clock, timing
+  Inkplate10_Trains.h        Waveform tables (seed, untuned on this panel)
+  epd_painter_powerctl       TPS65186 + PCAL6416A power sequencing, GMOD / OE
+  epd_pin_driver.h           Direct-register GPIO pin driver
   epd_painter_shutdown.h/.cpp  Screen-buffer reconciliation across power cycles,
                                reset-to-shutdown trigger, shutdown image
                                storage, idle timer, pre-shutdown callbacks
@@ -608,3 +632,89 @@ per frame (during `ink_dual`) so PSRAM is fine.
 
 *For questions about the assembly internals, see the comments in `EPD_Painter.S`
 which document every register and operation in detail.*
+
+---
+
+## 13. The Inkplate 10 Port
+
+The Inkplate 10's ED097TC2 is the same kind of panel as the boards the engine
+grew up on: 8-bit parallel, 2 bits per pixel (01 darken, 10 whiten, 00
+float), SPV/CKV gate scan, SPH/CL/LE source chain. What changed is size,
+power, timing and orientation.
+
+**Width that is not a multiple of 64.** 1200 px is 300 packed bytes. Every
+SIMD routine processes 16-byte (64-pixel) chunks, loads with aligned
+`ee.vld.128`, and a row's chunk mask is one 32-bit word. Rows are therefore
+stored at `packedRowBytes()` = 304 bytes (19 chunks), and `_pack()` writes
+the four padding bytes as zero. Padding pixels are white in both the paint
+and screen buffers, so discovery never gives them work. They are clocked out
+after the 1200 visible columns, past the end of the source chain, where
+they act as extra row padding. Every buffer size goes through `packedSize()`.
+The 8bpp canvas stays exactly 1200 wide; 1200 is a multiple of 16, so each
+canvas row starts 16-byte aligned for the assembly packer.
+
+**Rotation.** The Inkplate library walks its framebuffer from the last byte
+to the first, so its (0,0) is the last pixel the panel receives. The preset
+defaults to `ROTATION_180` to match. `_pack()` implements 0/180/CW for both
+2bpp and 4bpp, which also lifts the old "16-grey is ROTATION_0 only"
+restriction.
+
+**Pixel clock.** `Config::pclk_hz` (default 4 MHz) sets LCD_CAM to the
+160 MHz PLL / div_num / prescale, always prescale 2 for an even duty cycle.
+The bit-banged Inkplate driver needed ≥125 ns CL-high on the breakout, but it
+also changed D7 on the same store that raised CL, so it gave that line zero
+setup time. LCD_CAM holds data and clock in a fixed half-period relationship,
+the same configuration the earlier panels ran at 80 MHz, so faster clocks
+are probably fine here too. They are untested, though, and every waveform
+table is only valid at the row timing it was tuned at.
+
+At 4 MHz a row is 308 bytes = 77 µs, a pass ~64 ms, so a 13-pass 4-level
+NORMAL frame takes roughly 0.9 s. On the 960×540 boards the same frame took
+~0.13 s. The 16-grey pass period is 75 ms for the same reason.
+
+**Gate lead-in.** `vscan_skip_lines = 3` reproduces where the Inkplate
+driver's `vscan_start()` puts the first data row. Rows are latched one send
+late (see §8), so row 0 lands on gate output 5 in both drivers.
+
+**Power.** TPS65186 behind a PCAL6416A at 0x20:
+
+```
+  powerOn:  GMOD high → WAKEUP high, 5 ms → ENABLE=0x20 (V3P3 on)
+            → UPSEQ0=0xE4, DWNSEQ0=0x1B → PWRUP high
+            → poll PG (0x0F) == 0xFA, ≤250 ms → VCOM high → OE high
+  powerOff: LE/CKV/SPH/SPV low (EPD_Painter) → OE, GMOD low
+            → VCOM, PWRUP low → poll PG == 0 → ENABLE=0x00 → WAKEUP low
+```
+
+V3P3 powers the panel's logic, so every panel line goes low before it
+switches off. PWR_GOOD and INT get the expander's internal pull-ups. VCOM is
+whatever is factory-programmed in the PMIC's EEPROM. `readVcomMv()` and
+`readTemperature()` expose it and the panel thermistor.
+
+**Pins.** Data lines 39–42 power up as the S3 JTAG pads, so `begin()` sets
+output enable, the matrix route and the IO_MUX GPIO function for every bus
+pin, in esp_lcd's i80 order. The previous code passed an IO_MUX register
+address where `esp_rom_gpio_pad_select_gpio()` expects a GPIO number.
+
+**SPH.** A per-row start pulse, low for the first byte only, as in the
+Inkplate driver's `hscan_start()`. The earlier boards held SPH low for the
+panel's whole powered life. On the ED097TC2 that fails: its two cascaded
+600-column source drivers restart chip 1 when it fills, so the left half
+shows the right half of the image and the right half is never driven.
+LCD_CAM generates the pulse in hardware. SPH is routed to the i80 DC
+line, and each row is a 1-cycle CMD phase (`lcd_cmd_value` = the row's
+byte 0, DC low) followed by DOUT from byte 1 (DC high). DC idles high, so
+SPH is handed back to a low GPIO in `powerOff()` and stays there until
+`powerOn()`.
+
+**Row window.** A frame only scans the rows that carry work. Rows above the
+first changed row are stepped past with bare CKV clocks (`_skipRow`), with
+float latched by `_vscanStart()` while the gates are off. Each pass and the
+closing sweep stop after the last changed row. Because the gate driver is a
+shift register, an early stop then latches float and clocks the token off
+the bottom (`_flushGate`), so the next SPV doesn't run two tokens at once.
+Pass length is the dose, so a short window is padded to
+`Config::min_pass_us` (default 6 ms, 4-level only). Grey levels on a small
+window therefore differ from the same levels on a full-screen paint, unless
+`min_pass_us` is set to a full pass. `skip_idle_rows = false` restores full
+scans.

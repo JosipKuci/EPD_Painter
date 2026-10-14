@@ -7,7 +7,8 @@
 //  https://creativecommons.org/licenses/by-nc-sa/3.0/
 //
 //  Ported to ESP32 C++ software rasteriser for EPD_Painter.
-//  Renders at 240x135, upscaled 4x to 960x540 for the e-paper display.
+//  Renders at 288x206, upscaled 4x to 1152x824 and centred on the 1200x825
+//  e-paper panel (the render size follows the panel size at runtime).
 //
 //  Speed-ups vs the first version:
 //    1. Permutation-table noise   — removes 4 multiplicative hashes per no() call
@@ -15,11 +16,6 @@
 //    3. Dual-core rendering       — core 0 renders bottom half in parallel
 //    4. PIE-vectorised upscale    — ee.vzip.8 does 16→64 bytes in 11 instructions
 // =============================================================================
-
-// Choose your hardware:
-#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-// #define EPD_PAINTER_PRESET_M5PAPER_S3
 
 // elevated.h must be first — Arduino inserts auto-prototypes after includes,
 // so NR, Scene and RenderJob must be visible at that point.
@@ -31,11 +27,16 @@
 static EPD_Painter display(EPD_PAINTER_PRESET);
 
 // --- Render resolution ---
-static const int RW = 240;
-static const int RH = 135;
+// Set in setup() from the panel size: a quarter of it in each direction,
+// with RW rounded down to a multiple of 16 for elevated_upscale_row(). The
+// 4x image is centred horizontally; XOFF is kept a multiple of 16 so every
+// destination row stays 16-byte aligned for the PIE stores.
+static int DW, DH;                       // panel size
+static int RW, RH;                       // render size
+static int XOFF;                         // left margin of the upscaled image
 
 static uint8_t *render_buf  = nullptr;   // RW*RH  — internal RAM
-static uint8_t *display_buf = nullptr;   // 960*540 — PSRAM
+static uint8_t *display_buf = nullptr;   // DW*DH  — PSRAM
 
 // =============================================================================
 // Permutation-table noise
@@ -438,11 +439,11 @@ static void helper_task(void*) {
 }
 
 // =============================================================================
-// Upscale render_buf (RW×RH) → display_buf (960×540)
+// Upscale render_buf (RW×RH) → display_buf (DW×DH)
 //
 // Each source row is written to 4 consecutive display rows.
 // Within each row, elevated_upscale_row() (PIE assembly) replicates every
-// source byte 4 times, turning 240 bytes → 960 bytes in one pass.
+// source byte 4 times, turning 288 bytes → 1152 bytes in one pass.
 // =============================================================================
 
 static void upscale() {
@@ -450,7 +451,7 @@ static void upscale() {
         const uint8_t *src  = render_buf + sy * RW;
         // Each source row maps to 4 display rows
         for (int rep = 0; rep < 4; rep++) {
-            uint8_t *dst = display_buf + (sy*4 + rep) * 960;
+            uint8_t *dst = display_buf + (size_t)(sy*4 + rep) * DW + XOFF;
             elevated_upscale_row(src, dst, RW);
         }
     }
@@ -466,8 +467,15 @@ void setup() {
 
     init_noise_table();
 
-    render_buf  = (uint8_t*)heap_caps_malloc(RW * RH,   MALLOC_CAP_INTERNAL);
-    display_buf = (uint8_t*)heap_caps_malloc(960 * 540, MALLOC_CAP_SPIRAM);
+    DW   = display.getConfig().width;
+    DH   = display.getConfig().height;
+    RW   = (DW / 4) & ~15;
+    RH   = DH / 4;
+    XOFF = ((DW - RW * 4) / 2) & ~15;
+
+    // 16-byte aligned: the PIE upscale loads and stores 128 bits at a time.
+    render_buf  = (uint8_t*)heap_caps_aligned_alloc(16, RW * RH,           MALLOC_CAP_INTERNAL);
+    display_buf = (uint8_t*)heap_caps_aligned_alloc(16, (size_t)DW * DH,   MALLOC_CAP_SPIRAM);
     htc = (float*)heap_caps_malloc((size_t)HTC_N * HTC_N * sizeof(float), MALLOC_CAP_SPIRAM);
     htf = (float*)heap_caps_malloc((size_t)HTF_N * HTF_N * sizeof(float), MALLOC_CAP_SPIRAM);
 
@@ -476,6 +484,7 @@ void setup() {
         while (1) delay(1000);
     }
 
+    memset(display_buf, 0, (size_t)DW * DH);   // margins stay white
     precompute_heightmaps();
 
     if (!display.begin()) {
@@ -491,7 +500,7 @@ void setup() {
     xTaskCreatePinnedToCore(helper_task, "elev_render", 4096, nullptr,
                             5, &helper_task_h, 0);
 
-    Serial.printf("[Elevated] Ready. Rendering %dx%d -> 960x540\n", RW, RH);
+    Serial.printf("[Elevated] Ready. Rendering %dx%d -> %dx%d\n", RW, RH, DW, DH);
 }
 
 static float g_time = 0.0f;

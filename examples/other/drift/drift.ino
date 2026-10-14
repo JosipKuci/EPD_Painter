@@ -18,25 +18,22 @@
 //      4 grey levels while preserving the illusion of a full tonal range.
 //    · Dual-core rendering splits the frame between ESP32-S3 cores 0 and 1.
 //
-//  Render target : 240×135  (upscaled 4× to 960×540 for the display)
-//  Render time   : ~1–2 s on ESP32-S3 @ 240 MHz
+//  Render target : 240×165  (upscaled 5× to the 1200×825 panel; the render
+//                  size is the panel size / SCALE, computed at runtime)
+//  Render time   : ~1.5–2.5 s on ESP32-S3 @ 240 MHz
 // =============================================================================
-
-// Choose your hardware:
-#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
-//#define EPD_PAINTER_PRESET_LILYGO_T5_S3_H752
-// #define EPD_PAINTER_PRESET_M5PAPER_S3
 
 #include "EPD_Painter_presets.h"
 #include "esp_heap_caps.h"
 
 static EPD_Painter display(EPD_PAINTER_PRESET);
 
-static const int RW = 240;
-static const int RH = 135;
+static const int SCALE = 5;             // render pixel -> SCALE×SCALE panel pixels
+static int DW, DH;                       // panel size, from the preset
+static int RW, RH;                       // render size = DW/SCALE × DH/SCALE
 
 static uint8_t *render_buf  = nullptr;   // RW*RH  — internal SRAM
-static uint8_t *display_buf = nullptr;   // 960*540 — PSRAM
+static uint8_t *display_buf = nullptr;   // DW*DH  — PSRAM
 
 // =============================================================================
 // Smooth Julia-set iteration
@@ -152,11 +149,12 @@ static DriftJob     g_job;
 static TaskHandle_t g_helper = nullptr;
 
 static void render_rows(float cx, float cy, int row0, int row1, uint8_t *buf) {
-    // View window: centred at origin, width 3.6 units (16:9 at 240×135)
+    // View window: centred at origin, width 3.6 units, square pixels (the
+    // height follows the panel's aspect ratio).
     const float xs     = 3.6f   / RW;
-    const float ys     = 2.025f / RH;
-    const float x_orig = -1.8f   + xs * 0.5f;
-    const float y_orig = -1.0125f + ys * 0.5f;
+    const float ys     = xs;
+    const float x_orig = -1.8f            + xs * 0.5f;
+    const float y_orig = -0.5f * ys * RH  + ys * 0.5f;
 
     for (int y = row0; y < row1; y++) {
         float zy = y_orig + y * ys;
@@ -179,19 +177,21 @@ static void helper_task(void*) {
 }
 
 // =============================================================================
-// Upscale render_buf (RW×RH) → display_buf (960×540)
+// Upscale render_buf (RW×RH) → display_buf (DW×DH)
 //
-// Each source byte is replicated 4× horizontally; each source row 4× vertically.
+// Each source byte is replicated SCALE× horizontally; each source row SCALE×
+// vertically. Any remainder columns/rows (DW, DH not multiples of SCALE)
+// stay white from the initial memset.
 // =============================================================================
 
 static void upscale() {
     for (int sy = 0; sy < RH; sy++) {
         const uint8_t *src = render_buf + sy * RW;
-        for (int rep = 0; rep < 4; rep++) {
-            uint8_t *dst = display_buf + (sy*4 + rep) * 960;
+        for (int rep = 0; rep < SCALE; rep++) {
+            uint8_t *dst = display_buf + (size_t)(sy*SCALE + rep) * DW;
             for (int x = 0; x < RW; x++) {
-                dst[0] = dst[1] = dst[2] = dst[3] = src[x];
-                dst += 4;
+                memset(dst, src[x], SCALE);
+                dst += SCALE;
             }
         }
     }
@@ -207,13 +207,18 @@ void setup() {
     Serial.begin(115200);
     Serial.println("[Drift] Starting...");
 
-    render_buf  = (uint8_t*)heap_caps_malloc(RW * RH,   MALLOC_CAP_INTERNAL);
-    display_buf = (uint8_t*)heap_caps_malloc(960 * 540, MALLOC_CAP_SPIRAM);
+    DW = display.getConfig().width;
+    DH = display.getConfig().height;
+    RW = DW / SCALE;
+    RH = DH / SCALE;
+    render_buf  = (uint8_t*)heap_caps_malloc(RW * RH,           MALLOC_CAP_INTERNAL);
+    display_buf = (uint8_t*)heap_caps_malloc((size_t)DW * DH,   MALLOC_CAP_SPIRAM);
 
     if (!render_buf || !display_buf) {
         Serial.println("[Drift] FATAL: allocation failed");
         while (1) delay(1000);
     }
+    memset(display_buf, 0, (size_t)DW * DH);
 
     if (!display.begin()) {
         Serial.println("[Drift] FATAL: display init failed");

@@ -1,18 +1,14 @@
 // ============================================================================
 // EPD_Painter_trains.h — the per-board waveform train files, gathered.
 //
-// Every board's optical data lives in ONE file per board — the 4-level
-// waveform pairs, the 16-grey decision-engine tables, and the direct
-// grey-to-grey trains, with the calibration history beside the numbers:
+// The board's optical data lives in ONE file — the 4-level waveform
+// pairs, the 16-grey decision-engine tables, and the direct grey-to-grey
+// trains, with the calibration history beside the numbers:
 //
-//   M5PaperS3_Trains.h         M5PaperS3
-//   LilyGo_T5S3_GPS_Trains.h   LilyGo T5 S3 GPS
-//   LilyGo_H716_Trains.h       LilyGo T5 4.7" EPD47 H716
-//   LilyGo_H752_Trains.h       LilyGo T5 S3 H752 (hand-built 4-level only)
+//   Inkplate10_Trains.h        Soldered Inkplate 10 (ED097TC2)
 //
 // The preset in EPD_Painter_presets.h carries pins and timing and points
-// its Config at that board's tables, so selecting a board — explicitly or
-// by auto-detection — selects its trains with it. Precedence at runtime:
+// its Config at these tables. Precedence at runtime:
 //
 //   1. a tuned blob in NVS (written by examples/other/tuneup), installed
 //      automatically by begin() when one validates for this board;
@@ -50,9 +46,6 @@
 #ifndef EPD_PAINTER_TRAINS_H
 #define EPD_PAINTER_TRAINS_H
 
-#include "M5PaperS3_Trains.h"
-#include "LilyGo_T5S3_GPS_Trains.h"
-#include "LilyGo_H716_Trains.h"
-#include "LilyGo_H752_Trains.h"
+#include "Inkplate10_Trains.h"
 
 #endif // EPD_PAINTER_TRAINS_H

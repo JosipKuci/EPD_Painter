@@ -82,7 +82,7 @@ static void evo4FillCanvas(int upto) {
   const int W = epd.width(), H = epd.height();
   for (int y = 0; y < H; y++) {
     uint8_t *row = fb + (size_t)y * W;
-    if (y < EVO_REF_H) {
+    if (y < evoRefH()) {
       for (int x = 0; x < W; x++) {
         const int g = ((x * 16) / W) / 4;
         const int thr = (g * 64 + 1) / 3;
@@ -90,7 +90,7 @@ static void evo4FillCanvas(int upto) {
       }
       continue;
     }
-    const int band = (y - EVO_REF_H) / EVO_BAND_H;
+    const int band = (y - evoRefH()) / evoBandH();
     if (band > upto) { memset(row, 0, W); continue; }
     for (int x = 0; x < W; x++) row[x] = (uint8_t)(((x * 16) / W) / 4);
   }
@@ -135,11 +135,11 @@ static bool evo4Measure(float ref[4], float nat[EVO_BANDS][4]) {
     int pa0, pa1, pb0, pb1, sx0, sx1, sy0, sy1;
     tuneColSpan(g * 4 + 1, &pa0, &pa1);
     tuneColSpan(g * 4 + 2, &pb0, &pb1);
-    tunePanelRect(pa0, pb1, 12, EVO_REF_H - 12, &sx0, &sx1, &sy0, &sy1);
+    tunePanelRect(pa0, pb1, 12, evoRefH() - 12, &sx0, &sx1, &sy0, &sy1);
     ref[g] = tuneRectMean(sx0, sx1, sy0, sy1);
     for (int b = 0; b < EVO_BANDS; b++) {
-      const int y0 = EVO_REF_H + b * EVO_BAND_H + 12;
-      const int y1 = EVO_REF_H + (b + 1) * EVO_BAND_H - 12;
+      const int y0 = evoRefH() + b * evoBandH() + 12;
+      const int y1 = evoRefH() + (b + 1) * evoBandH() - 12;
       tunePanelRect(pa0, pb1, y0, y1, &sx0, &sx1, &sy0, &sy1);
       nat[b][g] = tuneRectMean(sx0, sx1, sy0, sy1);
     }
