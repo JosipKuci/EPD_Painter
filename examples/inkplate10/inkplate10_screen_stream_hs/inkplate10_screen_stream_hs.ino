@@ -30,6 +30,11 @@
 // Then on the computer:
 //   brew install libusb            (macOS; Linux: apt install libusb-1.0-0)
 //   pip install numpy pillow pyusb mss
+//   Windows instead: pip install numpy pillow pyusb mss libusb-package (it
+//   bundles the libusb DLL), then bind the WinUSB driver to the device once
+//   with Zadig (zadig.akeo.ie: Options > List All Devices, "Inkplate screen
+//   stream", VID 303A, WinUSB, Install Driver). Windows binds no driver to a
+//   vendor interface by itself, and libusb can only open one that has WinUSB.
 //   python3 ../inkplate10_screen_stream/screen_stream.py --usb
 // Linux needs a udev rule (or root) to open the device; macOS does not.
 

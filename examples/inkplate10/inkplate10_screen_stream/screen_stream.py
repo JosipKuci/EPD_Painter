@@ -473,17 +473,25 @@ USB_ITF = (0xFF, 0x45, 0x50)
 
 
 def _usb_backend():
-    """libusb for pyusb. Homebrew's lib is not on the default search path on
-    Apple Silicon, so look there too."""
+    """libusb for pyusb. Tries, in order: the system search path; the
+    libusb-package wheel (bundles the DLL, the easy route on Windows); and
+    Homebrew's lib, which is not on the default path on Apple Silicon."""
     import usb.backend.libusb1 as libusb1
     be = libusb1.get_backend()
+    if be is None:
+        try:
+            import libusb_package
+            be = libusb_package.get_libusb1_backend()
+        except ImportError:
+            pass
     if be is None:
         for path in ("/opt/homebrew/lib/libusb-1.0.dylib", "/usr/local/lib/libusb-1.0.dylib"):
             be = libusb1.get_backend(find_library=lambda _n, p=path: p)
             if be is not None:
                 break
     if be is None:
-        sys.exit("libusb not found: brew install libusb (macOS) or "
+        sys.exit("libusb not found: pip install libusb-package (any OS, needed "
+                 "on Windows), brew install libusb (macOS) or "
                  "apt install libusb-1.0-0 (Linux)")
     return be
 
@@ -516,7 +524,10 @@ class UsbLink:
         found = usb_devices()
         if not found:
             sys.exit("no board found on USB: is inkplate10_screen_stream_hs "
-                     "running and the high-speed port connected? (--list)")
+                     "running and the high-speed port connected? (--list)"
+                     + ("\nOn Windows the interface also needs the WinUSB "
+                        "driver: bind it once with Zadig (zadig.akeo.ie)."
+                        if sys.platform == "win32" else ""))
         self.dev, itf = found[0]
         try:
             self.dev.set_configuration()
