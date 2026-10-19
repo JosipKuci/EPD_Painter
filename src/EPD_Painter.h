@@ -171,6 +171,21 @@ struct PowerCtlConfig {
       // columns latch data belonging to pixels further left, repeating the
       // image at the right-hand edge. See How_It_Works.md §7.
       uint8_t row_pad_bytes = 4;
+
+      // Minimum time (ns) between starting a row's GDMA and starting
+      // LCD_CAM, so the DMA has filled the LCD FIFO before the first pixel
+      // clock. Too short and the LCD clocks out stale FIFO contents at the
+      // start of the row (the first columns on the bus show garbage or a
+      // copy of other columns). The row's gate/latch sequence runs inside
+      // this window, so only the remainder is waited. 0 = no wait (the S3:
+      // its AHB DMA is primed by the ~1 us pin sequence alone).
+      uint16_t dma_prefill_ns = 0;
+
+      // Reset the LCD FIFO before every row's DMA (the S3 behaviour). On the
+      // S31 the reset is suspected to land after GDMA has started filling
+      // the FIFO, throwing away the start of the row; its preset turns it
+      // off (the FIFO is empty after every exact-length row anyway).
+      bool afifo_reset_per_row = true;
       int8_t data_pins[8];
       I2CBusConfig i2c{};
       PowerCtlConfig power{};
@@ -533,6 +548,15 @@ struct PowerCtlConfig {
   // bandwidth needed when streaming frames from storage. height must be an
   // exact multiple of line_repeat.
   void paintPacked(const uint8_t* packed, int line_repeat = 1);
+
+  // paintRows() for a pre-packed 2bpp frame: `packed` is a full frame in
+  // the physical layout (packedRowBytes() stride, rotation already applied,
+  // padding bytes zero), and only PHYSICAL rows r0..r1 (inclusive) are
+  // copied and compared. Rows outside the range must be unchanged since the
+  // last submission. Pipelined like paintRows(): waits for the previous
+  // frame to be picked up, copies, returns. `packed` may be rewritten as
+  // soon as it returns.
+  void paintPackedRows(const uint8_t* packed, int r0, int r1);
   void unpaintPacked(const uint8_t* packed);
   void paintLater(uint8_t* framebuffer);
 
@@ -542,6 +566,9 @@ struct PowerCtlConfig {
   // submit-loop rate. No-op cycles (nothing changed) are not counted.
   uint32_t paintsCompleted() const { return _paints_done.load(); }
   bool paintIdle() const { return paintStage.load() == 0; }
+  // S31 only (0 elsewhere): running count of LCD_CAM data reads that found
+  // its FIFO empty, i.e. bytes clocked onto the panel that were not row data.
+  uint32_t lcdInvalidReads() const;
   // No-op, kept for API compatibility. Interlace mode existed to spatially
   // dither the old either-direction-per-chunk deferral artifact; the
   // dual-plane ink engine drives both directions per pixel in one cycle,
@@ -874,9 +901,9 @@ private:
   // ---- LCD_CAM / DMA ----
   gdma_channel_handle_t dma_chan = nullptr;
   int                   _dma_channel_id = 0;
-  dma_descriptor_t      dma_desc1 = {};
-  dma_descriptor_t      dma_desc2 = {};
-  dma_descriptor_t      dma_desc0 = {};      // all-float row (discharge_rows)
+  alignas(8) dma_descriptor_t dma_desc1 = {};
+  alignas(8) dma_descriptor_t dma_desc2 = {};
+  alignas(8) dma_descriptor_t dma_desc0 = {};      // all-float row (discharge_rows)
   intr_handle_t         _lcd_intr_handle = nullptr;
   volatile TaskHandle_t _dma_notify_task = nullptr;
   bool                  _dma_pending = false;
@@ -1048,6 +1075,7 @@ private:
   // the row the next sendRow() latches.
   void _dischargeColumns();
   void _txRow(dma_descriptor_t *desc);   // transmit only: no latch, no gate
+  void _waitPrefill(uint32_t dma_t0);    // Config::dma_prefill_ns before lcd_start
   void _setBusRowBytes(int n);
   void _gateStep();               // one CKV clock with no row (skip/flush)    // bytes per row on the bus (skip_idle_cols)   // clock a stopped pass's gate token off the bottom
   // Pack an 8bpp canvas into the physical stride layout (2bpp, or 4bpp in

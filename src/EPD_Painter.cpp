@@ -8,12 +8,24 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "esp_rom_gpio.h"
-#include <driver/periph_ctrl.h>
+#include "esp_idf_version.h"
+#include "sdkconfig.h"
 #include <esp_private/gdma.h>
 #include <hal/dma_types.h>
 #include <hal/gpio_hal.h>
 #include <soc/lcd_cam_struct.h>
-#include <soc/gdma_struct.h>
+#if ESP_IDF_VERSION_MAJOR >= 6
+  // IDF 6 (Arduino core 4.x): LCD_CAM is set up through the LL layer, which
+  // hides the per-chip clock tree (on the S31 the LCD clock lives in
+  // HP_SYS_CLKRST, not in LCD_CAM itself).
+  #include <esp_private/periph_ctrl.h>
+  #include <esp_private/esp_clk_tree_common.h>
+  #include <hal/lcd_ll.h>
+  #include <hal/gdma_channel.h>   // SOC_GDMA_TRIG_PERIPH_LCD0_BUS
+#else
+  #include <driver/periph_ctrl.h>
+  #include <soc/gdma_struct.h>
+#endif
 #include "EPD_Painter.h"
 #include "EPD_Painter_tuned.h"
 #include <epd_painter_powerctl.h>
@@ -37,17 +49,27 @@
 // durations to serial each frame so you can compare old vs new .S builds.
 //#define EPD_ASM_TIMING
 
-// LCD_CAM signal indices for the 8 parallel data lines
-static const uint8_t kDataSignals[8] = {
-  LCD_DATA_OUT0_IDX,
-  LCD_DATA_OUT1_IDX,
-  LCD_DATA_OUT2_IDX,
-  LCD_DATA_OUT3_IDX,
-  LCD_DATA_OUT4_IDX,
-  LCD_DATA_OUT5_IDX,
-  LCD_DATA_OUT6_IDX,
-  LCD_DATA_OUT7_IDX,
-};
+// ---- Per-chip LCD_CAM differences ----
+// GPIO-matrix signal numbers and the two registers whose names changed.
+// Everything else the row loop touches (lcd_start, lcd_afifo_reset,
+// lcd_dout_cyclelen) is the same on both chips.
+#if CONFIG_IDF_TARGET_ESP32S31
+  #define EPD_LCD_DATA_SIG(i)  (LCD_DATA_OUT_PAD_OUT0_IDX + (i))
+  #define EPD_LCD_PCLK_SIG     LCD_PCLK_PAD_OUT_IDX
+  #define EPD_LCD_DC_SIG       LCD_DC_PAD_OUT_IDX
+  #define EPD_LCD_SET_CMD(v)   (LCD_CAM.lcd_first_cmd_val.val = (v))
+  #define EPD_LCD_UPDATE()     (LCD_CAM.lcd_user.lcd_update_reg = 1)
+  // Latch the parameters on every start, as lcd_ll_start() does here.
+  #define EPD_LCD_START()      do { LCD_CAM.lcd_user.lcd_update_reg = 1; \
+                                    LCD_CAM.lcd_user.lcd_start = 1; } while (0)
+#else
+  #define EPD_LCD_DATA_SIG(i)  (LCD_DATA_OUT0_IDX + (i))
+  #define EPD_LCD_PCLK_SIG     LCD_PCLK_IDX
+  #define EPD_LCD_DC_SIG       LCD_DC_IDX
+  #define EPD_LCD_SET_CMD(v)   (LCD_CAM.lcd_cmd_val.lcd_cmd_value = (v))
+  #define EPD_LCD_UPDATE()     (LCD_CAM.lcd_user.lcd_update = 1)
+  #define EPD_LCD_START()      (LCD_CAM.lcd_user.lcd_start = 1)
+#endif
 
 
 // Assembly routines — see EPD_Painter.S for full documentation
@@ -546,9 +568,10 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
   // needing extra flush clocks — fixed by Config::row_pad_bytes (see
   // How_It_Works.md §7).  GDMA underflow flags confirmed the FIFO never
   // starved with this ordering.
-  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
-  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
+  if (_config.afifo_reset_per_row) LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  EPD_LCD_SET_CMD(static_cast<const uint8_t *>(desc->buffer)[-1]);
   gdma_start(dma_chan, (intptr_t)desc);
+  const uint32_t dma_t0 = EPD_CCOUNT();
 
 #ifdef EPD_ROW_PHASE_TIMING
   const int64_t _rp_t2 = esp_timer_get_time();
@@ -598,7 +621,8 @@ void EPD_Painter::sendRow(bool firstLine, bool lastLine, bool noAdvance) {
   g_rp_rows++;
 #endif
 
-  LCD_CAM.lcd_user.lcd_start = 1;
+  _waitPrefill(dma_t0);
+  EPD_LCD_START();
   if (lastLine) {
     while (LCD_CAM.lcd_user.lcd_start) {}
 
@@ -724,6 +748,66 @@ bool EPD_Painter::begin() {
   // and cost ~50ns per row. See How_It_Works.md §7.
   const int dma_row_bytes = packed_row_bytes + _config.row_pad_bytes;
 
+  int clk_div = 2, clk_pre = 2;
+  const uint32_t pclk = epd_pick_pclk(_config.pclk_hz, clk_div, clk_pre);
+
+#if ESP_IDF_VERSION_MAJOR >= 6
+  // ---- LCD_CAM through the LL layer (IDF 6: S3 and S31) ----
+  lcd_cam_dev_t *lcd = &LCD_CAM;
+  PERIPH_RCC_ACQUIRE_ATOMIC(PERIPH_LCD_CAM_MODULE, ref_count) {
+    if (ref_count == 0) {
+      lcd_ll_enable_bus_clock(0, true);
+      lcd_ll_reset_register(0);
+#if CONFIG_IDF_TARGET_ESP32S31
+      // Shared LCD/CAM core clock (register access, FIFO): PLL_F120M / 1.
+      lcd_ll_select_core_clk_src(0, LCD_CORE_CLK_SRC_PLL120M);
+      lcd_ll_set_core_clock_divider(0, 1, 0, 0);
+#endif
+    }
+  }
+#if CONFIG_IDF_TARGET_ESP32S31
+  esp_clk_tree_enable_src((soc_module_clk_t)LCD_CORE_CLK_SRC_PLL120M, true);
+  lcd_ll_mem_force_power_on(lcd);
+#endif
+  esp_clk_tree_enable_src((soc_module_clk_t)LCD_CLK_SRC_PLL160M, true);
+  lcd_ll_reset(lcd);
+  EPD_DELAY_US(100);
+
+  // ---- Pixel clock (Config::pclk_hz): 160 MHz / clk_div / clk_pre ----
+  PERIPH_RCC_ATOMIC() {
+    lcd_ll_select_clk_src(0, LCD_CLK_SRC_PLL160M);
+    lcd_ll_set_group_clock_coeff(0, clk_div, 0, 0);
+  }
+  lcd_ll_enable_clock(lcd, true);
+  lcd_ll_set_pixel_clock_prescale(lcd, clk_pre);
+  lcd_ll_set_pixel_clock_edge(lcd, false);
+  lcd_ll_set_clock_idle_level(lcd, false);
+  printf("[EPD_Painter] CL %lu Hz (asked %lu): %u x %u px, %d bus bytes/row, ~%lu us/pass\n",
+         (unsigned long)pclk, (unsigned long)_config.pclk_hz,
+         (unsigned)_config.width, (unsigned)_config.height, dma_row_bytes,
+         (unsigned long)((uint64_t)dma_row_bytes * _config.height * 1000000ULL / pclk));
+
+  // ---- i8080, 8 bits, CMD phase = the row's first byte with SPH low ----
+  // (see the IDF 5 branch below for why SPH rides the DC line)
+  lcd_ll_enable_rgb_mode(lcd, false);
+  lcd_ll_enable_color_convert(lcd, false);
+  lcd_ll_enable_auto_next_frame(lcd, false);
+  lcd_ll_enable_output_always_on(lcd, false);
+  lcd_ll_set_dma_read_stride(lcd, 8);
+  lcd_ll_set_data_wire_width(lcd, 8);
+  lcd_ll_reverse_dma_data_bit_order(lcd, false);
+  lcd_ll_reverse_wire_bit_order(lcd, false);
+  lcd_ll_swap_dma_data_byte_order(lcd, false);
+  lcd_ll_enable_swizzle(lcd, false);
+  lcd_ll_set_dc_level(lcd, true, false, true, true);   // SPH: idle high, low for CMD
+  lcd_ll_set_phase_cycles(lcd, 1, 0, dma_row_bytes - 1);
+  EPD_LCD_UPDATE();
+#if CONFIG_IDF_TARGET_ESP32S31
+  // Count LCD reads that found the FIFO empty (see lcdInvalidReads()).
+  LCD_CAM.lcd_bw_monitor_dbg.lcd_bw_monitore_ena = 1;
+#endif
+  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+#else
   // ---- Enable and reset LCD_CAM peripheral ----
   periph_module_enable(PERIPH_LCD_CAM_MODULE);
   periph_module_reset(PERIPH_LCD_CAM_MODULE);
@@ -731,8 +815,6 @@ bool EPD_Painter::begin() {
   EPD_DELAY_US(100);
 
   // ---- Configure LCD_CAM pixel clock (Config::pclk_hz) ----
-  int clk_div = 2, clk_pre = 2;
-  const uint32_t pclk = epd_pick_pclk(_config.pclk_hz, clk_div, clk_pre);
   LCD_CAM.lcd_clock.clk_en = 1;
   LCD_CAM.lcd_clock.lcd_clk_sel = 3;              // PLL_F160M
   LCD_CAM.lcd_clock.lcd_ck_out_edge = 0;
@@ -778,6 +860,7 @@ bool EPD_Painter::begin() {
   LCD_CAM.lcd_user.lcd_dout_cyclelen = dma_row_bytes - 2;
   LCD_CAM.lcd_user.lcd_dout = 1;
   LCD_CAM.lcd_user.lcd_update = 1;
+#endif
 
   // ---- Route 8-bit data bus pins using config ----
   for (int i = 0; i < 8; i++) {
@@ -786,14 +869,14 @@ bool EPD_Painter::begin() {
     // i80 order. GPIO39-42 power up as the JTAG pads, so the IO_MUX select
     // is not optional on this wiring.
     gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
-    esp_rom_gpio_connect_out_signal(pin, kDataSignals[i], false, false);
+    esp_rom_gpio_connect_out_signal(pin, EPD_LCD_DATA_SIG(i), false, false);
     epd_gpio_func_sel(pin);
     gpio_set_drive_capability((gpio_num_t)pin, (gpio_drive_cap_t)3);
   }
 
   // ---- Route pixel clock to CL pin ----
   gpio_set_direction((gpio_num_t)_config.pin_cl, GPIO_MODE_OUTPUT);
-  esp_rom_gpio_connect_out_signal(_config.pin_cl, LCD_PCLK_IDX, false, false);
+  esp_rom_gpio_connect_out_signal(_config.pin_cl, EPD_LCD_PCLK_SIG, false, false);
   epd_gpio_func_sel(_config.pin_cl);
   gpio_set_drive_capability((gpio_num_t)_config.pin_cl, (gpio_drive_cap_t)3);
 
@@ -804,6 +887,20 @@ bool EPD_Painter::begin() {
   gpio_set_drive_capability((gpio_num_t)_config.pin_sph, (gpio_drive_cap_t)3);
 
   // ---- Allocate GDMA channel ----
+#if ESP_IDF_VERSION_MAJOR >= 6
+  // LCD_CAM sits on the AHB GDMA on the S3 and on the AXI GDMA on the S31.
+  gdma_channel_alloc_config_t dma_chan_config = {};
+#if defined(SOC_GDMA_BUS_AXI) && SOC_GDMA_TRIG_PERIPH_LCD0_BUS == SOC_GDMA_BUS_AXI
+  esp_err_t dma_err = gdma_new_axi_channel(&dma_chan_config, &dma_chan, nullptr);
+#else
+  esp_err_t dma_err = gdma_new_ahb_channel(&dma_chan_config, &dma_chan, nullptr);
+#endif
+  if (dma_err != ESP_OK || !dma_chan) {
+    printf("[EPD_Painter] GDMA channel allocation failed (%d)\n", (int)dma_err);
+    return false;
+  }
+  gdma_connect(dma_chan, GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0));
+#else
   gdma_channel_alloc_config_t dma_chan_config = {
     .sibling_chan = NULL,
     .direction = GDMA_CHANNEL_DIRECTION_TX,
@@ -818,6 +915,7 @@ bool EPD_Painter::begin() {
   for (int i = 0; i < 5; i++) {
     if (GDMA.channel[i].out.peri_sel.sel == 5) { _dma_channel_id = i; break; }
   }
+#endif
 
   gdma_strategy_config_t strategy_config = {
     .owner_check = false,
@@ -1020,7 +1118,13 @@ bool EPD_Painter::end() {
     gdma_del_channel(dma_chan);
     dma_chan = nullptr;
   }
+#if ESP_IDF_VERSION_MAJOR >= 6
+  PERIPH_RCC_RELEASE_ATOMIC(PERIPH_LCD_CAM_MODULE, ref_count) {
+    if (ref_count == 0) lcd_ll_enable_bus_clock(0, false);
+  }
+#else
   periph_module_disable(PERIPH_LCD_CAM_MODULE);
+#endif
   return true;
 }
 
@@ -1037,10 +1141,11 @@ void EPD_Painter::_pushRow() {
   dma_descriptor_t *desc;
   if (dma_buffer == dma_buffer1) { desc = &dma_desc1; dma_buffer = dma_buffer2; }
   else                           { desc = &dma_desc2; dma_buffer = dma_buffer1; }
-  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
-  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
+  if (_config.afifo_reset_per_row) LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  EPD_LCD_SET_CMD(static_cast<const uint8_t *>(desc->buffer)[-1]);
   gdma_start(dma_chan, (intptr_t)desc);
-  LCD_CAM.lcd_user.lcd_start = 1;
+  _waitPrefill(EPD_CCOUNT());
+  EPD_LCD_START();
   spin = 0;
   while (LCD_CAM.lcd_user.lcd_start && ++spin < 200000) {}
 }
@@ -1113,7 +1218,7 @@ void EPD_Painter::powerOff() {
 void EPD_Painter::_sphToLcd(bool lcd) {
   const int pin = _config.pin_sph;
   if (lcd) {
-    esp_rom_gpio_connect_out_signal(pin, LCD_DC_IDX, false, false);
+    esp_rom_gpio_connect_out_signal(pin, EPD_LCD_DC_SIG, false, false);
   } else {
     esp_rom_gpio_connect_out_signal(pin, SIG_GPIO_OUT_IDX, false, false);
   }
@@ -1153,13 +1258,32 @@ void EPD_Painter::_endPass() {
 // float row so every column is pulled back to neutral with no line open,
 // then shift row n-1 back in; that transfer is the discharge time.
 // sendRow(n) then latches row n-1 and opens its line as usual.
+// Spin out whatever is left of Config::dma_prefill_ns since gdma_start()
+// (cycle count dma_t0), so the LCD FIFO is primed before lcd_start.
+void IRAM_ATTR EPD_Painter::_waitPrefill(uint32_t dma_t0) {
+  const uint32_t ns = _config.dma_prefill_ns;
+  if (!ns) return;
+  const uint32_t cycles = (uint32_t)(((uint64_t)ns * epd_cpu_mhz()) / 1000ULL);
+  while ((EPD_CCOUNT() - dma_t0) < cycles) { /* spin */ }
+}
+
+uint32_t EPD_Painter::lcdInvalidReads() const {
+#if CONFIG_IDF_TARGET_ESP32S31
+  return LCD_CAM.lcd_bw_monitor_dbg.lcd_invalid_rd_number;
+#else
+  return 0;
+#endif
+}
+
 void EPD_Painter::_txRow(dma_descriptor_t *desc) {
   while (LCD_CAM.lcd_user.lcd_start) {}
-  LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
-  LCD_CAM.lcd_cmd_val.lcd_cmd_value = static_cast<const uint8_t *>(desc->buffer)[-1];
+  if (_config.afifo_reset_per_row) LCD_CAM.lcd_misc.lcd_afifo_reset = 1;
+  EPD_LCD_SET_CMD(static_cast<const uint8_t *>(desc->buffer)[-1]);
   gdma_start(dma_chan, (intptr_t)desc);
+  const uint32_t dma_t0 = EPD_CCOUNT();
   EPD_DELAY_US(1);                       // let GDMA prime the FIFO
-  LCD_CAM.lcd_user.lcd_start = 1;
+  _waitPrefill(dma_t0);
+  EPD_LCD_START();
   while (LCD_CAM.lcd_user.lcd_start) {}
 }
 
@@ -1188,7 +1312,7 @@ void EPD_Painter::_setBusRowBytes(int n) {
   dma_desc2.dw0.size = dma_desc2.dw0.length = n - 1;
   dma_desc0.dw0.size = dma_desc0.dw0.length = n - 1;
   LCD_CAM.lcd_user.lcd_dout_cyclelen = n - 2;
-  LCD_CAM.lcd_user.lcd_update = 1;
+  EPD_LCD_UPDATE();
 }
 
 // =============================================================================
@@ -1346,6 +1470,32 @@ void EPD_Painter::paintPacked(const uint8_t* packed, int line_repeat) {
   while (paintStage == 2) {
     vTaskDelay(1);
   }
+}
+
+// =============================================================================
+// paintPackedRows() — paintRows() for a packed frame (physical rows)
+// =============================================================================
+void EPD_Painter::paintPackedRows(const uint8_t* packed, int r0, int r1) {
+  if (_grey16) {
+    printf("[EPD_Painter] paintPackedRows() is a 4-level path — call setGreyLevels(4) first\n");
+    return;
+  }
+  const int H = _config.height;
+  if (r0 > r1) { const int t = r0; r0 = r1; r1 = t; }
+  if (r0 < 0) r0 = 0;
+  if (r1 > H - 1) r1 = H - 1;
+  // Engines without a row-limited discovery take the whole frame.
+  if (_decision_engine || _decision_direct || _has_template) { r0 = 0; r1 = H - 1; }
+
+  while (paintStage == 2) {
+    vTaskDelay(1);
+  }
+  xSemaphoreTake(_paint_buffer_sem, portMAX_DELAY);
+  _pr_lo = r0; _pr_hi = r1;
+  const size_t off = (size_t)r0 * packed_row_bytes;
+  memcpy(packed_paintbuffer + off, packed + off, (size_t)(r1 - r0 + 1) * packed_row_bytes);
+  paintStage = 2;
+  xSemaphoreGive(_paint_buffer_sem);
 }
 
 // =============================================================================

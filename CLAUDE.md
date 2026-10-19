@@ -14,6 +14,7 @@ This is an **Arduino library** (and project). Build and flash via **Arduino IDE*
 - Optional library: **LVGL v9** (for LVGL-based examples)
 - Board: ESP32S3 Dev Module, OPI PSRAM — `esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=huge_app,USBMode=hwcdc,CDCOnBoot=cdc`
 - First-light sketch: `examples/inkplate10/inkplate10_hello`
+- **ESP32-S31** (Arduino core 4.x / IDF 6): `esp32:esp32:esp32s31:USBMode=hwcdc,CDCOnBoot=cdc` (add `PartitionScheme=huge_app` for the GIF player). `EPD_PAINTER_PRESET` picks `EPD_INKPLATE10_S31_PRESET` on that target. Bring-up port, untested on hardware
 
 There is no Makefile or CMake. Arduino IDE is the primary build tool, and `arduino-cli compile` with the FQBN above works for checking builds.
 
@@ -30,6 +31,7 @@ Packed rows use a stride of `packedRowBytes()` = width/4 rounded up to 16 bytes 
 ### Key Source Files
 
 - `src/EPD_Painter.h/.cpp` — Core driver: hardware init, LCD_CAM DMA setup and pixel clock (`Config::pclk_hz`), `paint()`, `clear()`, `sendRow()` row timing (SPV/CKV/LE signals, `vscan_skip_lines` lead-in), `_endPass()` tail latch, `_pack()`
+- `src/epd_painter_kernels_c.c` — portable C versions of the four `.S` kernels (same symbols, bit-identical output), linked on every non-Xtensa target (the S31). The `.S` builds only under `__XTENSA__`
 - `src/EPD_Painter.S` — **Xtensa assembly**: all pixel packing, waveform conversion, `ink_on`/`ink_off` delta detection, 64-pixel SIMD chunks
 - `src/EPD_Painter_Adafruit.h` — Wrapper exposing Adafruit GFX API; owns 8bpp framebuffer in PSRAM
 - `src/EPD_Painter_LVGL.h` — LVGL v9 integration: flush callback + paint timer

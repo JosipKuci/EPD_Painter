@@ -1,6 +1,7 @@
 #ifndef EPD_PAINTER_DEVICES_H
 #define EPD_PAINTER_DEVICES_H
 
+#include "sdkconfig.h"
 #include "EPD_Painter.h"
 #include "EPD_Painter_trains.h"
 
@@ -68,6 +69,63 @@ inline EPD_Painter::Config EPD_INKPLATE10_PRESET = {
     // and direct transitions stay on the two-step path.
 };
 
+// -----------------------------------------------------------------------
+// The same Inkplate 10 panel and power board on an ESP32-S31.
+//
+//   D0..D7  8 9 10 11 12 13 14 15   (the S31's IO MUX LCD_DATA0..7 pads)
+//   CL 40 (IO MUX LCD_PCLK pad)   SPH 43   CKV 16   LE 17   SPV 18
+//   OE 19   GMOD 44
+//   I2C SDA 60 / SCL 61: PCAL6416A @0x20, TPS65186 @0x48
+//
+// GPIO60/61 are boot-mode strapping pins with weak pull-ups; the I2C
+// pull-ups hold them at the same (normal boot) level. GPIO33/34 are left
+// for USB Serial/JTAG. Everything is routed through the GPIO matrix, so any
+// free pins work; these just keep the bus on its native pads.
+//
+// Untuned and unproven on hardware: same seed trains and timing as the S3.
+// -----------------------------------------------------------------------
+inline EPD_Painter::Config EPD_INKPLATE10_S31_PRESET = {
+    .width    = 1200,
+    .height   = 825,
+    .pin_sph  = 43,
+    .pin_oe   = 19,
+    .pin_gmod = 44,
+    .pin_cl   = 40,
+    .pin_spv  = 18,
+    .pin_ckv  = 16,
+    .pin_le   = 17,
+    .quality  = EPD_Painter::Quality::QUALITY_NORMAL,
+    .rotation = EPD_Painter::Rotation::ROTATION_180,
+    .pclk_hz  = 4000000,
+    .vscan_skip_lines = 3,
+    .vscan_hold_us    = 8,
+    .afifo_reset_per_row = false,
+    .data_pins = { 8, 9, 10, 11, 12, 13, 14, 15 },
+    .i2c = {
+        .wire = nullptr,
+        .sda  = 60,
+        .scl  = 61,
+        .freq = 100000,
+    },
+    .power = {
+        .expander_addr = 0x20,
+        .tps_addr      = 0x48,
+        .pin_wakeup    = 0,
+        .pin_pwrup     = 1,
+        .pin_vcom      = 2,
+        .pin_int       = 3,
+        .pin_pwrgood   = 4,
+    },
+    .waveforms = EPD_WF_INKPLATE10,
+    .g16_pass_us_normal = 75000,
+    .g16_pass_us_high   = 75000,
+};
+
+// The preset for the chip being built for.
+#if CONFIG_IDF_TARGET_ESP32S31
+inline EPD_Painter::Config& EPD_PAINTER_PRESET = EPD_INKPLATE10_S31_PRESET;
+#else
 inline EPD_Painter::Config& EPD_PAINTER_PRESET = EPD_INKPLATE10_PRESET;
+#endif
 
 #endif

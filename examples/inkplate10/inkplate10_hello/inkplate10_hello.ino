@@ -70,5 +70,9 @@ void loop() {
   const int64_t t0 = esp_timer_get_time();
   epd.paint();
   while (!epd.driver().paintIdle()) delay(1);
-  Serial.printf("refresh %d: %lld ms\n", n, (esp_timer_get_time() - t0) / 1000);
+  // S31: bytes clocked to the panel that were not row data (FIFO empty).
+  // Should stay 0; always 0 on the S3.
+  Serial.printf("refresh %d: %lld ms, LCD invalid reads %lu\n", n,
+                (esp_timer_get_time() - t0) / 1000,
+                (unsigned long)epd.driver().lcdInvalidReads());
 }

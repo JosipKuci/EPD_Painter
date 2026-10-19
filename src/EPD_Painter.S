@@ -1,4 +1,4 @@
-#ifdef __ASSEMBLER__
+#if defined(__ASSEMBLER__) && defined(__XTENSA__)   // S3 PIE; other targets use epd_painter_kernels_c.c
 // =============================================================================
 // EPD Painter Assembly Functions
 //
